@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Winbetin backend focused on browser-based login, route discovery, and balance extraction.
+Sportsape BitBot backend focused on browser-based login, route discovery, and balance extraction.
 """
 
 from __future__ import annotations
@@ -16,11 +16,14 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from urllib.parse import urljoin
+
+import requests
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -31,12 +34,13 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from resource_path import resource_path, writable_path
 
-LOGIN_URL = "https://winbetin.com/#/Login"
-SITE_ORIGIN = "https://winbetin.com"
-HOME_URL = f"{SITE_ORIGIN}/"
+LOGIN_URL = "https://www.ke.sportpesa.com/en/sports-betting/football-1/"
+SITE_ORIGIN = "https://www.ke.sportpesa.com"
+HOME_URL = f"{SITE_ORIGIN}/en"
+USER_API_LOGIN_URL = "https://user-api.ke.sportpesa.com/player/v2/login"
 CONFIG_PATH = Path(writable_path("config/endpoints.json"))
 BUNDLED_CONFIG_PATH = Path(resource_path("config/endpoints.json"))
-DISCOVERED_ROUTES_PATH = Path(writable_path("config/discovered_winbetin_routes.json"))
+DISCOVERED_ROUTES_PATH = Path(writable_path("config/discovered_sportsape_routes.json"))
 BALANCE_RE = re.compile(r"(?i)(?:kes|ksh)?\s*([0-9][0-9,]*\.?[0-9]{0,2})")
 COIN_RE = re.compile(r"(?i)coins?\s*[:\-]?\s*([0-9][0-9,]*)")
 
@@ -60,8 +64,8 @@ class NullAIEngine:
         return None
 
 
-class WinbetinBackend:
-    """Browser-backed Winbetin integration with lightweight route discovery."""
+class SportsapeBackend:
+    """Browser-backed SportPesa integration with lightweight route discovery."""
 
     def __init__(self, headless: bool = True, verbose: bool = False):
         self.running = True
@@ -94,10 +98,10 @@ class WinbetinBackend:
                 "country": "/api/country",
             },
             "route_candidates": {
-                "login": ["/kickGoLogin", "/#/Login"],
-                "profile": ["/profile"],
-                "deposit": ["/deposite", "/depositerecords"],
-                "withdraw": ["/withdraw", "/withdrawlimit"],
+                "login": ["/login_check", "/en/login"],
+                "profile": ["/en/profile"],
+                "deposit": ["/en/deposit"],
+                "withdraw": ["/en/withdraw"],
             },
             "confirmed_routes": {
                 "country": "/api/country",
@@ -128,7 +132,7 @@ class WinbetinBackend:
     def _cleanup_driver(self, driver) -> None:
         if not driver:
             return
-        temp_profile = getattr(driver, "_winbetin_temp_profile", None)
+        temp_profile = getattr(driver, "_sportsape_temp_profile", None)
         with self._active_drivers_lock:
             self._active_drivers.discard(driver)
         try:
@@ -296,7 +300,7 @@ class WinbetinBackend:
         )
         options.set_capability("goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
 
-        temp_profile = tempfile.mkdtemp(prefix="winbetin_chrome_")
+        temp_profile = tempfile.mkdtemp(prefix="sportsape_chrome_")
         options.add_argument(f"--user-data-dir={temp_profile}")
 
         try:
@@ -318,7 +322,7 @@ class WinbetinBackend:
                 ]
             })
             driver.execute_cdp_cmd("Network.enable", {})
-            driver._winbetin_temp_profile = temp_profile  # type: ignore[attr-defined]
+            driver._sportsape_temp_profile = temp_profile  # type: ignore[attr-defined]
             return driver
         except Exception as e:
             self._emit_direct(gui_callback, f"   ❌ Browser launch failed: {str(e)[:50]}")
@@ -343,7 +347,7 @@ class WinbetinBackend:
             return "254" + phone
         return phone
 
-    def _format_winbetin_login_phone(self, phone: str) -> str:
+    def _format_sportsape_login_phone(self, phone: str) -> str:
         digits = "".join(filter(str.isdigit, phone))
         if digits.startswith("254") and len(digits) == 12:
             return "0" + digits[3:]
@@ -381,7 +385,7 @@ class WinbetinBackend:
         )
         WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         WebDriverWait(driver, timeout).until(
-            lambda d: "winbetin" in (
+            lambda d: "sportpesa" in (
                 d.execute_script("return ((document.body && document.body.innerText) || '').toLowerCase();")
             )
         )
@@ -461,13 +465,27 @@ return false;
         for _ in range(rounds):
             for selectors in (
                 [".close.clickScale-92", ".close", ".closebtn"],
-                [".swiperClose", ".closeBtnX"],
+                [".swiperClose", ".closeBtnX", ".modal-close", ".popup-close-btn"],
                 ["[class*='close']", "[id*='close']"],
             ):
                 if self._click_first_visible_selector(driver, selectors):
                     total_actions += 1
                     time.sleep(0.3)
-            self._click_by_text(driver, ["close", "skip", "dismiss", "cancel", "no thanks", "later"])
+            self._click_by_text(
+                driver,
+                [
+                    "close",
+                    "skip",
+                    "dismiss",
+                    "cancel",
+                    "no thanks",
+                    "later",
+                    "accept",
+                    "accept all",
+                    "agree",
+                    "got it",
+                ],
+            )
             time.sleep(0.4)
         return total_actions
 
@@ -475,6 +493,12 @@ return false;
         phone_input = self._find_first(
             driver,
             [
+                "input[data-qa='common-login-username']",
+                "input#username",
+                "input[name='username']",
+                "input#user",
+                "input[name='user']",
+                "input[placeholder*='obile']",
                 "input[type='tel']",
                 "input[inputmode='numeric']",
                 "input[type='number']",
@@ -490,6 +514,8 @@ return false;
         password_input = self._find_first(
             driver,
             [
+                "input[data-qa='common-login-password']",
+                "input#password",
                 "input[type='password']",
                 "input[name*='password']",
                 "input[id*='password']",
@@ -498,15 +524,17 @@ return false;
         return phone_input, password_input
 
     def _click_login_entry(self, driver: webdriver.Chrome) -> bool:
-        if self._click_first_visible_selector(driver, [".login_in.clickScale-92", ".login_in"]):
+        phone_input, password_input = self._find_login_inputs(driver)
+        if phone_input and password_input:
             return True
-        if self._click_by_text(driver, ["log in", "login"]):
-            return True
+        # SportPesa mobile: the login form lives on its own /login page.
         try:
-            if driver.execute_script("if (window.TurnToPage) { window.TurnToPage(3); return true; } return false;"):
-                return True
+            driver.get(f"{SITE_ORIGIN}/login")
+            return True
         except Exception:
             pass
+        if self._click_by_text(driver, ["log in", "login", "sign in"]):
+            return True
         for route in ("#/Login", "#/login"):
             try:
                 driver.execute_script("window.location.hash = arguments[0];", route)
@@ -542,6 +570,10 @@ return false;
         if self._click_first_visible_selector(
             driver,
             [
+                "input[data-qa='common-login-submit']",
+                "#secondary_login input[type='submit']",
+                "button.login-form__button",
+                "input[type='submit']",
                 "button[type='submit']",
                 ".paybtn.clickScale.flex-box-row.middle",
                 ".btnPwd .paybtn",
@@ -567,7 +599,7 @@ return false;
             return True
         return False
 
-    def _wait_for_post_login(self, driver: webdriver.Chrome, timeout: int = 15) -> None:
+    def _wait_for_post_login(self, driver: webdriver.Chrome, timeout: int = 15) -> str:
         deadline = time.time() + timeout
         while time.time() < deadline:
             self._dismiss_visible_promos(driver, rounds=1)
@@ -575,34 +607,33 @@ return false;
                 body_text = driver.execute_script("return ((document.body && document.body.innerText) || '').toLowerCase();")
             except Exception:
                 body_text = ""
-            
+
+            for marker in (
+                "does not exist or incorrect",
+                "incorrect password",
+                "incorrect username",
+                "invalid credentials",
+                "invalid login",
+                "user does not exist",
+            ):
+                if marker in body_text:
+                    return "failed"
+
             # More reliable check: Wait until we see currency AND login inputs are gone
             # or we've reached a known logged-in state (like seeing 'Deposit' or 'KSH')
             has_currency = "ksh" in body_text or "kes" in body_text or "deposit" in body_text
             phone_input, password_input = self._find_login_inputs(driver)
-            
+
             if has_currency and not (phone_input and password_input):
-                return
+                return "ok"
             time.sleep(0.3)
+        return "timeout"
 
     def _logout_current_session(self, driver: webdriver.Chrome) -> bool:
-        self._dismiss_visible_promos(driver, rounds=1)
-        self._click_by_text(driver, ["profile"])
-        time.sleep(0.5)
         self._dismiss_visible_promos(driver, rounds=1)
         if self._click_by_text(driver, ["logout", "log out", "sign out", "exit login", "exit"]):
             time.sleep(0.5)
             return True
-        for route in ("#/profile", "#/Profile"):
-            try:
-                driver.execute_script("window.location.hash = arguments[0];", route)
-            except Exception:
-                continue
-            time.sleep(0.5)
-            self._dismiss_visible_promos(driver, rounds=1)
-            if self._click_by_text(driver, ["logout", "log out", "sign out", "exit login", "exit"]):
-                time.sleep(0.5)
-                return True
         return False
 
     def _collect_network(self, driver: webdriver.Chrome, messages: list[dict] | None = None) -> list[dict]:
@@ -746,7 +777,7 @@ return false;
     def _extract_wallet_snapshot_from_json(self, data) -> dict | None:
         if isinstance(data, dict):
             balance_keys = ("balance", "available_balance", "main_balance")
-            bonus_keys = ("bonus", "bonus_balance")
+            bonus_keys = ("bonus", "bonus_balance", "bonusBalance")
             coin_keys = ("coins", "coin", "coin_balance", "coinbalance")
             current = {"balance": None, "bonus": 0.0, "coins": 0.0}
 
@@ -809,6 +840,24 @@ return false;
             return self._extract_wallet_snapshot_from_json(token_data)
         except Exception:
             return None
+
+    def _extract_wallet_snapshot_from_sportpesa_api(self, driver: webdriver.Chrome) -> dict | None:
+        """Fetch the SportPesa /api/wallets/balance endpoint from the logged-in page."""
+        try:
+            data = driver.execute_async_script(
+                """
+                var done = arguments[arguments.length - 1];
+                fetch('/api/wallets/balance', {credentials: 'include', cache: 'no-store'})
+                    .then(function (r) { return r.json(); })
+                    .then(function (d) { done(d); })
+                    .catch(function () { done(null); });
+                """
+            )
+        except Exception:
+            return None
+        if not data:
+            return None
+        return self._extract_wallet_snapshot_from_json(data)
 
     def _extract_wallet_snapshot_from_page(self, driver: webdriver.Chrome) -> dict | None:
         try:
@@ -947,38 +996,195 @@ return false;
             DISCOVERED_ROUTES_PATH.write_text(json.dumps(route_map, indent=2), encoding="utf-8")
 
     def _navigate_to_profile(self, driver: webdriver.Chrome) -> bool:
-        """Force navigation to the profile page where balance and coins are visible."""
+        """Ensure we are on a page where the balance is visible (header for SportPesa)."""
         try:
-            # First try direct hash navigation as it's fastest
-            driver.execute_script("window.location.hash = '#/profile';")
-            time.sleep(1)
             self._dismiss_visible_promos(driver, rounds=1)
-            
-            # Verify we are on profile or try clicking the Profile tab
-            body_text = driver.execute_script("return (document.body && document.body.innerText) || '';").lower()
-            if "my balance" in body_text or "coins" in body_text:
-                return True
-                
-            # Fallback: click the Profile tab in the bottom navigation
-            self._click_by_text(driver, ["profile"])
-            time.sleep(1)
             return True
         except Exception:
             return False
 
+    def _get_driver_cookies(self, driver: webdriver.Chrome) -> dict[str, str]:
+        """Extract cookies from the Chrome browser for injection into requests.
+
+        The warm_browser preload loads the SportPesa page, which passes Akamai's
+        bot-detection challenge and sets session cookies.  Reusing those cookies
+        in a plain-requests call makes the API appear to be the same browsing
+        session — bypassing the 403/503 challenge pages.
+        """
+        try:
+            return {c["name"]: c["value"] for c in driver.get_cookies() if "name" in c}
+        except Exception:
+            return {}
+
+    def _api_login(self, phone: str, password: str, timeout: int = 20, retries: int = 3,
+                   cookies: dict[str, str] | None = None) -> dict:
+        """Log in via the SportPesa JSON API without a browser.
+
+        Returns {"ok": True, "balance": float, "currency": str, "token": str, "raw": dict}
+        or {"ok": False, "error": str, "status": int, "body": str}.
+
+        Akamai intermittently returns 403/503 challenge pages, so we retry with
+        backoff before giving up and falling back to the browser.
+        """
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Referer": "https://www.ke.sportpesa.com/",
+            "Origin": "https://www.ke.sportpesa.com",
+            "X-Channel": "web",
+        }
+        last_err = "unknown error"
+        for attempt in range(1, retries + 1):
+            try:
+                attempt_headers = dict(headers)
+                attempt_headers["X-TRACK-ID"] = str(uuid.uuid4())
+                # Use a Session so we can inject browser cookies to bypass Akamai
+                session = requests.Session()
+                if cookies:
+                    for name, value in cookies.items():
+                        session.cookies.set(name, value, domain=".ke.sportpesa.com")
+                resp = session.post(
+                    USER_API_LOGIN_URL,
+                    json={"usr": phone, "pwd": password},
+                    headers=attempt_headers,
+                    timeout=timeout,
+                )
+                try:
+                    data = resp.json()
+                except Exception:
+                    # Challenge / error HTML page -> retry with backoff
+                    last_err = f"Non-JSON response (HTTP {resp.status_code})"
+                    if attempt < retries:
+                        time.sleep(1.5 * attempt)
+                    continue
+                if resp.status_code != 200:
+                    message = data.get("description") or data.get("message") or f"HTTP {resp.status_code}"
+                    last_err = message
+                    if attempt < retries:
+                        time.sleep(1.5 * attempt)
+                    continue
+                if data.get("balance") is None:
+                    return {"ok": False, "error": "No balance in login response", "status": resp.status_code, "body": resp.text[:300]}
+                try:
+                    balance = float(data.get("balance") or 0)
+                except Exception:
+                    balance = 0.0
+                return {
+                    "ok": True,
+                    "balance": balance,
+                    "bonus": 0.0,
+                    "currency": data.get("currency", "KES"),
+                    "token": data.get("token", ""),
+                    "username": data.get("username", ""),
+                    "raw": data,
+                }
+            except Exception as exc:
+                last_err = str(exc)[:200]
+                if attempt < retries:
+                    time.sleep(1.5 * attempt)
+        return {"ok": False, "error": last_err, "status": None, "body": ""}
+
+    def check_single_balance_api(self, phone: str, password: str, gui_callback=None) -> dict:
+        """Fast balance check using only the SportPesa login API (no browser)."""
+        normalized = self._format_sportsape_login_phone(phone)
+        try:
+            self._emit(gui_callback, "   Logging in via SportPesa API...")
+            result = self._api_login(normalized, password)
+            if not result["ok"]:
+                return {
+                    "status": "error",
+                    "phone": phone,
+                    "balance": 0,
+                    "bonus": 0,
+                    "coins": 0,
+                    "message": f"API login failed: {result['error']}",
+                    "api_used": True,
+                }
+            balance = result["balance"]
+            bonus = result["bonus"]
+            return {
+                "status": "success",
+                "phone": phone,
+                "balance": balance,
+                "bonus": bonus,
+                "coins": 0,
+                "total": balance + bonus,
+                "message": "Success",
+                "currency": result.get("currency", "KES"),
+                "api_used": True,
+            }
+        except Exception as exc:
+            if gui_callback:
+                gui_callback(f"Error: {str(exc)[:100]}")
+            return {
+                "status": "error",
+                "phone": phone,
+                "balance": 0,
+                "bonus": 0,
+                "coins": 0,
+                "message": str(exc)[:100],
+                "api_used": True,
+            }
+
     def check_single_balance(self, phone: str, password: str, gui_callback=None, driver=None) -> dict:
-        external_driver = driver is not None
+        normalized = self._format_sportsape_login_phone(phone)
+
+        # ── Tier 1: Pure API  (fastest, no browser needed) ─────────────────
+        try:
+            api_result = self._api_login(normalized, password, retries=2)
+            if api_result["ok"]:
+                self._emit_direct(gui_callback, "   ✅ API login succeeded, reading balance from response...")
+                balance = api_result["balance"]
+                bonus = api_result["bonus"]
+                return {
+                    "status": "success",
+                    "phone": phone,
+                    "balance": balance,
+                    "bonus": bonus,
+                    "coins": 0,
+                    "total": balance + bonus,
+                    "message": "Success",
+                    "currency": api_result.get("currency", "KES"),
+                    "api_used": True,
+                }
+            self._emit_direct(gui_callback, f"   ⚠️ Tier-1 API blocked ({api_result['error']})")
+        except Exception as exc:
+            self._emit_direct(gui_callback, f"   ⚠️ Tier-1 API crashed ({str(exc)[:120]})")
+            api_result = None
+
+        # ── Tier 2: API with browser cookies  (bypasses Akamai) ──────────
+        own_driver = driver is None
         try:
             if not driver:
                 driver = self._acquire_driver(gui_callback=gui_callback)
+            cookies = self._get_driver_cookies(driver)
+            if cookies:
+                self._emit_direct(gui_callback, "   🔁 Retrying API with browser session cookies...")
+                api_result2 = self._api_login(normalized, password, cookies=cookies)
+                if api_result2["ok"]:
+                    self._emit_direct(gui_callback, "   ✅ Cookie-backed API login succeeded!")
+                    balance = api_result2["balance"]
+                    bonus = api_result2["bonus"]
+                    return {
+                        "status": "success",
+                        "phone": phone,
+                        "balance": balance,
+                        "bonus": bonus,
+                        "coins": 0,
+                        "total": balance + bonus,
+                        "message": "Success",
+                        "currency": api_result2.get("currency", "KES"),
+                        "api_used": True,
+                    }
+                self._emit_direct(gui_callback, f"   ⚠️ Cookie-backed API also blocked ({api_result2['error']})")
 
-            self._emit(gui_callback, "   Loading login page...")
+            # ── Tier 3: Full browser form fill  (most reliable) ───────────
+            self._emit_direct(gui_callback, "   🌐 Starting browser form login (most reliable)...")
             driver.get(LOGIN_URL)
-            # wait_for_site_shell is often too slow, use a lighter check
             WebDriverWait(driver, 10).until(lambda d: d.execute_script("return document.readyState") != "loading")
 
             phone_input, password_input = self._wait_for_login_inputs(driver, gui_callback=gui_callback)
-
             if not phone_input or not password_input:
                 return {
                     "status": "error",
@@ -986,23 +1192,35 @@ return false;
                     "balance": 0,
                     "bonus": 0,
                     "coins": 0,
-                    "message": "Could not find Winbetin login inputs",
+                    "message": "Could not find SportPesa login inputs",
                 }
 
             self._emit(gui_callback, "   Filling credentials...")
             phone_input.clear()
-            phone_input.send_keys(self._format_winbetin_login_phone(phone))
+            phone_input.send_keys(normalized)
             password_input.clear()
             password_input.send_keys(password)
             time.sleep(0.8)
 
             self._emit(gui_callback, "   Clicking login...")
             clicked = self._click_login_submit(driver)
-            self._wait_for_post_login(driver)
-            
+            login_state = self._wait_for_post_login(driver)
+            if login_state == "failed":
+                return {
+                    "status": "error",
+                    "phone": phone,
+                    "balance": 0,
+                    "bonus": 0,
+                    "coins": 0,
+                    "message": "Login failed: incorrect phone or password",
+                    "clicked_login": clicked,
+                    "logout_success": False,
+                }
+            if login_state == "timeout":
+                self._emit(gui_callback, "   Login result unclear, continuing with extraction...")
+
             self._emit(gui_callback, "   Navigating to Profile...")
             self._navigate_to_profile(driver)
-            # Short delay for header stabilization
             time.sleep(0.8)
 
             self._emit(gui_callback, "   Collecting CDP network logs...")
@@ -1016,6 +1234,9 @@ return false;
             if wallet_snapshot is None:
                 wallet_snapshot = self._extract_wallet_snapshot_from_token(token)
             if wallet_snapshot is None:
+                self._emit(gui_callback, "   Querying SportPesa balance API...")
+                wallet_snapshot = self._extract_wallet_snapshot_from_sportpesa_api(driver)
+            if wallet_snapshot is None:
                 self._emit(gui_callback, "   Falling back to page text wallet extraction...")
                 wallet_snapshot = self._extract_wallet_snapshot_from_page(driver)
 
@@ -1028,7 +1249,7 @@ return false;
                     "balance": 0,
                     "bonus": 0,
                     "coins": 0,
-                    "message": "Logged in or reached site, but no Winbetin wallet data was confirmed",
+                    "message": "Logged in or reached site, but no SportPesa wallet data was confirmed",
                     "clicked_login": clicked,
                     "logout_success": logout_success,
                 }
@@ -1059,12 +1280,11 @@ return false;
                 "message": str(exc)[:100],
             }
         finally:
-            if driver and not external_driver:
+            if driver and own_driver:
                 self._reset_driver_state(driver)
                 if not self._store_preloaded_driver(driver):
                     self._cleanup_driver(driver)
-            elif driver and external_driver:
-                # If reusing, just clear session for next account
+            elif driver and not own_driver:
                 self._reset_driver_state(driver)
 
     def check_balances(self, phone_list, password, gui_callback=None):
@@ -1073,7 +1293,7 @@ return false;
         indexed_results = {}
 
         def process_phone(phone, driver):
-            normalized = self._format_winbetin_login_phone(phone)
+            normalized = self._format_sportsape_login_phone(phone)
             result = None
             for attempt in range(2):
                 if not self.running:
@@ -1105,7 +1325,7 @@ return false;
                         if result["status"] == "success":
                             self._emit_direct(
                                 gui_callback,
-                                f"Checking: {phone} Balance: KES {result['balance']:,.2f} | Coins: {result.get('coins', 0):,.0f}",
+                                    f"Checking: {phone} Balance: KES {result['balance']:,.2f} | Bonus: KES {result.get('bonus', 0):,.2f}",
                             )
                         else:
                             self._emit_direct(gui_callback, f"Checking: {phone} Failed: {result['message']}")
@@ -1136,7 +1356,7 @@ return false;
                         if result["status"] == "success":
                             self._emit_direct(
                                 gui_callback,
-                                f"Checking: {phone} Balance: KES {result['balance']:,.2f} | Coins: {result.get('coins', 0):,.0f}",
+                                    f"Checking: {phone} Balance: KES {result['balance']:,.2f} | Bonus: KES {result.get('bonus', 0):,.2f}",
                             )
                         else:
                             self._emit_direct(gui_callback, f"Checking: {phone} Failed: {result['message']}")
@@ -1169,13 +1389,13 @@ return false;
         # Emit total balance summary to GUI
         if gui_callback:
             total_bal = sum(r["balance"] for r in results if r["status"] == "success")
-            total_coins = sum(r.get("coins", 0) for r in results if r["status"] == "success")
+            total_bonus = sum(r["bonus"] for r in results if r["status"] == "success")
             success_count = sum(1 for r in results if r["status"] == "success")
             
             gui_callback("-" * 30)
             gui_callback(f"🏆 FINAL SUMMARY: {success_count}/{len(results)} Accounts Successful")
             gui_callback(f"💰 TOTAL BALANCE: KES {total_bal:,.2f}")
-            gui_callback(f"🪙 TOTAL COINS: {total_coins:,.0f}")
+            gui_callback(f"🎁 TOTAL BONUS: KES {total_bonus:,.2f}")
             gui_callback("-" * 31) # Slightly different length to avoid GUI de-duplication
 
         self.generate_balance_report(results, gui_callback)
@@ -1196,13 +1416,12 @@ return false;
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Phone", "Status", "Balance", "Coins", "Bonus", "Message"])
+                writer.writerow(["Phone", "Status", "Balance", "Bonus", "Message"])
                 for item in results:
                     writer.writerow([
                         item["phone"],
                         item["status"],
                         f"{item['balance']:.2f}",
-                        f"{item.get('coins', 0):.0f}",
                         f"{item.get('bonus', 0):.2f}",
                         item["message"]
                     ])
@@ -1215,13 +1434,13 @@ return false;
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         filename = f"balance_report_{timestamp}.txt"
         total_balance = sum(item["balance"] for item in results if item["status"] == "success")
-        total_coins = sum(item.get("coins", 0) for item in results if item["status"] == "success")
+        total_bonus = sum(item.get("bonus", 0) for item in results if item["status"] == "success")
         success_count = sum(1 for item in results if item["status"] == "success")
         failed_count = len(results) - success_count
 
         lines = [
             "=" * 80,
-            "WINBETIN BALANCE AND COINS REPORT",
+            "SPORTSAPE V2 BALANCE REPORT",
             "=" * 80,
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Total Accounts: {len(results)}",
@@ -1229,14 +1448,14 @@ return false;
             f"Failed: {failed_count}",
             "",
             f"Total Balance: KES {total_balance:,.2f}",
-            f"Total Coins: {total_coins:,.0f}",
+            f"Total Bonus: KES {total_bonus:,.2f}",
             "",
         ]
 
         for item in results:
             if item["status"] == "success":
                 lines.append(
-                    f"{item['phone']}: Balance KES {item['balance']:,.2f} | Coins {item.get('coins', 0):,.0f}"
+                    f"{item['phone']}: Balance KES {item['balance']:,.2f} | Bonus KES {item.get('bonus', 0):,.2f}"
                 )
             else:
                 lines.append(f"{item['phone']}: FAILED - {item['message']}")
@@ -1267,7 +1486,7 @@ return false;
         return self.check_single_balance(self.normalize_phone(phone), password)
 
     def withdraw_funds(self, _phone, _password, _amount, _callback=None):
-        return {"status": "error", "message": "Withdraw automation is not configured for Winbetin yet"}
+        return {"status": "error", "message": "Withdraw automation is not configured for SportPesa yet"}
 
     def check_account_balances(self, phone_list, password, gui_callback=None):
         results = self.check_balances(phone_list, password, gui_callback)
@@ -1277,25 +1496,25 @@ return false;
         return ready, insufficient, inactive
 
     def place_single_bet_with_booking_code(self, *_args, **_kwargs):
-        return {"status": "error", "message": "Bet placement is not configured for Winbetin yet"}
+        return {"status": "error", "message": "Bet placement is not configured for SportPesa yet"}
 
     def place_bets_with_booking_code(self, *_args, **_kwargs):
-        return {"status": "error", "message": "Bet placement is not configured for Winbetin yet"}
+        return {"status": "error", "message": "Bet placement is not configured for SportPesa yet"}
 
     def roll_over_accounts(self, *_args, **_kwargs):
-        return {"status": "error", "message": "Rollover is not configured for Winbetin yet"}
+        return {"status": "error", "message": "Rollover is not configured for SportPesa yet"}
 
     def claim_bonuses_for_accounts(self, *_args, **_kwargs):
-        return {"status": "error", "message": "Bonus claiming is not configured for Winbetin yet"}
+        return {"status": "error", "message": "Bonus claiming is not configured for SportPesa yet"}
 
     def batch_withdraw(self, *_args, **_kwargs):
-        return {"status": "error", "message": "Batch withdraw is not configured for Winbetin yet"}
+        return {"status": "error", "message": "Batch withdraw is not configured for SportPesa yet"}
 
     def odileague_supa5_automation(self, *_args, **_kwargs):
-        return {"status": "error", "message": "Supa5 automation is not configured for Winbetin yet"}
+        return {"status": "error", "message": "Supa5 automation is not configured for SportPesa yet"}
 
     def run_odileague_bonus(self, *_args, **_kwargs):
-        return {"status": "error", "message": "Bonus automation is not configured for Winbetin yet"}
+        return {"status": "error", "message": "Bonus automation is not configured for SportPesa yet"}
 
     def extract_tokens_for_accounts(self, *_args, **_kwargs):
         return False

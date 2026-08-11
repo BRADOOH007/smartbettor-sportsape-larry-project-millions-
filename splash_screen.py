@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Winbetin Balance Checker - Elegant Loading Splash Screen
+Sportsape BitBot Checker - Elegant Loading Splash Screen
 Displays a professional loading screen while the application initializes
 """
 import tkinter as tk
@@ -10,7 +10,8 @@ import time
 import os
 from resource_path import resource_path
 
-WINDOWS_APP_ID = "WinbetinBalanceChecker.Splash.v5"
+WINDOWS_APP_ID = "SportsapeBitBot.Splash.v2"
+APP_VERSION = "5.0.0"
 
 
 
@@ -54,17 +55,17 @@ class SplashScreen:
             self.root.withdraw()  # Hide initially
             
             # Window configuration - compact and well-proportioned
-            self.width = 480
-            self.height = 380
+            self.width = 500
+            self.height = 430
             
             # 🔧 ROBUST: Setup window with error handling
             try:
                 self.setup_window()
             except Exception as setup_err:
                 # Minimal setup if full setup fails
-                self.root.title("Winbetin Balance Checker")
+                self.root.title("Sportsape BitBot Checker")
                 self.root.geometry(f"{self.width}x{self.height}")
-                self.root.configure(bg='#0a0a0a')
+                self.root.configure(bg='#0c1b26')
             
             # Progress tracking
             self.progress_var = tk.DoubleVar(value=0)
@@ -111,7 +112,7 @@ class SplashScreen:
     def setup_window(self):
         """Configure window properties with robust error handling"""
         try:
-            self.root.title("Winbetin Balance Checker")
+            self.root.title("Sportsape BitBot Checker")
         except:
             pass
         
@@ -128,7 +129,7 @@ class SplashScreen:
         
         # Set window properties
         try:
-            self.root.configure(bg='#0a0a0a')
+            self.root.configure(bg='#0c1b26')
         except:
             pass
         
@@ -193,176 +194,91 @@ class SplashScreen:
             pass  # Centering is optional - window will appear at default position
     
     def create_ui(self):
-        """Create splash screen UI"""
-        # Main container with border
-        container = tk.Frame(
-            self.root,
-            bg='#1a1a1a',
-            highlightthickness=2,
-            highlightbackground='#00ff00',
-            highlightcolor='#00ff00'
-        )
+        """Create splash screen UI - clean SportPesa branded"""
+        N  = '#0c1b26'   # navy bg
+        P  = '#14303f'   # panel
+        G  = '#ffb200'   # gold accent
+        GD = '#d49900'   # gold dark
+        W  = '#ffffff'   # white
+        M  = '#7d98a8'   # muted
+
+        # Container
+        container = tk.Frame(self.root, bg=P, highlightthickness=1,
+                             highlightbackground=G, highlightcolor=G)
         container.pack(fill='both', expand=True, padx=2, pady=2)
-        
-        # Inner frame
-        inner_frame = tk.Frame(container, bg='#0a0a0a')
-        inner_frame.pack(fill='both', expand=True, padx=20, pady=15)
-        
-        # Logo section - smaller to make room for text
-        self.create_logo_section(inner_frame)
-        
-        # Title - compact size
-        title_label = tk.Label(
-            inner_frame,
-            text="⚡ WINBETIN",
-            font=('Arial', 22, 'bold'),
-            bg='#0a0a0a',
-            fg='#00ff00'
-        )
-        title_label.pack(pady=(10, 5))
-        
-        # Subtitle - more visible color
-        subtitle_label = tk.Label(
-            inner_frame,
-            text="Automated Balance Checking",
-            font=('Arial', 9),
-            bg='#0a0a0a',
-            fg='#00aa00'
-        )
-        subtitle_label.pack(pady=(0, 15))
-        
-        # Progress bar frame
-        progress_frame = tk.Frame(inner_frame, bg='#0a0a0a')
-        progress_frame.pack(fill='x', pady=(0, 10))
-        
-        # Custom styled progress bar
+
+        inner = tk.Frame(container, bg=N)
+        inner.pack(fill='both', expand=True, padx=28, pady=20)
+
+        # Top gold line
+        tk.Frame(inner, bg=G, height=2).pack(fill='x', pady=(0, 10))
+
+        # Logo
+        self._build_logo(inner, N, G, W)
+
+        # Title
+        tk.Label(inner, text="Sportsape BitBot", font=('Segoe UI', 24, 'bold'),
+                 bg=N, fg=W).pack(pady=(12, 2))
+
+        # Subtitle
+        tk.Label(inner, text="SportPesa Kenya Balance Checker", font=('Segoe UI', 10),
+                 bg=N, fg=M).pack(pady=(2, 20))
+
+        # Progress bar
         style = ttk.Style()
         style.theme_use('default')
-        style.configure(
-            "Elegant.Horizontal.TProgressbar",
-            troughcolor='#1a1a1a',
-            bordercolor='#00ff00',
-            background='#00ff00',
-            lightcolor='#00ff00',
-            darkcolor='#00aa00',
-            thickness=25
-        )
-        
+        style.configure("Splash.Horizontal.TProgressbar",
+                         troughcolor=P, bordercolor=G, background=G,
+                         lightcolor=G, darkcolor=GD, thickness=14)
         self.progress_bar = ttk.Progressbar(
-            progress_frame,
-            style="Elegant.Horizontal.TProgressbar",
-            variable=self.progress_var,
-            maximum=100,
-            mode='determinate',
-            length=400
-        )
-        self.progress_bar.pack(pady=10)
-        
-        # Status label - LARGER and BRIGHTER for visibility with more space
-        self.status_label = tk.Label(
-            inner_frame,
-            textvariable=self.status_var,
-            font=('Arial', 10, 'bold'),
-            bg='#0a0a0a',
-            fg='#00ff00',  # Bright green
-            wraplength=420,  # Wrap text if too long
-            height=2  # Reserve space for 2 lines
-        )
-        self.status_label.pack(pady=(5, 15))
-        
-        # Footer with version - brighter text
-        footer_label = tk.Label(
-            inner_frame,
-            text="v5.0.0 | AI-Powered | Secure",
-            font=('Arial', 8),
-            bg='#0a0a0a',
-            fg='#00aa00'
-        )
-        footer_label.pack(side='bottom', pady=(5, 0))
-    
-    def create_logo_section(self, parent):
-        """Create professional logo section (image or stylized text)"""
-        logo_frame = tk.Frame(parent, bg='#0a0a0a')
-        logo_frame.pack(pady=(0, 0))
-        
-        # Try to load logo image (works in EXE and dev)
+            inner, style="Splash.Horizontal.TProgressbar",
+            variable=self.progress_var, maximum=100, mode='determinate', length=410)
+        self.progress_bar.pack(pady=(0, 8))
+
+        # Status
+        self.status_label = tk.Label(inner, textvariable=self.status_var,
+                                     font=('Consolas', 9),
+                                     bg=N, fg=G, wraplength=410, height=2)
+        self.status_label.pack(pady=(2, 10))
+
+        # Footer
+        tk.Label(inner, text=f"v{APP_VERSION}  ·  API Fast-Path  ·  Secure",
+                 font=('Segoe UI', 8), bg=N, fg=M).pack(side='bottom', pady=(4, 0))
+
+        # Bottom gold line
+        tk.Frame(inner, bg=G, height=2).pack(side='bottom', fill='x', pady=(6, 0))
+
+    def _build_logo(self, parent, navy, gold, white):
+        """Render the app icon or a stylized fallback logo."""
+        frame = tk.Frame(parent, bg=navy)
+        frame.pack(pady=(6, 0))
+
         logo_path = resource_path('Assets/balance_icon.png')
         if os.path.exists(logo_path):
             try:
                 from PIL import Image, ImageTk
                 img = Image.open(logo_path)
-                
-                # Resize to fit professionally (very small to leave room for text)
-                max_size = (60, 60)
-                img.thumbnail(max_size, Image.Resampling.LANCZOS)
-                
-                # Create a circular mask effect (optional)
+                img.thumbnail((88, 88), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
-                
-                # Display with minimal padding
-                logo_container = tk.Frame(logo_frame, bg='#0a0a0a')
-                logo_container.pack(pady=2)
-                
-                logo_label = tk.Label(
-                    logo_container,
-                    image=photo,
-                    bg='#0a0a0a',
-                    borderwidth=0,
-                    highlightthickness=0
-                )
-                logo_label.image = photo  # Keep reference
-                logo_label.pack()
-                
-                # Add glow effect with border
-                border_frame = tk.Frame(
-                    logo_frame, 
-                    bg='#00ff00',
-                    width=160,
-                    height=160
-                )
-                border_frame.place(x=-5, y=-5)
-                border_frame.lower()
-                
+
+                ring = tk.Frame(frame, bg=gold, highlightbackground=gold, highlightthickness=1)
+                ring.pack(ipadx=4, ipady=4)
+                lbl = tk.Label(ring, image=photo, bg=navy, borderwidth=0, highlightthickness=0)
+                lbl.image = photo
+                lbl.pack(padx=3, pady=3)
                 return
-            except ImportError:
-                # PIL not available, use stylized text logo
+            except (ImportError, Exception):
                 pass
-            except Exception as e:
-                # Image loading failed, use fallback
-                pass
-        
-        # Fallback: Professional stylized logo
-        # Create multi-layer logo for depth
-        logo_container = tk.Frame(logo_frame, bg='#0a0a0a')
-        logo_container.pack(pady=10)
-        
-        # Shadow layer (creates depth)
-        shadow_label = tk.Label(
-            logo_container,
-            text="⚡ WINBETIN",
-            font=('Arial Black', 36, 'bold'),
-            bg='#0a0a0a',
-            fg='#003300'
-        )
-        shadow_label.place(x=2, y=2)
-        
-        # Main logo
-        logo_main = tk.Label(
-            logo_container,
-            text="⚡ WINBETIN",
-            font=('Arial Black', 36, 'bold'),
-            bg='#0a0a0a',
-            fg='#00ff00'
-        )
-        logo_main.pack()
-        
-        # Glow effect border
-        glow_frame = tk.Frame(
-            logo_container,
-            bg='#00ff00',
-            height=2
-        )
-        glow_frame.pack(fill='x', pady=5)
+
+        # Stylized fallback
+        c = tk.Frame(frame, bg=navy)
+        c.pack()
+        tk.Label(c, text="SB", font=('Arial Black', 36, 'bold'),
+                 bg=navy, fg='#06233a').place(x=2, y=2)
+        tk.Label(c, text="SB", font=('Arial Black', 36, 'bold'),
+                 bg=navy, fg=gold).pack()
+        tk.Frame(c, bg=gold, height=2).pack(fill='x', pady=4)
+
     
     def update_progress(self, value, status=""):
         """
@@ -415,36 +331,16 @@ class SplashScreen:
     def create_minimal_ui(self):
         """Create minimal UI if full UI creation fails (fallback)"""
         try:
-            # Minimal title
-            title = tk.Label(
-                self.root,
-                text="⚡ WINBETIN",
-                font=('Arial', 20, 'bold'),
-                bg='#0a0a0a',
-                fg='#00ff00'
-            )
-            title.pack(pady=50)
-            
-            # Minimal status
-            self.status_label = tk.Label(
-                self.root,
-                textvariable=self.status_var,
-                font=('Arial', 10),
-                bg='#0a0a0a',
-                fg='#00ff00'
-            )
+            N, G = '#0c1b26', '#ffb200'
+            tk.Label(self.root, text="Sportsape BitBot", font=('Segoe UI', 20, 'bold'),
+                     bg=N, fg=G).pack(pady=50)
+            self.status_label = tk.Label(self.root, textvariable=self.status_var,
+                                         font=('Segoe UI', 10), bg=N, fg='#ffffff')
             self.status_label.pack(pady=20)
-            
-            # Minimal progress bar
-            self.progress_bar = ttk.Progressbar(
-                self.root,
-                variable=self.progress_var,
-                maximum=100,
-                length=300
-            )
+            self.progress_bar = ttk.Progressbar(self.root, variable=self.progress_var,
+                                                maximum=100, length=300)
             self.progress_bar.pack(pady=10)
         except:
-            # If even minimal UI fails, just create empty window
             pass
     
     def close(self):

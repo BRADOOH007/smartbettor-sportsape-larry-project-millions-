@@ -10,8 +10,20 @@ import requests
 import sys
 import subprocess
 
-# Import Winbetin backend
-from winbetin_backend import WinbetinBackend
+# Ensure print() handles emoji/unicode even on cp1252 consoles
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(errors="replace")
+    except Exception:
+        pass
+
+# Import Sportsape backend
+from sportsape_backend import SportsapeBackend
 
 from resource_path import resource_path, writable_path
 
@@ -64,16 +76,16 @@ class BetFlowProGUI:
         self.root = root
         self.splash_screen = splash_screen  # Store splash screen reference for progress updates
         if sys.platform == 'win32':
-            set_windows_app_id(f"WinbetinBalanceChecker.{APP_VERSION}")
-        self.root.title(f"💰 WonBetin Checker By BetFlow v{APP_VERSION}")
+            set_windows_app_id(f"SportsapeBitBot.{APP_VERSION}")
+        self.root.title(f"💰 Sportsape BitBot v{APP_VERSION}")
         
         # Get screen dimensions for centering
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         
         # PERFORMANCE FIX: Fixed window size eliminates resize lag
-        window_width = 840
-        window_height = 720
+        window_width = 860
+        window_height = 760
         
         # Calculate center position
         center_x = int((screen_width - window_width) / 2)
@@ -105,7 +117,7 @@ class BetFlowProGUI:
         self._watchdog_interval = 1.0  # Check every second
         self._start_gui_watchdog()
         
-        self.root.configure(bg='#1e1e1e')
+        self.root.configure(bg='#0c1b26')
         
         # Make window appear on top and get focus
         self.root.lift()
@@ -130,8 +142,8 @@ class BetFlowProGUI:
             try:
                 from PIL import Image, ImageDraw, ImageTk
                 
-                # Create 32x32 icon with green background and $ symbol
-                img = Image.new('RGBA', (32, 32), (34, 139, 34, 255))  # Forest green
+                # Create 32x32 icon with SportPesa blue background and $ symbol
+                img = Image.new('RGBA', (32, 32), (0, 168, 250, 255))  # SportPesa blue
                 draw = ImageDraw.Draw(img)
                 
                 # Draw white border circle
@@ -190,9 +202,9 @@ class BetFlowProGUI:
         self._fast_mode_active = False  # Track if Golang fast mode is active
 
         # Initialize components - this is the slowest part
-        update_splash_progress(20, "🧠 Initializing Winbetin backend...")
-        self.headless = WinbetinBackend()
-        update_splash_progress(35, "✅ Winbetin backend ready")
+        update_splash_progress(20, "🧠 Initializing Sportsape BitBot backend...")
+        self.headless = SportsapeBackend()
+        update_splash_progress(35, "✅ Sportsape BitBot backend ready")
         
         # Stub components not used by this balance checker
         self.remote_server = None
@@ -202,6 +214,10 @@ class BetFlowProGUI:
         self.preloader = None
         self.last_accounts_text = ""
         self.last_password = ""
+        # Terminal counter-logging debounce state
+        self._last_logged_count = 0
+        self._count_log_after_id = None
+        self._phone_placeholder_active = False
         
         # Set network status callback for headless engine
         # self.headless.network_status_callback = lambda: self.network_online
@@ -223,7 +239,7 @@ class BetFlowProGUI:
         update_splash_progress(75, "✅ Configuration loaded")
         self.telegram_token = tk.StringVar(value=self.config.get('telegram_token', ''))
         self.telegram_chat_id = tk.StringVar(value=self.config.get('telegram_chat_id', ''))
-        self.target_url = tk.StringVar(value=self.config.get('base_url', 'https://winbetin.com/#/Login'))
+        self.target_url = tk.StringVar(value=self.config.get('base_url', 'https://www.ke.sportpesa.com/en/sports-betting/football-1/'))
         self.theme = tk.StringVar(value=self.config.get('theme', 'dark'))
         
         # AI Control Variables
@@ -238,22 +254,42 @@ class BetFlowProGUI:
         self.paned_windows = {}  # Store paned window references for resizing
         
 
-        # UI Colors
+        # UI Colors - SportPesa brand palette
         self.dark_theme = {
-            'bg': '#1e1e1e',
+            'bg': '#0c1b26',
             'fg': '#ffffff',
-            'button_bg': '#2196F3',
+            'button_bg': '#00a8fa',
             'button_fg': '#ffffff',
-            'text_bg': '#252525',
-            'text_fg': '#e0e0e0'
+            'text_bg': '#0e2433',
+            'text_fg': '#e8f4fa',
+            'panel': '#14303f',
+            'panel_alt': '#1f4255',
+            'accent': '#ffb200',
+            'accent_dark': '#d49900',
+            'gold': '#ffb200',
+            'danger': '#e11d48',
+            'muted': '#7d98a8',
+            'border': '#2b4a5c',
+            'terminal_bg': '#050d12',
+            'terminal_fg': '#00ff9c',
         }
         self.light_theme = {
-            'bg': '#f8f9fa',
-            'fg': '#212529',
-            'button_bg': '#e9ecef',
-            'button_fg': '#212529',
+            'bg': '#f2f6f9',
+            'fg': '#12222e',
+            'button_bg': '#00a8fa',
+            'button_fg': '#ffffff',
             'text_bg': '#ffffff',
-            'text_fg': '#212529'
+            'text_fg': '#12222e',
+            'panel': '#ffffff',
+            'panel_alt': '#e7f3fb',
+            'accent': '#ffb200',
+            'accent_dark': '#d49900',
+            'gold': '#b8860b',
+            'danger': '#e11d48',
+            'muted': '#5f7a8c',
+            'border': '#cfe0ea',
+            'terminal_bg': '#0a0f14',
+            'terminal_fg': '#00ff9c',
         }
         
         # Set initial colors based on theme from config
@@ -601,7 +637,7 @@ class BetFlowProGUI:
                 with open(path, 'r', encoding='utf-8') as f:
                     return json.load(f)
         return {
-            'base_url': 'https://winbetin.com/#/Login',
+            'base_url': 'https://www.ke.sportpesa.com/en/sports-betting/football-1/',
             'endpoints': {
                 'login': '/api/login',
                 'balance': '/api/balance',
@@ -630,64 +666,73 @@ class BetFlowProGUI:
             self.save_config()
 
     def create_widgets(self):
-        # Top frame for theme toggle and shortcuts info
-        top_frame = tk.Frame(self.root, bg=self.colors['bg'])
-        top_frame.pack(fill='x', padx=10, pady=5)
-        
-        # Shortcuts info label
-        shortcuts_label = tk.Label(top_frame, text="Shortcuts: Ctrl+O (Upload Phone Numbers) | Ctrl+R (Check Balance) | Ctrl+T (Toggle Theme)", 
-                                 fg=self.colors['fg'], bg=self.colors['bg'], font=('Arial', 8))
-        shortcuts_label.pack(side='left')
-        
-        # Live Clock (EAT - Kenya Time) - Professional + shows system is alive
-        self.clock_label = tk.Label(top_frame, text="🕐 --:--:--\nEAT (Kenya)", 
-                                    fg='#FFC107', bg=self.colors['bg'], 
-                                    font=('Consolas', 9, 'bold'), 
-                                    justify='center')
-        self.clock_label.pack(side='right', padx=10)
-        
-        # Network status indicator with better symbol
-        self.network_label = tk.Label(top_frame, text="● Online", fg='#4CAF50', bg=self.colors['bg'], font=('Arial', 10, 'bold'))
-        self.network_label.pack(side='right', padx=10)
-        
-        # Theme toggle button (icon depends on current theme)
-        theme_text = "🌙 Toggle Theme" if self.theme.get() == 'dark' else "🌞 Toggle Theme"
-        theme_bg = '#9C27B0' if self.theme.get() == 'dark' else '#FF9800'
-        self.theme_btn = tk.Button(top_frame, text=theme_text, command=self.toggle_theme, bg=theme_bg, fg='white')
-        self.theme_btn.pack(side='right')
+        colors = self.colors
+        bg = colors['bg']
 
-        # Persistence toggle (default OFF => stateless)
+        # ── Top status bar ──────────────────────────────────────────────
+        top_frame = tk.Frame(self.root, bg=bg)
+        top_frame.pack(fill='x', padx=12, pady=(8, 4))
+
+        shortcuts_label = tk.Label(
+            top_frame,
+            text="Shortcuts:  Ctrl+O Upload  ·  Ctrl+R Check  ·  Ctrl+T Theme",
+            fg=colors.get('muted', colors['fg']), bg=bg, font=('Segoe UI', 8)
+        )
+        shortcuts_label.pack(side='left')
+
+        right_cluster = tk.Frame(top_frame, bg=bg)
+        right_cluster.pack(side='right')
+
+        self.clock_label = tk.Label(
+            right_cluster, text="🕐 --:--:--\nEAT (Kenya)",
+            fg=colors.get('gold', '#FFC107'), bg=bg,
+            font=('Consolas', 8, 'bold'), justify='center'
+        )
+        self.clock_label.pack(side='right', padx=(12, 0))
+
+        self.network_label = tk.Label(
+            right_cluster, text="● Online", fg='#00e07a', bg=bg,
+            font=('Segoe UI', 9, 'bold')
+        )
+        self.network_label.pack(side='right', padx=(12, 0))
+
         self.allow_persist = tk.BooleanVar(value=True)
         persist_cb = tk.Checkbutton(
-            top_frame,
-            text="Allow saving to disk",
+            right_cluster,
+            text="Save to disk",
             variable=self.allow_persist,
             command=self.toggle_persistence,
-            bg=self.colors['bg'], fg=self.colors['fg'], selectcolor=self.colors['bg']
+            bg=bg, fg=colors.get('muted', colors['fg']), selectcolor=bg,
+            activebackground=bg, activeforeground=colors['fg'],
+            font=('Segoe UI', 8)
         )
-        persist_cb.pack(side='right', padx=10)
+        persist_cb.pack(side='right', padx=(12, 0))
 
-        # Create main canvas with scrollbar for all content - STABLE CONFIG
-        main_canvas = tk.Canvas(self.root, bg=self.colors['bg'], highlightthickness=0, bd=0)
+        theme_text = "🌙 Dark" if self.theme.get() == 'dark' else "🌞 Light"
+        theme_bg = colors.get('panel_alt', '#9C27B0')
+        self.theme_btn = tk.Button(
+            right_cluster, text=theme_text, command=self.toggle_theme,
+            bg=theme_bg, fg='white', relief=tk.FLAT, bd=0, padx=10, pady=2,
+            activebackground=colors.get('accent_dark', '#0097e1'), activeforeground='white',
+            cursor='hand2'
+        )
+        self.theme_btn.pack(side='right')
+
+        # ── Scrollable canvas for content ───────────────────────────────
+        main_canvas = tk.Canvas(self.root, bg=bg, highlightthickness=0, bd=0)
         main_scrollbar = tk.Scrollbar(self.root, orient="vertical", command=main_canvas.yview)
-        scrollable_frame = tk.Frame(main_canvas, bg=self.colors['bg'])
-        
-        # Create window in canvas with proper anchoring
+        scrollable_frame = tk.Frame(main_canvas, bg=bg)
+
         canvas_window = main_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        
-        # Configure scroll region when frame size changes - OPTIMIZED FOR NO GLITCHES
+
         scroll_update_lock = threading.Lock()
         frame_update_pending = False
-        
+
         def _on_frame_configure(event):
-            """Optimized frame configure - prevents scroll glitches with debouncing"""
             nonlocal frame_update_pending
-            
             if not scroll_update_lock.acquire(blocking=False):
-                return  # Skip if already updating
-            
+                return
             try:
-                # Debounce scroll region updates to prevent excessive redraws
                 if not frame_update_pending:
                     frame_update_pending = True
                     def update_region():
@@ -699,30 +744,22 @@ class BetFlowProGUI:
                         except:
                             pass
                         frame_update_pending = False
-                    
-                    # Batch update with small delay - prevents flickering
                     self.root.after(10, update_region)
             finally:
                 scroll_update_lock.release()
-        
+
         scrollable_frame.bind("<Configure>", _on_frame_configure)
-        
-        # Make scrollable_frame match canvas width - OPTIMIZED
+
         canvas_config_lock = threading.Lock()
         canvas_update_pending = False
-        
+
         def _on_canvas_configure(event):
-            """Optimized canvas configure - prevents resize glitches with debouncing"""
             nonlocal canvas_update_pending
-            
             if not canvas_config_lock.acquire(blocking=False):
                 return
-            
             try:
                 canvas_width = event.width
                 main_canvas.itemconfig(canvas_window, width=canvas_width)
-                
-                # Debounce scroll region update to prevent visual artifacts
                 if not canvas_update_pending:
                     canvas_update_pending = True
                     def update_region():
@@ -734,36 +771,26 @@ class BetFlowProGUI:
                         except:
                             pass
                         canvas_update_pending = False
-                    
-                    # Small delay prevents flickering during resize
                     self.root.after(10, update_region)
             finally:
                 canvas_config_lock.release()
-        
+
         main_canvas.bind('<Configure>', _on_canvas_configure)
         main_canvas.configure(yscrollcommand=main_scrollbar.set)
-        
-        # Pack with proper ordering
+
         main_scrollbar.pack(side="right", fill="y")
-        main_canvas.pack(side="left", fill="both", expand=True, padx=10, pady=10)
-        
-        # Enable smooth mouse wheel scrolling - OPTIMIZED FOR NO GLITCHES
+        main_canvas.pack(side="left", fill="both", expand=True, padx=12, pady=6)
+
         scroll_lock = threading.Lock()
         scroll_update_pending = False
-        
+
         def _on_mousewheel(event):
-            """Smooth scrolling without glitches - optimized debouncing"""
             nonlocal scroll_update_pending
-            
             if not scroll_lock.acquire(blocking=False):
-                return  # Skip if already scrolling
-            
+                return
             try:
-                # Calculate scroll amount (smoother)
                 delta = -1 * (event.delta / 120)
                 main_canvas.yview_scroll(int(delta), "units")
-                
-                # Batch scroll region updates - prevent excessive redraws
                 if not scroll_update_pending:
                     scroll_update_pending = True
                     def update_scroll_region():
@@ -775,244 +802,255 @@ class BetFlowProGUI:
                         except:
                             pass
                         scroll_update_pending = False
-                    
-                    # Debounce scroll region update
                     self.root.after(50, update_scroll_region)
-                
-                # Release lock after short delay - increased for smoother scrolling
                 self.root.after(20, scroll_lock.release)
             except:
                 scroll_lock.release()
-        
-        # Bind to canvas only (not globally) to prevent conflicts
+
         def enable_scroll(event):
             main_canvas.bind_all("<MouseWheel>", _on_mousewheel)
         def disable_scroll(event):
             main_canvas.unbind_all("<MouseWheel>")
-        
+
         main_canvas.bind("<Enter>", enable_scroll)
         main_canvas.bind("<Leave>", disable_scroll)
-        
-        # Use scrollable_frame as parent for all sections
+
         top_section = scrollable_frame
 
-        # Logo and Title Section at the top
-        logo_section = tk.Frame(top_section, bg=self.colors['bg'])
-        logo_section.pack(fill='x', pady=(5, 10))
-        
-        # Try to display logo image (works in EXE and dev)
+        # ── Logo + Title (floating, no background band) ────────────────
+        logo_title_row = tk.Frame(top_section, bg=bg)
+        logo_title_row.pack(fill='x', pady=(4, 6))
+
         logo_path = resource_path('Assets/balance_icon.png')
         if os.path.exists(logo_path):
             try:
                 from PIL import Image, ImageTk
                 img = Image.open(logo_path)
-                # Resize to reasonable size for main GUI
                 img.thumbnail((80, 80), Image.Resampling.LANCZOS)
                 self.logo_photo = ImageTk.PhotoImage(img)
-                
-                logo_label = tk.Label(
-                    logo_section,
-                    image=self.logo_photo,
-                    bg=self.colors['bg']
-                )
-                logo_label.pack(side='left', padx=10)
-            except Exception as e:
-                # If image fails, skip silently
+                logo_label = tk.Label(logo_title_row, image=self.logo_photo, bg=bg)
+                logo_label.pack(side='left', padx=(6, 14))
+            except Exception:
                 pass
-        
-        # Title next to logo
-        title_frame = tk.Frame(logo_section, bg=self.colors['bg'])
-        title_frame.pack(side='left', fill='x', expand=True)
-        
+
+        title_frame = tk.Frame(logo_title_row, bg=bg)
+        title_frame.pack(side='left')
+
         title_label = tk.Label(
             title_frame,
-            text="💰 WINBETIN BALANCE CHECKER",
-            font=('Arial', 18, 'bold'),
-            fg='#00ff00',
-            bg=self.colors['bg']
+            text="SPORTSAPE BITBOT",
+            font=('Segoe UI', 18, 'bold'),
+            fg='#ffffff',
+            bg=bg
         )
         title_label.pack(anchor='w')
-        
+
         subtitle_label = tk.Label(
             title_frame,
-            text="⚠️ WINBETIN INTEGRATION ACTIVE - Browser automation required",
-            font=('Arial', 9),
-            fg='#FF9800',
-            bg=self.colors['bg']
+            text="SportPesa Balance Checker  ·  API + Browser Login",
+            font=('Segoe UI', 9),
+            fg=colors.get('gold', '#ffb200'),
+            bg=bg
         )
         subtitle_label.pack(anchor='w')
 
-        # Phone numbers section with drag-drop support
-        phone_frame = tk.LabelFrame(top_section, text="📱 Phone Numbers for Balance Check (Drag & Drop files here)", fg=self.colors['fg'], bg=self.colors['bg'])
-        phone_frame.pack(fill='x', pady=5)
+        # ── Phone numbers card ──────────────────────────────────────────
+        phone_frame = tk.LabelFrame(
+            top_section,
+            text="  📱  PHONE NUMBERS  ",
+            fg=colors.get('accent', colors['fg']),
+            bg=colors.get('panel', colors['bg']),
+            bd=1, relief=tk.GROOVE,
+            font=('Segoe UI', 10, 'bold'),
+        )
+        phone_frame.pack(fill='x', pady=(14, 6))
 
-        # Horizontal paned window for phone text and buttons
-        phone_paned = tk.PanedWindow(phone_frame, orient=tk.HORIZONTAL, bg=self.colors['bg'])
-        phone_paned.pack(fill='both', expand=True, padx=5, pady=5)
+        phone_paned = tk.PanedWindow(phone_frame, orient=tk.HORIZONTAL, bg=colors.get('panel', colors['bg']), relief=tk.FLAT)
+        phone_paned.pack(fill='both', expand=True, padx=8, pady=8)
         self.paned_windows['phone'] = phone_paned
 
-        # Phone text area
-        phone_text_frame = tk.Frame(phone_paned, bg=self.colors['bg'])
-        phone_paned.add(phone_text_frame, minsize=400)
-        
-        self.phone_text = tk.Text(phone_text_frame, height=4, bg=self.colors['text_bg'], fg=self.colors['text_fg'])
-        self.phone_text.pack(fill='both', expand=True)
+        phone_text_frame = tk.Frame(phone_paned, bg=colors.get('panel', colors['bg']))
+        phone_paned.add(phone_text_frame, minsize=460)
 
-        # Phone buttons
-        phone_buttons = tk.Frame(phone_paned, bg=self.colors['bg'])
-        phone_paned.add(phone_buttons, minsize=150)
-        
-        tk.Button(phone_buttons, text="📁 Upload File (Ctrl+O)", command=self.upload_phones, 
-                 bg=self.colors['button_bg'], fg=self.colors['button_fg']).pack(pady=2, fill='x')
-        tk.Button(phone_buttons, text="🗑️ Clear All", command=lambda: self.phone_text.delete(1.0, tk.END), 
-                 bg=self.colors['button_bg'], fg=self.colors['button_fg']).pack(pady=2, fill='x')
-        tk.Button(phone_buttons, text="📊 Count: 0", command=self.count_phones, 
-                 bg=self.colors['button_bg'], fg=self.colors['button_fg']).pack(pady=2, fill='x')
-        
-        # Store count button reference
-        self.count_btn = phone_buttons.winfo_children()[-1]
-
-        # Input fields
-        inputs_frame = tk.Frame(top_section, bg=self.colors['bg'])
-        inputs_frame.pack(fill='x', pady=5)
-
-        # Shared password (PIN for accounts)
-        tk.Label(inputs_frame, text="Account PIN/Password:", fg=self.colors['fg'], bg=self.colors['bg'], width=18).grid(row=0, column=0, sticky='w', padx=5)
-        self.password_entry = tk.Entry(inputs_frame, bg=self.colors['text_bg'], fg=self.colors['text_fg'], show="*")
-        self.password_entry.grid(row=0, column=1, padx=10, pady=2, sticky='ew')
-
-        # COMMENTED OUT - Not needed for balance checking
-        # # Booking code
-        # tk.Label(inputs_frame, text="Booking Code:", fg=self.colors['fg'], bg=self.colors['bg'], width=18).grid(row=1, column=0, sticky='w', padx=5)
-        # self.booking_entry = tk.Entry(inputs_frame, bg=self.colors['text_bg'], fg=self.colors['text_fg'])
-        # self.booking_entry.grid(row=1, column=1, padx=10, pady=2, sticky='ew')
-
-        # # Stake amount
-        # tk.Label(inputs_frame, text="Stake Amount:", fg=self.colors['fg'], bg=self.colors['bg'], width=18).grid(row=2, column=0, sticky='w', padx=5)
-        # self.stake_entry = tk.Entry(inputs_frame, bg=self.colors['text_bg'], fg=self.colors['text_fg'])
-        # self.stake_entry.insert(0, '100')
-        # self.stake_entry.grid(row=2, column=1, padx=10, pady=2, sticky='ew')
-
-        # HIDDEN - Target URL is set to winbetin.com by default
-        # tk.Label(inputs_frame, text="Target Website URL:", fg=self.colors['fg'], bg=self.colors['bg'], width=18).grid(row=1, column=0, sticky='w', padx=5)
-        # url_frame = tk.Frame(inputs_frame, bg=self.colors['bg'])
-        # url_frame.grid(row=1, column=1, padx=10, pady=2, sticky='ew')
-        # self.url_entry = tk.Entry(url_frame, textvariable=self.target_url, bg=self.colors['text_bg'], fg=self.colors['text_fg'])
-        # self.url_entry.pack(side='left', fill='x', expand=True)
-        # self.url_entry.bind('<FocusOut>', self.save_config_on_change)
-        # tk.Button(url_frame, text="🔄 Change Bookie", command=self.change_bookie, bg='#03A9F4', fg='white', width=15).pack(side='left', padx=5)
-
-        # Buttons - Split into 2 rows for proper alignment
-        buttons_container = tk.Frame(top_section, bg=self.colors['bg'])
-        buttons_container.pack(pady=10)
-        
-        # Row 1: Primary betting actions
-        buttons_row1 = tk.Frame(buttons_container, bg=self.colors['bg'])
-        buttons_row1.pack(pady=2)
-        
-        self.check_balance_btn = tk.Button(buttons_row1, text="💰 CHECK BALANCE", command=self.check_balance, bg='#FFC107', fg='black', width=18, font=('Arial', 9, 'bold'))
-        self.check_balance_btn.pack(side='left', padx=5)
-        # COMMENTED OUT - Simplified GUI for balance checking only
-        # self.roll_over_btn = tk.Button(buttons_row1, text="🔄 ROLL OVER", command=self.roll_over, bg='#FF9800', fg='white', width=18, font=('Arial', 9, 'bold'))
-        # self.roll_over_btn.pack(side='left', padx=5)
-        # self.place_bets_btn = tk.Button(buttons_row1, text="🎯 PLACE BETS", command=self.place_bets, bg='#4CAF50', fg='white', width=18, font=('Arial', 9, 'bold'))
-        # self.place_bets_btn.pack(side='left', padx=5)
-        # self.supa5_btn = tk.Button(buttons_row1, text="🎁 SUPA5", command=self.odileague_supa5, bg='#E91E63', fg='white', width=18, font=('Arial', 9, 'bold'))
-        # self.supa5_btn.pack(side='left', padx=5)
-        # tk.Button(buttons_row1, text="🎁 ODI LEAGUE BONUS", command=self.odileague_bonus, bg='#E91E63', fg='white', width=18, font=('Arial', 9, 'bold')).pack(side='left', padx=5)
-        
-        # Row 2: Account management - COMMENTED OUT for simplified GUI
-        # buttons_row2 = tk.Frame(buttons_container, bg=self.colors['bg'])
-        # buttons_row2.pack(pady=2)
-        
-        # self.claim_bonus_btn = tk.Button(buttons_row2, text="🎁 CLAIM BONUS", command=self.claim_bonus, bg='#9C27B0', fg='white', width=18, font=('Arial', 9, 'bold'))
-        # self.claim_bonus_btn.pack(side='left', padx=5)
-        # tk.Button(buttons_row2, text="💸 WITHDRAW", command=self.withdraw_funds, bg='#00BCD4', fg='white', width=18, font=('Arial', 9, 'bold')).pack(side='left', padx=5)
-        # tk.Button(buttons_row2, text="💰 BALANCE KEEPER", command=self.balance_keeper, bg='#00BCD4', fg='white', width=18, font=('Arial', 9, 'bold')).pack(side='left', padx=5)
-        # tk.Button(buttons_row2, text="🔑 SAVE TOKENS", command=self.save_tokens, bg='#673AB7', fg='white', width=18, font=('Arial', 9, 'bold')).pack(side='left', padx=5)
-        # tk.Button(buttons_row2, text="📡 TELEGRAM", command=self.set_telegram, bg='#2196F3', fg='white', width=18, font=('Arial', 9, 'bold')).pack(side='left', padx=5)
-        
-        # Row 3: System controls - Keep only Emergency Stop
-        buttons_row3 = tk.Frame(buttons_container, bg=self.colors['bg'])
-        buttons_row3.pack(pady=2)
-        
-        # Emergency STOP button (Kill Switch) - Keep this for safety
-        self.stop_btn = tk.Button(buttons_row3, text="⏹️ EMERGENCY STOP", command=self.emergency_stop, bg='#FF0000', fg='white', width=18, font=('Arial', 10, 'bold'))
-        self.stop_btn.pack(side='left', padx=5)
-        # COMMENTED OUT - Simplified GUI for balance checking only
-        # tk.Button(buttons_row3, text="🔍 DISCOVER API", command=self.auto_discover_api, bg='#FF5722', fg='white', width=18, font=('Arial', 9, 'bold')).pack(side='left', padx=5)
-        # tk.Button(buttons_row3, text="🤖 AI HUB", command=self.open_ai_hub, bg='#9C27B0', fg='white', width=18, font=('Arial', 9, 'bold')).pack(side='left', padx=5)
-        
-        # AI Controls Frame
-        # Powered by AI tagline
-        ai_tagline = tk.Label(top_section, text="⚡ Powered by AI", 
-                             fg='#03A9F4', bg=self.colors['bg'], 
-                             font=('Arial', 10, 'bold'))
-        ai_tagline.pack(pady=5)
-        
-        # Separator
-        tk.Frame(top_section, height=2, bg='#333333').pack(fill='x', pady=10)
-        
-        # ⚡ INSTANT RENDERING: Force immediate display of all elements
-        # This ensures GUI appears instantly without delays - updates during creation
-        self.root.update_idletasks()
-
-        # ⚡ INSTANT RENDERING: Update after each major section
-        self.root.update_idletasks()
-        
-        # Live terminal with controls
-        terminal_frame = tk.LabelFrame(top_section, text="LIVE TERMINAL", fg=self.colors['fg'], bg=self.colors['bg'])
-        terminal_frame.pack(fill='both', expand=True, pady=5)
-        
-        # Terminal controls
-        terminal_controls = tk.Frame(terminal_frame, bg=self.colors['bg'])
-        terminal_controls.pack(fill='x', padx=5, pady=2)
-        
-        # Auto-scroll toggle button
-        self.auto_scroll_btn = tk.Button(terminal_controls, text="⏬ Auto-Scroll: ALWAYS ON", 
-                                         command=self.toggle_auto_scroll, 
-                                         bg='#4CAF50', fg='white', width=20)
-        self.auto_scroll_btn.pack(side='left', padx=5)
-        
-        # Clear terminal button
-        tk.Button(terminal_controls, text="🗑️ Clear Terminal", 
-                 command=self.clear_terminal, 
-                 bg=self.colors['button_bg'], fg=self.colors['button_fg'], width=15).pack(side='left', padx=5)
-        
-        # Jump to bottom button
-        tk.Button(terminal_controls, text="⬇️ Jump to Bottom", 
-                 command=self.jump_to_bottom, 
-                 bg=self.colors['button_bg'], fg=self.colors['button_fg'], width=15).pack(side='left', padx=5)
-
-        # Optimized terminal for fast updates (Golang operations)
-        self.terminal = scrolledtext.ScrolledText(
-            terminal_frame, 
-            bg='#0a0a0a', 
-            fg='#00ff00', 
-            height=25, 
-            font=('Consolas', 12),
-            wrap=tk.WORD,
-            undo=False,  # Disable undo for better performance
-            maxundo=0,   # No undo history
-            autoseparators=False  # Faster text operations
+        self.phone_text = tk.Text(
+            phone_text_frame,
+            height=4,
+            bg=colors['text_bg'], fg=colors['text_fg'],
+            insertbackground=colors['text_fg'],
+            relief=tk.FLAT, bd=0, padx=8, pady=6,
+            font=('Consolas', 10),
+            selectbackground=colors.get('accent', '#00a8fa'), selectforeground='white',
+            highlightthickness=1, highlightbackground=colors.get('border', '#2b4a5c'),
+            highlightcolor=colors.get('accent', '#00a8fa'),
         )
-        self.terminal.pack(fill='both', expand=True, padx=5, pady=5)
+        self.phone_text.pack(fill='both', expand=True)
+        self.phone_text.insert('1.0', "Enter phone numbers here, one per line...")
+        self.phone_text.config(fg=colors.get('muted', '#7d98a8'))
+        self._phone_placeholder_active = True
 
-        # Configure grid weights
+        phone_buttons = tk.Frame(phone_paned, bg=colors.get('panel', colors['bg']))
+        phone_paned.add(phone_buttons, minsize=170)
+
+        def _card_btn(text, command, btn_bg=None):
+            return tk.Button(
+                phone_buttons, text=text, command=command,
+                bg=btn_bg or colors.get('accent', '#00a8fa'), fg='white',
+                relief=tk.FLAT, bd=0, padx=6, pady=6,
+                font=('Segoe UI', 9, 'bold'), cursor='hand2',
+                activebackground=colors.get('accent_dark', '#0097e1'), activeforeground='white',
+            )
+
+        upload_btn = _card_btn("📁 Upload File  (Ctrl+O)", self.upload_phones)
+        upload_btn.pack(fill='x', pady=3)
+        clear_btn = _card_btn("🗑️ Clear All", self._clear_phones)
+        clear_btn.pack(fill='x', pady=3)
+        count_btn = _card_btn("📊 Count: 0", self.count_phones)
+        count_btn.pack(fill='x', pady=3)
+
+        self.count_btn = count_btn
+
+        # ── Password card ───────────────────────────────────────────────
+        inputs_frame = tk.LabelFrame(
+            top_section,
+            text="  🔑  ACCOUNT PASSWORD  ",
+            fg=colors.get('accent', colors['fg']),
+            bg=colors.get('panel', colors['bg']),
+            bd=1, relief=tk.GROOVE,
+            font=('Segoe UI', 10, 'bold'),
+        )
+        inputs_frame.pack(fill='x', pady=6)
+
+        password_row = tk.Frame(inputs_frame, bg=colors.get('panel', colors['bg']))
+        password_row.pack(fill='x', padx=8, pady=8)
+
+        tk.Label(
+            password_row, text="Account PIN / Password:",
+            fg=colors['fg'], bg=colors.get('panel', colors['bg']), font=('Segoe UI', 9, 'bold')
+        ).pack(side='left', padx=(0, 10))
+
+        self.password_entry = tk.Entry(
+            password_row,
+            bg=colors['text_bg'], fg=colors['text_fg'], show="*",
+            insertbackground=colors['text_fg'],
+            relief=tk.FLAT, bd=0,
+            font=('Consolas', 10),
+            highlightthickness=1, highlightbackground=colors.get('border', '#2b4a5c'),
+            highlightcolor=colors.get('accent', '#00a8fa'),
+        )
+        self.password_entry.pack(side='left', fill='x', expand=True, ipady=6, padx=(0, 8))
+
+        # ── Action buttons ──────────────────────────────────────────────
+        buttons_container = tk.Frame(top_section, bg=bg)
+        buttons_container.pack(fill='x', pady=(12, 4))
+
+        self.check_balance_btn = tk.Button(
+            buttons_container, text="💰  CHECK BALANCE  (Ctrl+R)", command=self.check_balance,
+            bg=colors.get('accent', '#00a8fa'), fg='white',
+            relief=tk.FLAT, bd=0, pady=6, font=('Segoe UI', 10, 'bold'), cursor='hand2',
+            activebackground=colors.get('accent_dark', '#0097e1'), activeforeground='white',
+        )
+        self.check_balance_btn.pack(side='left', fill='x', expand=True, padx=(0, 6))
+
+        self.stop_btn = tk.Button(
+            buttons_container, text="⏹️  EMERGENCY STOP", command=self.emergency_stop,
+            bg=colors.get('danger', '#e11d48'), fg='white',
+            relief=tk.FLAT, bd=0, pady=6, font=('Segoe UI', 9, 'bold'), cursor='hand2',
+            activebackground='#b91c3c', activeforeground='white',
+        )
+        self.stop_btn.pack(side='right', padx=(6, 0))
+
+        ai_tagline = tk.Label(
+            top_section,
+            text="⚡ SportPesa Integration Active  ·  API fast-path enabled",
+            fg=colors.get('muted', '#03A9F4'), bg=bg, font=('Segoe UI', 8)
+        )
+        ai_tagline.pack(pady=(6, 2))
+
+        self.root.update_idletasks()
+
+        # ── Live terminal card ──────────────────────────────────────────
+        terminal_frame = tk.LabelFrame(
+            top_section,
+            text="  LIVE TERMINAL  ",
+            fg=colors.get('gold', colors['fg']),
+            bg=colors.get('panel', colors['bg']),
+            bd=1, relief=tk.GROOVE,
+            font=('Segoe UI', 10, 'bold'),
+        )
+        terminal_frame.pack(fill='both', expand=True, pady=8)
+
+        terminal_controls = tk.Frame(terminal_frame, bg=colors.get('panel', colors['bg']))
+        terminal_controls.pack(fill='x', padx=8, pady=(8, 2))
+
+        self.auto_scroll_btn = tk.Button(
+            terminal_controls, text="⏬ Auto-Scroll: ALWAYS ON",
+            command=self.toggle_auto_scroll,
+            bg='#00a86b', fg='white', width=20,
+            relief=tk.FLAT, bd=0, pady=4, font=('Segoe UI', 8, 'bold'), cursor='hand2',
+            activebackground='#008a56', activeforeground='white',
+        )
+        self.auto_scroll_btn.pack(side='left', padx=(0, 6))
+
+        tk.Button(
+            terminal_controls, text="🗑️ Clear Terminal",
+            command=self.clear_terminal,
+            bg=colors.get('accent', '#00a8fa'), fg='white', width=15,
+            relief=tk.FLAT, bd=0, pady=4, font=('Segoe UI', 8, 'bold'), cursor='hand2',
+            activebackground=colors.get('accent_dark', '#0097e1'), activeforeground='white',
+        ).pack(side='left', padx=6)
+
+        tk.Button(
+            terminal_controls, text="⬇️ Jump to Bottom",
+            command=self.jump_to_bottom,
+            bg=colors.get('accent', '#00a8fa'), fg='white', width=15,
+            relief=tk.FLAT, bd=0, pady=4, font=('Segoe UI', 8, 'bold'), cursor='hand2',
+            activebackground=colors.get('accent_dark', '#0097e1'), activeforeground='white',
+        ).pack(side='left', padx=6)
+
+        self.terminal = scrolledtext.ScrolledText(
+            terminal_frame,
+            bg=colors.get('terminal_bg', '#050d12'),
+            fg=colors.get('terminal_fg', '#00ff9c'),
+            height=22,
+            font=('Consolas', 11),
+            wrap=tk.WORD,
+            undo=False,
+            maxundo=0,
+            autoseparators=False,
+            insertbackground=colors.get('terminal_fg', '#00ff9c'),
+            selectbackground='#00ff9c', selectforeground='#050d12',
+            relief=tk.FLAT, bd=0, padx=8, pady=6,
+            highlightthickness=1, highlightbackground=colors.get('border', '#2b4a5c'),
+        )
+        self.terminal.pack(fill='both', expand=True, padx=8, pady=(4, 8))
+
         inputs_frame.grid_columnconfigure(1, weight=1)
 
         # Bind events for dynamic button enabling
+        self.phone_text.bind('<FocusIn>', self._on_phone_focus)
         self.phone_text.bind('<KeyRelease>', self.update_button_states)
-        
-        # 🚀 SMART PRELOADING - Bind listeners for instant feel
         self.phone_text.bind('<KeyRelease>', self.on_text_changed, add='+')
         self.phone_text.bind('<<Paste>>', lambda e: self.root.after(100, self.on_text_changed))
+        self.phone_text.bind('<<Paste>>', lambda e: self.root.after(100, self.update_button_states), add='+')
         self.password_entry.bind('<KeyRelease>', self.on_text_changed)
-        
-        # Auto-scroll configuration
+
         self.auto_scroll_enabled = True
         self.terminal.bind('<Button-1>', self.on_terminal_click)
         self.terminal.bind('<MouseWheel>', self.on_terminal_scroll)
+
+    def _on_phone_focus(self, event=None):
+        """Clear the placeholder text when the user focuses the phone box."""
+        if getattr(self, '_phone_placeholder_active', False):
+            self.phone_text.delete('1.0', tk.END)
+            self.phone_text.config(fg=self.colors.get('text_fg', '#e8f4fa'))
+            self._phone_placeholder_active = False
+
+    def _get_phones_text(self) -> str:
+        """Return the phone-box content, ignoring the placeholder hint."""
+        if getattr(self, '_phone_placeholder_active', False):
+            return ""
+        return self.phone_text.get('1.0', tk.END).strip()
+
 
     def on_terminal_click(self, event):
         """Handle terminal click - auto-scroll remains on but user can still click"""
@@ -1236,19 +1274,59 @@ class BetFlowProGUI:
                 pass
 
     def update_button_states(self, event=None):
-        phones_text = self.phone_text.get('1.0', tk.END).strip()
+        phones_text = self._get_phones_text()
+        count = 0
         if phones_text:
             phone_list = [line.strip() for line in phones_text.split('\n') if line.strip()]
             count = len(phone_list)
-            self.log(f"Phone numbers loaded: {count} numbers")
 
-        # The simplified Winbetin build only exposes balance-related actions.
+        # Live count on the button (no terminal spam per keystroke)
+        if hasattr(self, 'count_btn'):
+            self.count_btn.config(text=f"📊 Count: {count}")
+
+        # The simplified Sportsape BitBot build only exposes balance-related actions.
         if hasattr(self, "check_balance_btn"):
-            self.check_balance_btn.config(state='normal', bg='#FFC107')
+            self.check_balance_btn.config(state='normal', bg=self.colors.get('accent', '#00a8fa'))
+
+        # Debounced, change-only terminal log (logs once when typing stops)
+        self._schedule_phone_count_log(count)
+
+    def _schedule_phone_count_log(self, count):
+        """Log the phone count once the user pauses typing, and only on change."""
+        after_id = getattr(self, '_count_log_after_id', None)
+        if after_id:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        if getattr(self, '_last_logged_count', None) == count:
+            return
+        self._count_log_after_id = self.root.after(
+            600, lambda: self._log_phone_count(count)
+        )
+
+    def _log_phone_count(self, count):
+        self._count_log_after_id = None
+        if getattr(self, '_last_logged_count', None) == count:
+            return
+        self._last_logged_count = count
+        if count > 0:
+            self.log(f"📊 Phone numbers loaded: {count}")
+        else:
+            self.log("📊 Phone numbers cleared")
+
+    def _clear_phones(self):
+        """Clear the phone box and restore the placeholder hint."""
+        self.phone_text.delete('1.0', tk.END)
+        if not getattr(self, '_phone_placeholder_active', False):
+            self._phone_placeholder_active = True
+            self.phone_text.insert('1.0', "Enter phone numbers here, one per line...")
+            self.phone_text.config(fg=self.colors.get('muted', '#7d98a8'))
+        self.update_button_states()
     
     def on_text_changed(self, event=None):
         """🚀 SMART PRELOAD: Called when user types/pastes - start background processing"""
-        accounts_text = self.phone_text.get("1.0", tk.END).strip()
+        accounts_text = self._get_phones_text()
         password = self.password_entry.get().strip()
         
         # Only process if something changed
@@ -1256,7 +1334,7 @@ class BetFlowProGUI:
             self.last_accounts_text = accounts_text
             self.last_password = password
             
-            # Smart preloading is disabled in this Winbetin-only build.
+            # Smart preloading is disabled in this Sportsape BitBot-only build.
             if accounts_text and password and self.preloader:
                 self.preloader.on_accounts_changed(accounts_text, password)
                 
@@ -1289,12 +1367,17 @@ class BetFlowProGUI:
         if file_path:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
+                if getattr(self, '_phone_placeholder_active', False):
+                    self.phone_text.delete('1.0', tk.END)
+                    self.phone_text.config(fg=self.colors.get('text_fg', '#e8f4fa'))
+                    self._phone_placeholder_active = False
                 self.phone_text.insert(tk.END, content)
             # Count and log after upload
             phones_text = self.phone_text.get('1.0', tk.END).strip()
             phone_list = [line.strip() for line in phones_text.split('\n') if line.strip()]
             count = len(phone_list)
-            self.log(f"Phone numbers uploaded: {count} numbers from {file_path}")
+            self.log(f"📁 Phone numbers uploaded: {count} from {os.path.basename(file_path)}")
+            self._last_logged_count = count
             self.update_button_states()  # Update button state
 
     def change_bookie(self):
@@ -1526,7 +1609,7 @@ class BetFlowProGUI:
         threading.Thread(target=run_place_bets, daemon=True).start()
 
     def check_balance(self):
-        phones = self.phone_text.get('1.0', tk.END).strip()
+        phones = self._get_phones_text()
         if not phones:
             self.log("❌ Error: Please enter phone numbers before checking balance.")
             messagebox.showerror("Missing Data", "Please enter phone numbers")
@@ -1538,7 +1621,7 @@ class BetFlowProGUI:
             return
         phone_list = [line.strip() for line in phones.split('\n') if line.strip()]
         
-        self.log(f"⚡ Launching balance and coins check engine for {len(phone_list)} accounts...")
+        self.log(f"⚡ Launching balance check engine for {len(phone_list)} accounts...")
         
         if len(phone_list) == 0:
             self.log("❌ Error: No valid phone numbers found")
@@ -1579,7 +1662,7 @@ class BetFlowProGUI:
                 self.headless.running = True
                 self.running = True
                 self.headless.check_balances(valid_phones, password, enhanced_callback)
-                self.log("✅ Balance and coins check completed!")
+                self.log("✅ Balance check completed!")
             except KeyboardInterrupt:
                 self.log("🛑 Balance check stopped by user")
             except Exception as e:
@@ -2302,7 +2385,7 @@ class BetFlowProGUI:
     def set_telegram(self):
         """Elegant dialog for Telegram bot setup with instructions"""
         dialog = tk.Toplevel(self.root)
-        dialog.title("⚡ Winbetin Balance Checker - Telegram Remote Control")
+        dialog.title("⚡ Sportsape BitBot - Telegram Remote Control")
         dialog.geometry("600x500")
         dialog.configure(bg='#0a0a0a')
         dialog.resizable(False, False)
@@ -2348,8 +2431,8 @@ class BetFlowProGUI:
         
         instructions_text = """1. Open Telegram and search for @BotFather
 2. Send: /newbot
-3. Choose a name (e.g., "My Winbetin Bot")
-4. Choose a username (e.g., "myWinbetin_bot")
+3. Choose a name (e.g., "My Sportsape BitBot Bot")
+4. Choose a username (e.g., "mySportsapeV2_bot")
 5. Copy the Bot Token provided
 6. Start a chat with your new bot
 7. Get your Chat ID from @userinfobot"""
@@ -2443,7 +2526,7 @@ class BetFlowProGUI:
                 bot = telegram.Bot(token=token)
                 bot.send_message(
                     chat_id=chat_id,
-                    text="✅ *Winbetin Balance Checker Connection Test Successful!*\n\nYour bot is ready for remote control.",
+                    text="✅ *Sportsape BitBot Connection Test Successful!*\n\nYour bot is ready for remote control.",
                     parse_mode='Markdown'
                 )
                 status_label.config(text="✅ Connection successful! Message sent to Telegram", fg='#00ff00')
@@ -3097,7 +3180,7 @@ class BetFlowProGUI:
         guidelines_text.pack(fill='both', expand=True, padx=10, pady=10)
         
         guidelines_content = """╔══════════════════════════════════════════════════════════════╗
-║        🤖 WINBETIN BALANCE CHECKER - SYSTEM GUIDELINES        ║
+║        🤖 SPORTSAPE BITBOT BALANCE CHECKER - SYSTEM GUIDELINES        ║
 ╚══════════════════════════════════════════════════════════════╝
 
 📋 HOW THE SYSTEM OPERATES:
@@ -3239,7 +3322,7 @@ class BetFlowProGUI:
         footer_frame = tk.Frame(hub_window, bg='#2d2d2d', pady=5)
         footer_frame.pack(fill='x', side='bottom')
         
-        tk.Label(footer_frame, text="⚡ Winbetin Balance Checker v5.0.0", 
+        tk.Label(footer_frame, text="⚡ Sportsape BitBot Balance Checker v5.0.0", 
                 fg='#888888', bg='#2d2d2d', font=('Arial', 8)).pack(side='left', padx=10)
         
         tk.Button(footer_frame, text="✕ Close AI HUB", command=on_close, 
@@ -3511,23 +3594,29 @@ class BetFlowProGUI:
                     # Update theme toggle button specifically using stored reference
                     if hasattr(self, 'theme_btn') and widget == self.theme_btn:
                         if self.theme.get() == 'dark':
-                            widget.configure(text="🌙 Toggle Theme", bg='#9C27B0', fg='white')
+                            widget.configure(text="🌙 Dark", bg=self.colors.get('panel_alt', '#1f4255'), fg='white')
                         else:
-                            widget.configure(text="🌞 Toggle Theme", bg='#FF9800', fg='white')
+                            widget.configure(text="🌞 Light", bg=self.colors.get('panel_alt', '#e7f3fb'), fg='#12222e')
                     # Keep other buttons with their original colors
                     
                 elif isinstance(widget, (tk.Label, tk.LabelFrame)):
-                    widget.configure(bg=self.colors['bg'], fg=self.colors['fg'])
+                    widget.configure(bg=self.colors.get('panel', self.colors['bg']), fg=self.colors['fg'])
                     
                 elif isinstance(widget, (tk.Text, scrolledtext.ScrolledText)):
                     # Keep terminal always green for techy feel
                     if hasattr(self, 'terminal') and widget == self.terminal:
-                        widget.configure(bg='#0a0a0a', fg='#00ff00')
-                        widget.configure(selectbackground='#00ff00', selectforeground='#0a0a0a')
+                        widget.configure(
+                            bg=self.colors.get('terminal_bg', '#050d12'),
+                            fg=self.colors.get('terminal_fg', '#00ff9c')
+                        )
+                        widget.configure(
+                            selectbackground=self.colors.get('terminal_fg', '#00ff9c'),
+                            selectforeground=self.colors.get('terminal_bg', '#050d12')
+                        )
                     else:
                         widget.configure(bg=self.colors['text_bg'], fg=self.colors['text_fg'])
                         # Update selection colors for better visibility
-                        widget.configure(selectbackground='#4CAF50', selectforeground='white')
+                        widget.configure(selectbackground='#00a8fa', selectforeground='white')
                     
                 elif isinstance(widget, tk.Entry):
                     widget.configure(bg=self.colors['text_bg'], fg=self.colors['text_fg'])
@@ -3537,7 +3626,7 @@ class BetFlowProGUI:
                     widget.configure(bg=self.colors['bg'])
                     
                 elif isinstance(widget, tk.PanedWindow):
-                    widget.configure(bg=self.colors['bg'])
+                    widget.configure(bg=self.colors.get('panel', self.colors['bg']))
                     
                 elif isinstance(widget, tk.Checkbutton):
                     widget.configure(
@@ -3553,7 +3642,7 @@ class BetFlowProGUI:
                     widget.configure(
                         bg=self.colors['bg'],
                         troughcolor=self.colors['text_bg'],
-                        activebackground=self.colors['button_bg']
+                        activebackground=self.colors.get('accent', '#00a8fa')
                     )
                     
                 # Recursively update all children
@@ -3667,7 +3756,7 @@ class BetFlowProGUI:
 
     def count_phones(self):
         """Count and display the number of phone numbers"""
-        phones_text = self.phone_text.get('1.0', tk.END).strip()
+        phones_text = self._get_phones_text()
         if phones_text:
             phone_list = [line.strip() for line in phones_text.split('\n') if line.strip()]
             count = len(phone_list)
@@ -4028,7 +4117,7 @@ if __name__ == "__main__":
                 app = BetFlowProGUI(root, splash_ref if splash_shown else None)
                 
                 # Complete splash with final message
-                update_splash(100, "✅ Ready! Starting Winbetin Balance Checker...")
+                update_splash(100, "✅ Ready! Starting Sportsape BitBot Balance Checker...")
                 time.sleep(0.3)
                 
                 # Force immediate rendering of all GUI elements

@@ -1,0 +1,25 @@
+{
+  "confirmed": {
+    "login_api": "https://user-api.ke.sportpesa.com/player/v2/login",
+    "login_form": "https://www.ke.sportpesa.com/login_check",
+    "wallet_balance": "https://www.ke.sportpesa.com/api/wallets/balance",
+    "casino_balance": "https://casino-frontend.ke.sportpesa.com/api/wallets/balance",
+    "user_profile": "https://www.ke.sportpesa.com/api/users/profile",
+    "global_config": "https://www.ke.sportpesa.com/api/global-config"
+  },
+  "candidates": [
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://www.ke.sportpesa.com/api/users/favorites"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://www.ke.sportpesa.com/api/users/markets"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://www.ke.sportpesa.com/api/users/live-markets"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://www.ke.sportpesa.com/api/available/markets"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://www.ke.sportpesa.com/api/games/markets"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://www.ke.sportpesa.com/api/todays/1/games"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://www.ke.sportpesa.com/api/live/sports"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://www.ke.sportpesa.com/api/live/restrictions"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://www.ke.sportpesa.com/api/live/default/markets"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://www.ke.sportpesa.com/api/live/bets"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://www.ke.sportpesa.com/api/live/sports/1/events"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://gpm-svc.ke.sportpesa.com/api/v1/games/platform/android"},
+    {"kind": "response", "method": "GET", "status": 200, "url": "https://casino-frontend.ke.sportpesa.com/api/config"}
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "base_url": "https://www.ke.sportpesa.com",
+  "subdomains": {
+    "user-api": "https://user-api.ke.sportpesa.com",
+    "casino": "https://casino-frontend.ke.sportpesa.com",
+    "jackpot": "https://jackpot-widget.ke.sportpesa.com",
+    "gpm-svc": "https://gpm-svc.ke.sportpesa.com",
+    "cdn": "https://cdn.ke.sportpesa.com"
+  },
+  "endpoints": {
+    "auth": [
+      {"method": "POST", "path": "https://user-api.ke.sportpesa.com/player/v2/login", "body": {"usr": "phone", "pwd": "password"}, "headers": "X-Channel: web, X-TRACK-ID: uuid", "desc": "JSON login — returns balance, currency, token"},
+      {"method": "POST", "path": "https://www.ke.sportpesa.com/login_check", "body": "username=&password=&_target_path=", "desc": "Symfony form login — sets session cookie"}
+    ],
+    "wallet": [
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/wallets/balance", "desc": "Sportsbook + casino balance (needs auth cookie)"},
+      {"method": "GET", "path": "https://casino-frontend.ke.sportpesa.com/api/wallets/balance", "desc": "Casino balance only (needs auth cookie)"}
+    ],
+    "profile": [
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/users/profile", "desc": "User profile — fields: username, email, phone, language, tcVersion, ppVersion, hasPlacedBets, marketLayout"},
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/users/favorites", "desc": "Favorite sports/teams/leagues"},
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/users/markets", "desc": "Market display preferences"},
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/users/live-markets", "desc": "Live betting market preferences"}
+    ],
+    "config": [
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/global-config", "desc": "Site-wide config (countries, languages, version, operators, currencies)"},
+      {"method": "GET", "path": "https://casino-frontend.ke.sportpesa.com/api/config", "desc": "Casino platform config"}
+    ],
+    "sports_data": [
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/available/markets", "desc": "Available betting market types"},
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/games/markets?games=...&markets=...", "desc": "Odds for specific game IDs (comma-sep)"},
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/todays/1/games?type=prematch&section=today&markets_layout=multiple&o=startTime&pag_count=15&pag_min=1", "desc": "Today's games for sport ID 1 (Football), paginated"}
+    ],
+    "live": [
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/live/sports", "desc": "Sports with live events"},
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/live/restrictions", "desc": "Live viewing restrictions"},
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/live/default/markets", "desc": "Default live market types"},
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/live/bets", "desc": "User's live bets"},
+      {"method": "GET", "path": "https://www.ke.sportpesa.com/api/live/sports/{id}/events?limit=15&offset=0", "desc": "Live events for a sport, paginated"}
+    ],
+    "casino": [
+      {"method": "GET", "path": "https://gpm-svc.ke.sportpesa.com/api/v1/games/platform/android", "desc": "Casino games list"}
+    ],
+    "analytics": [
+      {"method": "POST", "path": "https://app.adjust.com/event", "desc": "Adjust tracking (not useful)"}
+    ]
+  }
+}

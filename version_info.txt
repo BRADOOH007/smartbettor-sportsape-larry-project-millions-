@@ -30,13 +30,13 @@ VSVersionInfo(
       [
       StringTable(
         u'040904B0',
-        [StringStruct(u'CompanyName', u'Betflow'),
-        StringStruct(u'FileDescription', u'WonBetin Checker By BetFlow'),
+        [StringStruct(u'CompanyName', u'SportsApe'),
+        StringStruct(u'FileDescription', u'SportsApe BitBot Checker'),
         StringStruct(u'FileVersion', u'2.0.0'),
-        StringStruct(u'InternalName', u'WonBetin Checker By BetFlow'),
-        StringStruct(u'LegalCopyright', u'Copyright (c) 2026 Betflow'),
-        StringStruct(u'OriginalFilename', u'WonBetin Checker By BetFlow.exe'),
-        StringStruct(u'ProductName', u'WonBetin Checker By BetFlow'),
+        StringStruct(u'InternalName', u'SportsApe BitBot Checker'),
+        StringStruct(u'LegalCopyright', u'Copyright (c) 2026 SportsApe'),
+        StringStruct(u'OriginalFilename', u'SportsApe BitBot Checker.exe'),
+        StringStruct(u'ProductName', u'SportsApe BitBot Checker'),
         StringStruct(u'ProductVersion', u'2.0.0')])
       ]), 
     VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
