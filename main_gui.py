@@ -187,6 +187,8 @@ class BetFlowProGUI:
 
         # Network status
         self.network_online = True
+        self._last_logged_status = True  # Start assuming online
+        self._network_log_time = 0  # Cooldown timer for network log messages
         self.network_check_interval = 3000  # Check every 3 seconds for faster detection
         
         # ANTI-GLITCH SYSTEM: Prevent GUI tweaks and glitches
@@ -949,7 +951,23 @@ class BetFlowProGUI:
             relief=tk.FLAT, bd=0, pady=6, font=('Segoe UI', 10, 'bold'), cursor='hand2',
             activebackground=colors.get('accent_dark', '#0097e1'), activeforeground='white',
         )
-        self.check_balance_btn.pack(side='left', fill='x', expand=True, padx=(0, 6))
+        self.check_balance_btn.pack(side='left', fill='x', expand=True, padx=(0, 4))
+
+        self.taxi_casino_btn = tk.Button(
+            buttons_container, text="🚖  TAXI RIDE DELUXE", command=self.open_taxi_casino,
+            bg=colors.get('gold', '#ffb200'), fg='#0c1b26',
+            relief=tk.FLAT, bd=0, pady=6, font=('Segoe UI', 10, 'bold'), cursor='hand2',
+            activebackground='#d49900', activeforeground='#0c1b26',
+        )
+        self.taxi_casino_btn.pack(side='left', fill='x', expand=True, padx=4)
+
+        self.withdraw_btn = tk.Button(
+            buttons_container, text="💸  WITHDRAW", command=self.handle_withdraw,
+            bg=colors.get('danger', '#e11d48'), fg='white',
+            relief=tk.FLAT, bd=0, pady=6, font=('Segoe UI', 10, 'bold'), cursor='hand2',
+            activebackground='#b91c3c', activeforeground='white',
+        )
+        self.withdraw_btn.pack(side='left', fill='x', expand=True, padx=4)
 
         self.stop_btn = tk.Button(
             buttons_container, text="⏹️  EMERGENCY STOP", command=self.emergency_stop,
@@ -3328,6 +3346,164 @@ class BetFlowProGUI:
         tk.Button(footer_frame, text="✕ Close AI HUB", command=on_close, 
                  bg='#ff4444', fg='white', font=('Arial', 9, 'bold')).pack(side='right', padx=10)
 
+    def open_taxi_casino(self):
+        """One-click Taxi Ride Deluxe auto-bet using undetected Chrome."""
+        def run():
+            try:
+                self._taxi_driver = self.headless._build_driver(force_visible=True)
+                d = self._taxi_driver
+                d.get("https://www.ke.sportpesa.com/en/sports-betting/football-1/")
+                from selenium.webdriver.support.ui import WebDriverWait
+                WebDriverWait(d, 20).until(lambda x: x.execute_script("return document.readyState") != "loading")
+                import time; time.sleep(2)
+                for login_attempt in range(3):
+                    pi, pw = self.headless._wait_for_login_inputs(d)
+                    if pi and pw:
+                        pi.clear(); pi.send_keys("0700817151")
+                        pw.clear(); pw.send_keys("3ethwelX")
+                        self.headless._click_login_submit(d)
+                        time.sleep(1)
+                        if self.headless._wait_for_post_login(d) == "ok":
+                            self.log("Logged in!")
+                            break
+                    time.sleep(2)
+                else:
+                    self.log("Login failed")
+                    return
+                # Casino
+                self.log("Opening casino...")
+                d.get("https://www.ke.sportpesa.com/en/casino")
+                WebDriverWait(d, 25).until(lambda x: x.execute_script("return document.readyState") != "loading")
+                time.sleep(5)
+                from selenium.webdriver.common.by import By
+                for f in d.find_elements(By.TAG_NAME, "iframe"):
+                    if "casino" in (f.get_attribute("src") or "").lower():
+                        d.switch_to.frame(f); break
+                # Wait for Play buttons
+                self.log("Waiting for casino games...")
+                for _ in range(20):
+                    time.sleep(3)
+                    body = d.execute_script("return document.body.innerText.length")
+                    play = d.execute_script("return Array.from(document.querySelectorAll('button')).some(function(b){return b.innerText.indexOf('Play')>=0})")
+                    if play: self.log(f"  Games loaded (body={body}, play=YES)"); break
+                else:
+                    self.log("Casino games didn't load")
+                    return
+                # Hover and click Play on taxi
+                self.log("Launching Taxi Ride Deluxe...")
+                from selenium.webdriver.common.action_chains import ActionChains
+                card = d.find_element(By.ID, "105762")
+                d.execute_script("arguments[0].scrollIntoView({block:'center'});", card)
+                time.sleep(1)
+                ActionChains(d).move_to_element(card).perform(); time.sleep(2)
+                for btn in card.find_elements(By.TAG_NAME, "button"):
+                    if btn.text.strip().lower() == "play":
+                        btn.click(); self.log("Clicked Play!"); break
+                time.sleep(8)
+                # Dismiss Buckle Up modal
+                for _ in range(10):
+                    d.execute_script("var btns=document.querySelectorAll('button,a,span');for(var i=0;i<btns.length;i++){var t=(btns[i].innerText||'').trim().toLowerCase();if(t==='x'||t==='close'||t==='\\u00d7'){btns[i].click();break}}")
+                    time.sleep(0.5)
+                d.execute_script("var ovs=document.querySelectorAll('[class*=\"overlay\"],[class*=\"modal\"]');for(var i=0;i<ovs.length;i++)ovs[i].style.display='none'")
+                self.log("Game should be loaded. Starting auto-bet...")
+                self.headless._run_game_controls(d, stake=15, multiplier=1.01, rounds=15, gui_callback=self.log)
+            except Exception as e:
+                self.log(f"Taxi error: {e}")
+        threading.Thread(target=run, daemon=True).start()
+
+    def handle_withdraw(self):
+        """Show amount modal, then withdraw from all entered accounts."""
+        phones_text = self._get_phones_text().strip()
+        password = self.password_entry.get().strip()
+        if not phones_text or not password:
+            self.log("Enter phone numbers and password first")
+            messagebox.showerror("Missing Data", "Please enter phone numbers and password")
+            return
+        phone_list = [p.strip() for p in phones_text.split('\n') if p.strip()]
+        if not phone_list:
+            self.log("No valid phone numbers")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Withdraw Funds")
+        dialog.configure(bg=self.colors['bg'])
+        dialog.geometry("380x200")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Center on parent
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - 380) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 200) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        frame = tk.Frame(dialog, bg=self.colors['bg'], padx=20, pady=20)
+        frame.pack(fill='both', expand=True)
+
+        tk.Label(frame, text=f"Withdraw from {len(phone_list)} account(s)",
+                 fg=self.colors['fg'], bg=self.colors['bg'],
+                 font=('Segoe UI', 11, 'bold')).pack(pady=(0, 12))
+
+        row = tk.Frame(frame, bg=self.colors['bg'])
+        row.pack(pady=(0, 12))
+        tk.Label(row, text="Amount (KES):", fg=self.colors['fg'], bg=self.colors['bg'],
+                 font=('Segoe UI', 10)).pack(side='left', padx=(0, 8))
+        amount_var = tk.StringVar(value="100")
+        amount_entry = tk.Entry(row, textvariable=amount_var, width=12,
+                                bg=self.colors['text_bg'], fg=self.colors['text_fg'],
+                                font=('Consolas', 14), justify='center',
+                                relief=tk.FLAT, bd=0,
+                                highlightthickness=1, highlightbackground=self.colors.get('border', '#2b4a5c'))
+        amount_entry.pack(side='left', ipady=4)
+        amount_entry.select_range(0, tk.END)
+        amount_entry.focus()
+
+        btn_row = tk.Frame(frame, bg=self.colors['bg'])
+        btn_row.pack()
+        result = {"amount": None}
+
+        def on_go():
+            amt = amount_var.get().strip()
+            if not amt or not amt.replace('.', '').isdigit():
+                messagebox.showerror("Invalid", "Enter a valid amount", parent=dialog)
+                return
+            result["amount"] = float(amt)
+            dialog.destroy()
+
+        tk.Button(btn_row, text="Cancel", command=dialog.destroy,
+                  bg=self.colors.get('muted', '#7d98a8'), fg='white',
+                  relief=tk.FLAT, bd=0, padx=16, pady=6, font=('Segoe UI', 9), cursor='hand2').pack(side='left', padx=4)
+        tk.Button(btn_row, text="WITHDRAW", command=on_go,
+                  bg=self.colors.get('accent', '#ffb200'), fg='#0c1b26',
+                  relief=tk.FLAT, bd=0, padx=16, pady=6, font=('Segoe UI', 9, 'bold'), cursor='hand2').pack(side='left', padx=4)
+
+        dialog.bind('<Return>', lambda e: on_go())
+        self.root.wait_window(dialog)
+
+        if not result["amount"]:
+            return
+
+        amount = result["amount"]
+        self.log(f"WITHDRAW: {len(phone_list)} accounts x KES {amount:,.0f}")
+        def run():
+            self.headless.withdraw_funds_browser(phone_list, password, amount, gui_callback=self.log)
+        threading.Thread(target=run, daemon=True).start()
+
+    def start_taxi_betting(self):
+        """Auto-bet on the currently loaded Taxi Ride Deluxe game."""
+        d = getattr(self, '_taxi_driver', None)
+        if not d:
+            self.log("No taxi browser open — click TAXI RIDE DELUXE first")
+            return
+        self.log("STARTING AUTO-BET...")
+        def run():
+            try:
+                self.headless._run_game_controls(d, stake=15, multiplier=1.01, rounds=15, gui_callback=self.log)
+            except Exception as e:
+                self.log(f"Error: {e}")
+        threading.Thread(target=run, daemon=True).start()
+
     def emergency_stop(self):
         """Emergency stop button - FORCEFULLY kills ALL running operations"""
         try:
@@ -3531,17 +3707,20 @@ class BetFlowProGUI:
     def _update_network_ui(self, is_online):
         """Update network UI (must run in main thread)"""
         try:
+            now = time.time()
             if is_online:
                 self.network_label.config(text="● Online", fg='#4CAF50')
-                # Only log if status changed from offline to online
-                if hasattr(self, '_last_logged_status') and not self._last_logged_status:
-                    self.log("✅ Network connection restored")
+                if self._last_logged_status is not None and not self._last_logged_status:
+                    if now - getattr(self, '_network_log_time', 0) > 15:
+                        self.log("✅ Network connection restored")
+                        self._network_log_time = now
                     self._last_logged_status = True
             else:
                 self.network_label.config(text="● Offline", fg='#F44336')
-                # Only log if status changed from online to offline  
-                if not hasattr(self, '_last_logged_status') or self._last_logged_status:
-                    self.log("⚠️ Network connection lost - Operations will pause")
+                if self._last_logged_status is None or self._last_logged_status:
+                    if now - getattr(self, '_network_log_time', 0) > 15:
+                        self.log("⚠️ Network connection lost - Operations will pause")
+                        self._network_log_time = now
                     self._last_logged_status = False
         except:
             pass

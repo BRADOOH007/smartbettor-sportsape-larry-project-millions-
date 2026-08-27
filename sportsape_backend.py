@@ -262,42 +262,44 @@ class SportsapeBackend:
             with self._driver_lock:
                 self._driver_warmup_in_progress = False
 
-    def _build_driver(self, gui_callback=None) -> webdriver.Chrome:
+    def _build_driver(self, gui_callback=None, force_visible=False) -> webdriver.Chrome:
         options = Options()
-        options.page_load_strategy = 'eager'  # Don't wait for all images/ads to load
-        if self.headless:
+        options.page_load_strategy = 'normal'
+        if self.headless and not force_visible:
             options.add_argument("--headless=new")
-        options.add_argument("--window-size=430,932")
+        if force_visible:
+            options.add_argument("--window-size=1280,800")
+        else:
+            options.add_argument("--window-size=430,932")
         options.add_argument("--disable-gpu")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         options.add_experimental_option("useAutomationExtension", False)
-        # Suppress "Save password" and other automation popups
         options.add_experimental_option("prefs", {
             "credentials_enable_service": False,
             "profile.password_manager_enabled": False,
             "autofill.profile_enabled": False,
             "autofill.credit_card_enabled": False,
-            "profile.managed_default_content_settings.images": 2  # Disable images for speed
         })
         options.add_argument("--disable-extensions")
         options.add_argument("--disable-infobars")
         options.add_argument("--disable-notifications")
         options.add_argument("--dns-prefetch-disable")
         options.add_argument("--disable-browser-side-navigation")
-        options.add_experimental_option(
-            "mobileEmulation",
-            {
-                "deviceMetrics": {"width": 430, "height": 932, "pixelRatio": 2.75},
-                "userAgent": (
-                    "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/137.0.0.0 Mobile Safari/537.36"
-                ),
-            },
-        )
+        if not force_visible:
+            options.add_experimental_option(
+                "mobileEmulation",
+                {
+                    "deviceMetrics": {"width": 430, "height": 932, "pixelRatio": 2.75},
+                    "userAgent": (
+                        "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/137.0.0.0 Mobile Safari/537.36"
+                    ),
+                },
+            )
         options.set_capability("goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
 
         temp_profile = tempfile.mkdtemp(prefix="sportsape_chrome_")
@@ -317,8 +319,7 @@ class SportsapeBackend:
             driver.execute_cdp_cmd("Network.setBlockedURLs", {
                 "urls": [
                     "*google-analytics.com*", "*googletagmanager.com*", "*facebook.net*",
-                    "*doubleclick.net*", "*hotjar.com*", "*sentry.io*", "*.png", "*.jpg", 
-                    "*.jpeg", "*.gif", "*.svg", "*.webp", "*.mp4", "*.woff*"
+                    "*doubleclick.net*", "*hotjar.com*", "*sentry.io*",
                 ]
             })
             driver.execute_cdp_cmd("Network.enable", {})
@@ -621,7 +622,7 @@ return false;
 
             # More reliable check: Wait until we see currency AND login inputs are gone
             # or we've reached a known logged-in state (like seeing 'Deposit' or 'KSH')
-            has_currency = "ksh" in body_text or "kes" in body_text or "deposit" in body_text
+            has_currency = "ksh" in body_text or "kes" in body_text or "deposit" in body_text or "balance" in body_text or "logout" in body_text
             phone_input, password_input = self._find_login_inputs(driver)
 
             if has_currency and not (phone_input and password_input):
@@ -1537,5 +1538,569 @@ return false;
             self._cleanup_driver(self.selenium_driver)
         return None
 
-    def shutdown_all_executors(self):
-        return None
+    # ── Cookie-bridged API access (bypasses Akamai) ──────────────────────
+
+    def _get_cookie_session(self, phone: str, password: str, gui_callback=None) -> tuple:
+        """Login via browser, extract cookies, return a requests.Session.
+
+        Returns (session, driver) or (None, None) on failure.
+        The caller should call _cleanup_driver when done with the driver.
+        """
+        from selenium.webdriver.support.ui import WebDriverWait
+        try:
+            self._emit_direct(gui_callback, "Starting Akamai handshake (browser login)...")
+            driver = self._build_driver(force_visible=False)
+            # Login
+            driver.get(LOGIN_URL)
+            WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") != "loading")
+            time.sleep(2)
+            normalized = self._format_sportsape_login_phone(phone)
+            pi, pw = self._wait_for_login_inputs(driver, gui_callback=gui_callback)
+            if not pi or not pw:
+                try: driver.quit()
+                except: pass
+                return None, None
+            pi.clear(); pi.send_keys(normalized)
+            pw.clear(); pw.send_keys(password)
+            self._click_login_submit(driver)
+            if self._wait_for_post_login(driver) != "ok":
+                try: driver.quit()
+                except: pass
+                return None, None
+
+            self._emit_direct(gui_callback, "Logged in. Extracting cookies...")
+            # Extract all cookies into a Session
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+                "Origin": SITE_ORIGIN,
+                "Referer": SITE_ORIGIN + "/",
+                "Accept": "application/json, text/plain, */*",
+            })
+            for c in driver.get_cookies():
+                session.cookies.set(c["name"], c["value"], domain=c.get("domain", ".ke.sportpesa.com"))
+            self._emit_direct(gui_callback, f"Cookie session ready ({len(driver.get_cookies())} cookies)")
+            return session, driver
+        except Exception as e:
+            self._emit_direct(gui_callback, f"Cookie session failed: {str(e)[:100]}")
+            return None, None
+
+    def get_transactions(self, phone: str, password: str, gui_callback=None) -> dict:
+        """Get user transaction history via cookie-bridged API."""
+        session, driver = self._get_cookie_session(phone, password, gui_callback)
+        if not session:
+            return {"status": "error", "message": "Could not establish cookie session"}
+        try:
+            resp = session.get(f"{SITE_ORIGIN}/api/users/transactions", timeout=15)
+            if resp.status_code == 200 and "json" in resp.headers.get("Content-Type", ""):
+                data = resp.json()
+                self._emit_direct(gui_callback, f"Transactions: {len(data) if isinstance(data, list) else type(data).__name__}")
+                return {"status": "success", "data": data}
+            return {"status": "error", "message": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)[:150]}
+        finally:
+            if driver: self._cleanup_driver(driver)
+
+    def get_bet_history(self, phone: str, password: str, gui_callback=None) -> dict:
+        """Get bet history via cookie-bridged API."""
+        session, driver = self._get_cookie_session(phone, password, gui_callback)
+        if not session:
+            return {"status": "error", "message": "Could not establish cookie session"}
+        try:
+            resp = session.get(f"{SITE_ORIGIN}/api/users/bets", timeout=15)
+            if resp.status_code == 200 and "json" in resp.headers.get("Content-Type", ""):
+                data = resp.json()
+                self._emit_direct(gui_callback, f"Bets: {len(data) if isinstance(data, list) else type(data).__name__}")
+                return {"status": "success", "data": data}
+            return {"status": "error", "message": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)[:150]}
+        finally:
+            if driver: self._cleanup_driver(driver)
+
+    def get_wallet_detail(self, phone: str, password: str, gui_callback=None) -> dict:
+        """Get full wallet balance (sportsbook + casino) via cookie-bridged API."""
+        session, driver = self._get_cookie_session(phone, password, gui_callback)
+        if not session:
+            return {"status": "error", "message": "Could not establish cookie session"}
+        try:
+            resp = session.get(f"{SITE_ORIGIN}/api/wallets/balance", timeout=15)
+            if resp.status_code == 200 and "json" in resp.headers.get("Content-Type", ""):
+                data = resp.json()
+                sb = data.get("sportsbook", {})
+                casino = data.get("casino", {})
+                self._emit_direct(gui_callback,
+                    f"Wallet: Sportsbook KES {sb.get('balance','?')} (bonus {sb.get('bonusBalance','?')}) | "
+                    f"Casino KES {casino.get('balance','?')} (bonus {casino.get('bonusBalance','?')})")
+                return {"status": "success", "data": data}
+            return {"status": "error", "message": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)[:150]}
+        finally:
+            if driver: self._cleanup_driver(driver)
+
+    def get_casino_games(self, gui_callback=None) -> dict:
+        """Get all casino game names and IDs (no login needed)."""
+        try:
+            resp = requests.get(
+                "https://gpm-svc.ke.sportpesa.com/api/v1/games/platform/android",
+                headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36",
+                         "Origin": "https://casino-frontend.ke.sportpesa.com"}, timeout=20)
+            if resp.status_code == 200:
+                games = resp.json().get("games", {})
+                self._emit_direct(gui_callback, f"Casino games: {len(games)} total")
+                return {"status": "success", "count": len(games), "games": games}
+            return {"status": "error", "message": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)[:150]}
+
+    # ── Withdraw Automation ──────────────────────────────────────────────
+
+    def withdraw_funds_browser(self, phone_list, password, amount, gui_callback=None):
+        """Withdraw *amount* KES from each account in *phone_list* via browser."""
+        results = []
+        self._emit_direct(gui_callback, f"WITHDRAW: {len(phone_list)} accounts x KES {amount:,.0f}")
+
+        driver = None
+        try:
+            driver = self._acquire_driver(gui_callback=gui_callback)
+            for idx, phone in enumerate(phone_list, 1):
+                if not self.running:
+                    break
+                normalized = self._format_sportsape_login_phone(phone)
+                self._emit_direct(gui_callback, f"[{idx}/{len(phone_list)}] {phone} - logging in...")
+
+                # Login
+                driver.get(LOGIN_URL)
+                WebDriverWait(driver, 15).until(lambda d: d.execute_script("return document.readyState") != "loading")
+                time.sleep(1)
+                pi, pw = self._wait_for_login_inputs(driver, gui_callback=gui_callback)
+                if not pi or not pw:
+                    results.append({"phone": phone, "status": "error", "message": "Login form not found"})
+                    continue
+                pi.clear(); pi.send_keys(normalized)
+                pw.clear(); pw.send_keys(password)
+                self._click_login_submit(driver)
+                if self._wait_for_post_login(driver) != "ok":
+                    results.append({"phone": phone, "status": "error", "message": "Login failed"})
+                    continue
+
+                # Navigate to withdraw page
+                self._emit_direct(gui_callback, f"  Opening withdraw page...")
+                driver.get(f"{SITE_ORIGIN}/en/withdraw")
+                WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") != "loading")
+                time.sleep(4)
+
+                # Try to find and fill the withdraw form
+                withdrew = False
+                try:
+                    # Find amount input
+                    amount_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='number'], input[type='text'], input")
+                    for inp in amount_inputs:
+                        try:
+                            parent_text = (inp.find_element(By.XPATH, "..").text or "").lower()
+                            placeholder = (inp.get_attribute("placeholder") or "").lower()
+                            name = (inp.get_attribute("name") or inp.get_attribute("id") or "").lower()
+                            if any(k in parent_text + placeholder + name for k in ["amount", "kes", "withdraw"]):
+                                inp.clear()
+                                inp.send_keys(str(int(amount)))
+                                self._emit_direct(gui_callback, f"  Amount set: KES {amount:,.0f}")
+                                # Find submit button
+                                for btn in driver.find_elements(By.CSS_SELECTOR, "button, input[type='submit']"):
+                                    try:
+                                        t = (btn.text or btn.get_attribute("value") or "").lower()
+                                        if "withdraw" in t or "submit" in t or "confirm" in t:
+                                            btn.click()
+                                            withdrew = True
+                                            self._emit_direct(gui_callback, f"  Withdraw submitted!")
+                                            break
+                                    except: pass
+                                break
+                        except: pass
+                except Exception as e:
+                    self._emit_direct(gui_callback, f"  Form error: {str(e)[:80]}")
+
+                if not withdrew:
+                    self._emit_direct(gui_callback, f"  Could not find withdraw form. Dumping page...")
+                    try:
+                        body = driver.execute_script("return document.body.innerText.substring(0,400)")
+                        self._emit_direct(gui_callback, f"  Page: {body}")
+                    except: pass
+
+                # Logout
+                self._logout_current_session(driver)
+                results.append({"phone": phone, "status": "success" if withdrew else "error",
+                                "message": "Withdrawn" if withdrew else "Form not found"})
+
+            # Summary
+            success = sum(1 for r in results if r["status"] == "success")
+            self._emit_direct(gui_callback, f"DONE: {success}/{len(results)} withdrawals attempted")
+            return results
+        except Exception as e:
+            self._emit_direct(gui_callback, f"Withdraw error: {str(e)[:120]}")
+            return results
+        finally:
+            if driver:
+                self._reset_driver_state(driver)
+                self._store_preloaded_driver(driver)
+        self._emit_direct(gui_callback, "Looking for game controls...")
+
+        # Dismiss Buckle Up modal
+        self._emit_direct(gui_callback, "Dismissing modals...")
+        time.sleep(2)
+        for attempt_x in range(20):
+            try:
+                closed = driver.execute_script("""
+                    var btns = document.querySelectorAll('button,a,div,span');
+                    for (var i = 0; i < btns.length; i++) {
+                        var t = (btns[i].innerText || btns[i].textContent || '').trim();
+                        if (t === 'X' || t === '\u00d7') { btns[i].click(); return 'clicked-X'; }
+                        if (t === 'close') { btns[i].click(); return 'clicked-close'; } 
+                    }
+                    return 'no-modal';
+                """)
+                if 'no-modal' in (closed or ''): break
+                time.sleep(0.5)
+            except: pass
+        driver.execute_script("var ovs=document.querySelectorAll('[class*=\"overlay\"],[class*=\"modal\"]');for(var i=0;i<ovs.length;i++)ovs[i].display='none'")
+
+        def _find_btn(texts, timeout=10):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                for b in driver.find_elements(By.TAG_NAME, "button"):
+                    try:
+                        t = (b.text or "").strip().lower()
+                        if any(x in t for x in texts) and b.is_displayed() and b.is_enabled():
+                            return b
+                    except: pass
+                time.sleep(0.3)
+            return None
+
+        def _find_input(near, timeout=8):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
+                    try:
+                        if not inp.is_displayed() or not inp.is_enabled(): continue
+                        tp = inp.get_attribute("type") or "text"
+                        if tp == "hidden": continue
+                        p = inp.find_element(By.XPATH, "..")
+                        if any(t in (p.text or "").lower() for t in near):
+                            return inp
+                    except: pass
+                time.sleep(0.3)
+            return None
+
+        # Set stake
+        stake_inp = _find_input(["stake", "kes", "bet"], timeout=10)
+        if not stake_inp:
+            body = driver.execute_script("return (document.body||document.documentElement).innerText||''")
+            self._emit_direct(gui_callback, f"No stake input. Body ({len(body)}): {body[:300]}")
+            return {"status": "error", "message": "Stake input not found - is game loaded?"}
+        driver.execute_script("arguments[0].focus(); arguments[0].select();", stake_inp)
+        stake_inp.send_keys(str(int(stake)))
+        self._emit_direct(gui_callback, f"Stake = KES {stake:.0f}")
+
+        # Auto toggle OFF -> AUTO
+        for el in driver.find_elements(By.CSS_SELECTOR, "button, [role='switch']"):
+            try:
+                if (el.text or "").strip().lower() == "off":
+                    el.click(); self._emit_direct(gui_callback, "OFF -> AUTO"); time.sleep(0.3)
+                    break
+            except: pass
+
+        # Auto Cashout
+        ac_btn = _find_btn(["auto cashout", "auto cash"], timeout=5)
+        if ac_btn: ac_btn.click(); time.sleep(0.3)
+        ac_inp = _find_input(["auto", "cash", "multiplier", "payout"], timeout=5)
+        if ac_inp:
+            driver.execute_script("arguments[0].focus(); arguments[0].select();", ac_inp)
+            ac_inp.send_keys(str(multiplier))
+        self._emit_direct(gui_callback, f"Auto-cashout = {multiplier}x")
+
+        # Bet loop
+        bets = 0
+        for i in range(rounds):
+            play = _find_btn(["play"], timeout=20)
+            if play:
+                play.click(); bets += 1
+                self._emit_direct(gui_callback, f"Bet {bets}/{rounds}")
+                time.sleep(4)
+        self._emit_direct(gui_callback, f"DONE: {bets} bets")
+        return {"status": "success", "bets_placed": bets}
+
+    def run_taxi_free_bet_loop(self, phone: str, password: str, stake: float = 15,
+                                multiplier: float = 1.01, rounds: int = 15,
+                                visible: bool = True, gui_callback=None) -> dict:
+        """Auto-bet Taxi Ride Deluxe: login → casino → launch game → place bets.
+
+        Places *rounds* bets of *stake* KES at *multiplier* auto-cashout,
+        then optionally plays the resulting free rounds.
+        """
+        self._emit_direct(gui_callback, f"TAXI AUTO-BET: {rounds} rounds, KES {stake}, {multiplier}x")
+
+        normalized = self._format_sportsape_login_phone(phone)
+        api = self._api_login(normalized, password)
+        if api["ok"]:
+            self._emit_direct(gui_callback, f"Balance: KES {api['balance']:,.2f}")
+
+        driver = None
+        try:
+            driver = self._acquire_driver(gui_callback=gui_callback)
+
+            # ---- LOGIN (football page → login form) ----
+            driver.get(LOGIN_URL)
+            WebDriverWait(driver, 15).until(lambda d: d.execute_script("return document.readyState") != "loading")
+            time.sleep(1)
+            pi, pw = self._wait_for_login_inputs(driver, gui_callback=gui_callback)
+            if not pi or not pw:
+                return {"status": "error", "message": "Login form not found"}
+            pi.clear(); pi.send_keys(normalized)
+            pw.clear(); pw.send_keys(password)
+            time.sleep(0.5)
+            self._click_login_submit(driver)
+            if self._wait_for_post_login(driver) != "ok":
+                return {"status": "error", "message": "Login failed"}
+
+            self._emit_direct(gui_callback, "Logged in. Opening casino...")
+
+            # ---- CASINO ----
+            driver.get(SITE_ORIGIN + "/en/casino")
+            WebDriverWait(driver, 25).until(lambda d: d.execute_script("return document.readyState") != "loading")
+            time.sleep(5)
+
+            for f in driver.find_elements(By.TAG_NAME, "iframe"):
+                if "casino" in (f.get_attribute("src") or "").lower():
+                    driver.switch_to.frame(f)
+                    self._emit_direct(gui_callback, "Switched to casino iframe")
+                    break
+
+            # Wait for casino SPA to render game cards
+            self._emit_direct(gui_callback, "Waiting for casino games...")
+            for attempt in range(20):
+                time.sleep(3)
+                body = driver.execute_script("return document.body.innerText.length")
+                play = driver.execute_script("return document.querySelector('button') != null && document.querySelector('button').innerText.indexOf('Play') >= 0")
+                if play and body > 800:
+                    self._emit_direct(gui_callback, f"  Games loaded (body={body})")
+                    break
+                if attempt % 5 == 0:
+                    self._emit_direct(gui_callback, f"  waiting... body={body}")
+
+            # ---- FIND AND HOVER TAXI CARD, THEN CLICK PLAY ----
+            self._emit_direct(gui_callback, "Finding Taxi Ride Deluxe...")
+            card = driver.find_element(By.ID, "105762")
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", card)
+            time.sleep(0.5)
+
+            # HOVER over the card to reveal the Play overlay button
+            from selenium.webdriver.common.action_chains import ActionChains
+            ActionChains(driver).move_to_element(card).perform()
+            self._emit_direct(gui_callback, "Hovering over Taxi card...")
+            time.sleep(1.5)
+
+            # Now find and click the Play overlay button
+            play_btn = None
+            for attempt2 in range(5):
+                for btn in card.find_elements(By.TAG_NAME, "button"):
+                    if btn.text.strip().lower() == "play":
+                        play_btn = btn
+                        break
+                if play_btn:
+                    break
+                time.sleep(0.5)
+            if not play_btn:
+                # Try finding Play button by CSS selector
+                for sel in ["button:has-text('Play')", "button", "a"]:
+                    try:
+                        btns = card.find_elements(By.CSS_SELECTOR, sel)
+                        if isinstance(btns, list):
+                            for b in btns:
+                                if b.text.strip().lower() == "play":
+                                    play_btn = b; break
+                        if play_btn: break
+                    except: pass
+            if not play_btn:
+                self._emit_direct(gui_callback, f"Play button not found. Card buttons: {[b.text for b in card.find_elements(By.TAG_NAME, 'button')]}")
+                return {"status": "error", "message": "Play button not found"}
+            play_btn.click()
+            self._emit_direct(gui_callback, "Clicked Play on Taxi Ride Deluxe")
+            time.sleep(2)
+
+            # Game loads IN the same page (SPA view), wait for game elements
+            # The game container might be a canvas, iframe, or div with class game-container
+            self._emit_direct(gui_callback, "Waiting for game to load...")
+            for attempt3 in range(20):
+                time.sleep(2)
+                has_game = driver.execute_script("""
+                    return !!(
+                        document.querySelector('canvas') ||
+                        document.querySelector('iframe[src*=\"splitthepot\"]') ||
+                        document.querySelector('.game-container') ||
+                        document.querySelector('[class*=\"game\"] canvas') ||
+                        document.querySelector('[class*=\"crash\"]')
+                    );
+                """)
+                if has_game:
+                    self._emit_direct(gui_callback, "Game loaded!")
+                    break
+                if attempt3 % 4 == 0:
+                    body = driver.execute_script("return document.body.innerText.length")
+                    self._emit_direct(gui_callback, f"  waiting for game... body={body}")
+
+            # ---- DISMISS "Buckle Up" MODAL ----
+            self._emit_direct(gui_callback, "Dismissing 'Buckle Up' modal...")
+            time.sleep(3)
+            # Click the X close button
+            for attempt_x in range(10):
+                try:
+                    closed = driver.execute_script("""
+                        var btns = document.querySelectorAll('button,a,div,span,[role=\"button\"]');
+                        for (var i = 0; i < btns.length; i++) {
+                            var t = (btns[i].innerText || btns[i].textContent || '').trim().toLowerCase();
+                            var cls = (btns[i].className || '').toLowerCase();
+                            // Look for close/X buttons
+                            if (t === 'x' || t === '\u00d7' || t === 'close' ||
+                                cls.indexOf('close') >= 0 || cls.indexOf('dismiss') >= 0) {
+                                btns[i].click();
+                                return 'clicked-X';
+                            }
+                        }
+                        // Try to click overlay backdrop or find modal close
+                        var modals = document.querySelectorAll('[class*=\"modal\"],[class*=\"overlay\"],[class*=\"popup\"],[class*=\"dialog\"]');
+                        for (var j = 0; j < modals.length; j++) {
+                            if (modals[j].offsetHeight > 0) {
+                                // Find close button inside modal
+                                var closeBtns = modals[j].querySelectorAll('button,a,[role=\"button\"]');
+                                for (var k = 0; k < closeBtns.length; k++) {
+                                    var ct = (closeBtns[k].innerText || '').trim().toLowerCase();
+                                    if (ct === 'x' || ct === 'close' || ct === '\u00d7') {
+                                        closeBtns[k].click();
+                                        return 'clicked-modal-X';
+                                    }
+                                }
+                                // Try clicking overlay itself
+                                modals[j].style.display = 'none';
+                                return 'hid-modal';
+                            }
+                        }
+                        return 'no-modal-found';
+                    """)
+                    self._emit_direct(gui_callback, f"  Modal: {closed}")
+                    if closed and 'no-modal' not in closed:
+                        time.sleep(1)
+                    else:
+                        break
+                except Exception:
+                    time.sleep(0.5)
+            driver.execute_script("""
+                // Force-remove any remaining overlays
+                var ovs = document.querySelectorAll('[class*=\"overlay\"],[class*=\"modal\"],[class*=\"popup\"]');
+                for (var i = 0; i < ovs.length; i++) { ovs[i].style.display = 'none'; ovs[i].remove(); }
+            """)
+            self._emit_direct(gui_callback, "Modal dismissed")
+
+            # ---- GAME CONTROL FINDERS ----
+            def _find_btn(texts, timeout=10):
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    for b in driver.find_elements(By.TAG_NAME, "button"):
+                        try:
+                            t = (b.text or "").strip().lower()
+                            if any(x in t for x in texts) and b.is_displayed() and b.is_enabled():
+                                return b
+                        except: pass
+                    time.sleep(0.4)
+                return None
+
+            def _find_input(near_texts, timeout=8):
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    for inp in driver.find_elements(By.CSS_SELECTOR, "input"):
+                        try:
+                            tp = inp.get_attribute("type") or "text"
+                            if tp == "hidden": continue
+                            if not inp.is_displayed() or not inp.is_enabled(): continue
+                            p = inp.find_element(By.XPATH, "..")
+                            pt = (p.text or "").lower()
+                            if any(t in pt for t in near_texts):
+                                return inp
+                        except: pass
+                    time.sleep(0.4)
+                return None
+
+            # ---- SET STAKE 15 KES ----
+            stake_inp = _find_input(["stake", "kes", "bet amount"], timeout=15)
+            if not stake_inp:
+                body = driver.execute_script("return (document.body||document.documentElement).innerText||''")
+                self._emit_direct(gui_callback, f"No stake input. Body ({len(body)}): {body[:300]}")
+                return {"status": "error", "message": "Stake input not found"}
+            driver.execute_script("arguments[0].focus(); arguments[0].select();", stake_inp)
+            stake_inp.send_keys(str(int(stake)))
+            self._emit_direct(gui_callback, f"Stake set to KES {stake:.0f}")
+
+            # ---- SWITCH AUTO MODE ON (OFF -> AUTO) ----
+            time.sleep(0.5)
+            auto_toggled = False
+            for el in driver.find_elements(By.CSS_SELECTOR, "button, [role='switch'], .switch, .toggle, input[type='checkbox']"):
+                try:
+                    t = (el.text or el.get_attribute("aria-label") or "").lower()
+                    if t == "off":
+                        el.click(); auto_toggled = True
+                        self._emit_direct(gui_callback, "Switched OFF -> AUTO")
+                        time.sleep(0.4)
+                        break
+                except: pass
+            if not auto_toggled:
+                self._emit_direct(gui_callback, "AUTO toggle not found — may already be ON")
+
+            # ---- SET AUTO-CASHOUT 1.01 ----
+            ac_btn = _find_btn(["auto cashout", "auto cash"], timeout=5)
+            if ac_btn:
+                ac_btn.click()
+                self._emit_direct(gui_callback, "Clicked Auto Cashout")
+                time.sleep(0.5)
+            ac_inp = _find_input(["auto", "cash", "multiplier", "payout"], timeout=5)
+            if ac_inp:
+                driver.execute_script("arguments[0].focus(); arguments[0].select();", ac_inp)
+                ac_inp.send_keys(str(multiplier))
+                self._emit_direct(gui_callback, f"Auto-cashout set to {multiplier}x")
+
+            # ---- BETTING LOOP: 15 rounds of 15 KES at 1.01x ----
+            bets_placed = 0
+            self._emit_direct(gui_callback, f"Placing {rounds} bets...")
+            for i in range(rounds):
+                # Wait for PLAY during countdown ("Starts In")
+                play_btn = _find_btn(["play", "bet"], timeout=20)
+                if play_btn:
+                    play_btn.click()
+                    bets_placed += 1
+                    self._emit_direct(gui_callback, f"  Bet {bets_placed}/{rounds} placed")
+                    # At 1.01x auto-cashout, round completes near-instantly
+                    time.sleep(4)
+                else:
+                    self._emit_direct(gui_callback, f"  Round {i+1}: PLAY not ready, waiting...")
+                    time.sleep(6)
+                    play_btn2 = _find_btn(["play", "bet"], timeout=10)
+                    if play_btn2:
+                        play_btn2.click(); bets_placed += 1
+                        self._emit_direct(gui_callback, f"  Bet {bets_placed}/{rounds} placed (retry)")
+                        time.sleep(4)
+
+            self._emit_direct(gui_callback, f"DONE: {bets_placed}/{rounds} bets placed")
+            # Check "Your Session" for count
+            session_text = driver.execute_script("""
+                var el = document.querySelector('[class*=\"session\"], [class*=\"Session\"]');
+                return el ? el.innerText : 'no session panel';
+            """)
+            self._emit_direct(gui_callback, f"Session: {session_text[:200]}")
+            return {"status": "success", "bets_placed": bets_placed}
+
+        except Exception as e:
+            self._emit_direct(gui_callback, f"Taxi error: {str(e)[:120]}")
+            return {"status": "error", "message": str(e)[:120]}
+        finally:
+            if driver and not visible:
+                self._reset_driver_state(driver)
+                self._store_preloaded_driver(driver)
