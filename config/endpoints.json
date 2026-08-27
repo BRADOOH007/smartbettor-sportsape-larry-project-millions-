@@ -1,0 +1,27 @@
+{
+  "base_url": "https://winbetin.com/#/Login",
+  "endpoints": {
+    "country": "/api/country"
+  },
+  "confirmed_routes": {
+    "country": "/api/country"
+  },
+  "route_candidates": {
+    "login": [
+      "/kickGoLogin",
+      "/#/Login"
+    ],
+    "profile": [
+      "/profile"
+    ],
+    "deposit": [
+      "/deposite",
+      "/depositerecords"
+    ],
+    "withdraw": [
+      "/withdraw",
+      "/withdrawlimit"
+    ]
+  },
+  "theme": "dark"
+}

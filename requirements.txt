@@ -1,0 +1,18 @@
+# Core dependencies for BetFlow Pro
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+selenium>=4.15.0
+webdriver-manager>=4.0.0
+python-dateutil>=2.8.0
+
+# Encryption and security
+cryptography>=41.0.0
+
+# Optional: For enhanced discovery
+lxml>=4.9.0
+
+# Optional: For telegram integration (if needed)
+python-telegram-bot>=13.7
+
+# Optional: For remote server
+flask>=3.0.0

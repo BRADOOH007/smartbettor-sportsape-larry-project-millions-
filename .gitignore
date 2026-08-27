@@ -1,0 +1,34 @@
+# Large log files
+logs/
+*.log
+
+# Build and Dist
+build/
+dist/
+*.pkg
+*.spec
+# Exclude all EXEs by default except the final release
+*.exe
+!WonBetin Checker By BetFlow.exe
+
+# Reports
+balance_report_*.txt
+balance_report_*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
