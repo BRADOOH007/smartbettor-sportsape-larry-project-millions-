@@ -6,10 +6,15 @@ import sys
 
 
 def app_base_dir():
-    """Return the writable app directory."""
+    """Return the writable app directory.
+
+    Dev: the folder containing this module (not the CWD, so results land in the
+    same place regardless of where the app is launched from).
+    Frozen bundles: next to the executable.
+    """
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
-    return os.path.abspath(".")
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def resource_path(relative_path):

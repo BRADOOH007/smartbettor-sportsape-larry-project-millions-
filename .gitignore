@@ -11,6 +11,21 @@ dist/
 *.exe
 !SportsapeBitBot.exe
 
+# Runtime state (accounts & keys — never commit)
+sportsape_settings.json
+sportsape_ledger.json
+sportsape_stats.json
+sportsape_withdraw.json
+sportsape_usage.json
+sportsape_form_cache.json
+sportsape_jackpot_ready.json
+sportsape_grok_journal.json
+sportsape_balances.json
+sportsape_sched_state.json
+sportsape_supervisor.json
+sportsape_ledger_prev_*.json
+config/*.json
+
 # Reports
 balance_report_*.txt
 balance_report_*.csv
@@ -35,4 +50,9 @@ Thumbs.db
 build_log.txt
 probe_build.txt
 *_build.txt
-*.spec
+*.spec# Agent layer (research analyst, risk manager, calibration, alerts)
+sportsape_agent_cache.json
+sportsape_calibration.json
+sportsape_alerts.log
+Assets/icon.ico
+Assets/icon_preview.png

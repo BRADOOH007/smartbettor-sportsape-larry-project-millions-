@@ -91,7 +91,7 @@ class AppState:
         self.balance = None
         self.ledger = {"placed": 0, "active": 0, "won": 0, "lost": 0, "void": 0,
                        "won_return": 0.0, "net_profit": 0.0}
-        self.worker_busy = {"bet": False, "balance": False, "withdraw": False, "markets": False, "deposit": False, "jackpot": False}
+        self.worker_busy = {"bet": False, "balance": False, "withdraw": False, "markets": False, "deposit": False, "jackpot": False, "sync": False, "history": False}
 
 
 class EventBus:
@@ -137,22 +137,113 @@ class BetFlowProGUI:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._log_lines = []
         self._pump()
+        # Auto-sync on startup: settle any bets that finished while the tool was
+        # closed. Fires 3 s after launch so the UI has time to fully render first.
+        # Only runs if phone + password are already saved in settings.
+        root.after(3000, self._startup_sync)
 
     def _center_geometry(self, w, h):
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
         return f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h)//2)}"
 
-    def _set_app_icon(self):
-        """Load sportpesa_football.png as the window + taskbar icon (industrial look)."""
+    def _startup_sync(self):
+        """Auto-sync bet history 3 s after launch (silent, non-blocking).
+
+        Settles any bets that finished while the tool was closed. Only runs if
+        phone + password are already saved — otherwise it silently no-ops.
+        """
         try:
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sportpesa_football.png")
-            if os.path.exists(path):
-                img = tk.PhotoImage(master=self.root, file=path)
-                self.root.iconphoto(True, img)
-                self._icon_img = img  # prevent garbage collection
+            if not self._phone_list():
+                return
+            if not self.password_var.get().strip():
+                return
+            self.start_sync_winnings(auto=True)
         except Exception:
             pass
+
+    def _set_app_icon(self):
+        """Pin the custom .ico as the window AND taskbar icon on Windows.
+
+        Windows creates the taskbar button only after the window handle is
+        fully visible.  Calling iconbitmap() before that point has no effect
+        on the taskbar — the default Tk feather wins.  The reliable fix is:
+        1. Call wm_iconbitmap() right now (title-bar).
+        2. Schedule a 200 ms after() to re-apply it once the window is mapped
+           and the taskbar button exists.
+        3. Use ctypes to explicitly refresh the taskbar via SendMessage so
+           Windows drops its cached Tk feather and picks up the new icon.
+        iconphoto() is never called on Windows because it unconditionally
+        resets the taskbar group icon to the Tk feather.
+        """
+        base = os.path.dirname(os.path.abspath(__file__))
+        ico = os.path.join(base, "Assets", "icon.ico")
+        if not os.path.exists(ico):
+            try:
+                sys.path.insert(0, os.path.join(base, "Assets"))
+                from make_icon import build_icon
+                build_icon()
+            except Exception:
+                pass
+        if not os.path.exists(ico):
+            ico = os.path.join(base, "Assets", "balance_icon.ico")
+        if not os.path.exists(ico):
+            return
+
+        # Store absolute path — Tkinter resolves relative paths from cwd,
+        # which may differ if the app is launched from a shortcut.
+        ico_abs = os.path.abspath(ico)
+
+        def _apply_ico():
+            try:
+                self.root.wm_iconbitmap(ico_abs)
+            except Exception:
+                try:
+                    self.root.iconbitmap(default=ico_abs)
+                except Exception:
+                    pass
+            # Tell Windows to refresh its shell icon cache for this window.
+            # Without this, the taskbar can show a stale Tk feather even after
+            # iconbitmap() has set the correct icon on the HWND.
+            if sys.platform == "win32" and _HAS_CTYPES:
+                try:
+                    # Timeout-based refresh so this can never hang the launch: a
+                    # plain synchronous SendMessage to HWND_BROADCAST blocks until
+                    # EVERY top-level window responds, so one stuck window (e.g. an
+                    # orphaned browser from a killed session) freezes the whole app.
+                    WM_SETTINGCHANGE = 0x001A
+                    HWND_BROADCAST = 0xFFFF
+                    SMTO_ABORTIFHUNG = 0x0002
+                    _res = ctypes.c_ulong()
+                    ctypes.windll.user32.SendMessageTimeoutW(
+                        HWND_BROADCAST, WM_SETTINGCHANGE, 0, "WindowMetrics",
+                        SMTO_ABORTIFHUNG, 100, ctypes.byref(_res))
+                except Exception:
+                    pass
+
+        # Apply immediately (title-bar icon)
+        _apply_ico()
+        # Apply again after the event loop has shown the window and the
+        # taskbar button has been created (200 ms is safely past that point).
+        try:
+            self.root.after(200, _apply_ico)
+        except Exception:
+            pass
+
+        if sys.platform != "win32":
+            # On non-Windows, iconphoto() is the right approach
+            for cand in (os.path.join(base, "Assets", "icon_preview.png"),
+                         os.path.join(base, "Assets", "balance_icon.png"),
+                         os.path.join(base, "sportpesa_football.png")):
+                if os.path.exists(cand):
+                    try:
+                        img = tk.PhotoImage(master=self.root, file=cand)
+                        self.root.iconphoto(True, img)
+                        self._icon_img = img
+                        break
+                    except Exception:
+                        continue
+            _apply_ico()
 
     # ── thread-safe emit helpers ──────────────────────────────────────
     def _emit(self, message):
@@ -182,13 +273,15 @@ class BetFlowProGUI:
                 self._handle_event(kind, payload)
             self._tick()
         finally:
-            self.root.after(60, self._pump)
+            self.root.after(120, self._pump)  # ~8fps — sufficient, saves CPU vs 60ms
 
     def _handle_event(self, kind, payload):
         if kind == "log":
             self._append_log(str(payload))
             self._sniff_balance(str(payload))
             self._notify_from_log(str(payload))
+            if "🏆" in str(payload) or "WON" in str(payload).upper():
+                self._celebrate_win(str(payload))
         elif kind == "busy":
             name, busy = payload
             self._set_worker_button(name, busy)
@@ -210,6 +303,54 @@ class BetFlowProGUI:
     def _tick(self):
         if self.state.balance is not None:
             self._update_balance_label()
+        else:
+            # Refresh per-phone strip even if overall balance isn't set yet,
+            # but only when the engine state actually changed — not every 60 ms.
+            now = time.time()
+            if now - getattr(self, "_last_per_phone_refresh", 0.0) > 3.0:
+                self._last_per_phone_refresh = now
+                self._update_per_phone_balances()
+        now = time.time()
+        if now - getattr(self, "_last_ready_refresh", 0.0) > 5.0:
+            self._last_ready_refresh = now
+            self._refresh_jackpot_ready()
+            self._update_per_phone_balances()
+
+    def _refresh_jackpot_ready(self):
+        """Live 'Mega / Midweek jackpot — picks ready' alert fed by the idle
+        research. Each pool shows its own readiness (🟢 fresh / 🟠 stale)."""
+        try:
+            st = self.backend._load_jackpot_ready()
+        except Exception:
+            st = None
+        if not st:
+            self.ready_lbl.config(text="⚪ jackpot research idle", fg="#8a929e")
+            return
+        pools = {}
+        try:
+            pools = st.get("pools") or {}
+        except Exception:
+            pools = {}
+        if not any(dict(p or {}).get("ready") for p in pools.values()):
+            self.ready_lbl.config(text="⚪ jackpot research idle", fg="#8a929e")
+            return
+        parts = []
+        worst_age = 0.0
+        for pname, pst in pools.items():
+            if not isinstance(pst, dict) or not pst.get("ready"):
+                continue
+            n = int(pst.get("picks") or 0)
+            age_h = (time.time() - float(pst.get("ts") or 0)) / 3600.0
+            worst_age = max(worst_age, age_h)
+            if age_h <= 5:
+                parts.append(f"🟢 {str(pname).upper()} {n} picks READY")
+            else:
+                parts.append(f"🟠 {str(pname).upper()} {n} picks stale")
+        if not parts:
+            self.ready_lbl.config(text="⚪ jackpot research idle", fg="#8a929e")
+            return
+        self.ready_lbl.config(text="  ".join(parts),
+                              fg="#5fd06b" if worst_age <= 5 else "#d9a441")
 
     def _notify_from_log(self, text):
         if not getattr(self, "notify_var", None) or not self.notify_var.get():
@@ -219,6 +360,31 @@ class BetFlowProGUI:
             if kind:
                 notify.sound(kind)
                 notify.toast(title, msg)
+        except Exception:
+            pass
+
+    def _celebrate_win(self, text):
+        """Industrial-grade celebration: every win lights up the status chip and
+        the balance label, then settles back after a few seconds."""
+        try:
+            prev = self.status_chip.cget("text")
+            self.status_chip.config(text="🎉 WIN! 💰", fg="#ffd75e")
+            self.balance_label.config(fg="#ffd75e")
+            try:
+                self.root.bell()
+            except Exception:
+                pass
+
+            def _settle():
+                try:
+                    self.status_chip.config(text=prev, fg=self.colors["muted"])
+                    self._update_balance_label()
+                except Exception:
+                    pass
+            try:
+                self.root.after(8000, _settle)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -235,6 +401,12 @@ class BetFlowProGUI:
         self.balance_label = tk.Label(top, text="Balance: —", fg=c["accent"], bg=c["panel"],
                                       font=("Consolas", 11, "bold"))
         self.balance_label.pack(side="left", padx=18)
+
+        # Per-phone balance mini-strip — shows each account's live balance when the
+        # engine is running with multiple accounts. Hidden when only one phone is used.
+        self.per_phone_frame = tk.Frame(top, bg=c["panel"])
+        self.per_phone_frame.pack(side="left", padx=(0, 12))
+        self._per_phone_labels = {}   # phone -> Label widget
 
         self.winnings_label = tk.Label(top, text="📊 —", fg=c["terminal_fg"], bg=c["panel"],
                                        font=("Consolas", 10))
@@ -274,28 +446,56 @@ class BetFlowProGUI:
 
         arow = tk.Frame(account, bg=c["panel"])
         arow.pack(fill="x", padx=8, pady=6)
+        arow.columnconfigure(1, weight=1)
         tk.Label(arow, text="Phone (one per line):", bg=c["panel"], fg=c["muted"],
-                 font=("Segoe UI", 9)).pack(side="left")
-        self.phone_text = scrolledtext.ScrolledText(arow, height=3, width=42,
+                 font=("Segoe UI", 9)).grid(row=0, column=0, sticky="nw", padx=(0, 8), pady=4)
+        self.phone_text = scrolledtext.ScrolledText(arow, height=3, width=32,
                                                     bg=c["text_bg"], fg=c["text_fg"],
                                                     insertbackground=c["text_fg"],
                                                     relief=tk.FLAT, bd=0,
                                                     highlightthickness=1,
                                                     highlightbackground=c["border"],
                                                     font=("Consolas", 10))
-        self.phone_text.pack(side="left", padx=(8, 14))
-        tk.Label(arow, text="Password:", bg=c["panel"], fg=c["muted"],
-                 font=("Segoe UI", 9)).pack(side="left")
+        self.phone_text.grid(row=0, column=1, sticky="nsew", padx=(0, 14))
+        pwcell = tk.Frame(arow, bg=c["panel"])
+        pwcell.grid(row=0, column=2, sticky="n", padx=(0, 6))
+        tk.Label(pwcell, text="Password:", bg=c["panel"], fg=c["muted"],
+                 font=("Segoe UI", 9)).pack(anchor="w")
         self.password_var = tk.StringVar()
-        self.password_entry = tk.Entry(arow, textvariable=self.password_var, width=18,
+        self.password_entry = tk.Entry(pwcell, textvariable=self.password_var, width=20,
                                        show="*", bg=c["text_bg"], fg=c["text_fg"],
                                        insertbackground=c["text_fg"], relief=tk.FLAT,
                                        highlightthickness=1,
                                        highlightbackground=c["border"])
-        self.password_entry.pack(side="left", padx=(6, 8), ipady=4)
+        self.password_entry.pack(anchor="w", padx=(0, 8), pady=(2, 0), ipady=4)
         self.show_pw_btn = self._styled_button(arow, "👁", self._toggle_show_pw,
                                                width=3, font=("Segoe UI", 10))
-        self.show_pw_btn.pack(side="left")
+        self.show_pw_btn.grid(row=0, column=3, sticky="n", pady=18)
+
+        # ── Lock In button — saves phone numbers so they auto-load on next launch ──
+        self.lock_in_var = tk.BooleanVar(value=False)
+        self.lock_in_btn = tk.Checkbutton(
+            arow, text="🔒 Lock In",
+            variable=self.lock_in_var,
+            command=self._toggle_lock_in,
+            bg=c["panel"], fg=c["fg"],
+            selectcolor="#1a3a1a",
+            activebackground=c["panel"],
+            activeforeground=c["fg"],
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2",
+        )
+        self.lock_in_btn.grid(row=0, column=4, sticky="n", padx=(8, 0), pady=18)
+
+        self.sync_btn = self._styled_button(arow, "🔄 Sync Winnings",
+                                            self.start_sync_winnings,
+                                            bg=c["accent"], fg="#0a1420", width=16)
+        self.sync_btn.grid(row=0, column=5, sticky="n", padx=(8, 0), pady=18)
+        self.history_btn = self._styled_button(arow, "📋 Live History",
+                                               self.show_live_bet_history,
+                                               bg=c["button_bg"], width=14,
+                                               font=("Segoe UI", 9, "bold"))
+        self.history_btn.grid(row=0, column=6, sticky="n", padx=(4, 0), pady=18)
 
         params = tk.Frame(tab, bg=c["bg"])
         params.pack(fill="x", pady=(0, 8))
@@ -303,7 +503,7 @@ class BetFlowProGUI:
         self._field(params, "Every (min)", "cadence_var", "60", 0, 1)
         self._field(params, "Daily cap (0=∞)", "daily_var", "20", 0, 2)
         self._field(params, "Max bets (0=∞)", "max_var", "0", 1, 0)
-        self._field(params, "Stake % (0=fixed)", "pct_var", "2", 1, 1)
+        self._field(params, "Stake % (0=fixed)", "pct_var", "0", 1, 1)
 
         self.chain_var = tk.BooleanVar(value=True)
         self.autostart_var = tk.BooleanVar(value=False)
@@ -329,7 +529,7 @@ class BetFlowProGUI:
                                 selectcolor=c["panel"], activebackground=c["bg"],
                                 activeforeground=c["fg"], font=("Segoe UI", 9))
         hd_chk.grid(row=2, column=1, sticky="w", padx=2)
-        self._field(params, "LS legs (0=off)", "ls_legs_var", "10", 3, 0)
+        self._field(params, "LS legs (0=off)", "ls_legs_var", "14", 3, 0)
         self._field(params, "LS x min", "ls_min_var", "15", 3, 1)
         self._field(params, "LS x max", "ls_max_var", "60", 3, 2)
         self._field(params, "Auto-withdraw KES (0=off)", "withdraw_var", "200", 4, 0)
@@ -342,55 +542,108 @@ class BetFlowProGUI:
                        row=5, column=0, sticky="w", padx=2, pady=(6, 0))
         self._field(params, "Jackpot KES", "jackpot_stake_var", "99", 5, 1)
 
+        # ── Markets to bet — owner toggles; all on by default. The selector
+        # then only builds legs from the ticked market groups (e.g. switch to
+        # O/U 1.5 + O/U 2.5 only, or drop BTTS). ─────────────────────────
+        self.mk_vars = {
+            "1x2": tk.BooleanVar(value=True),
+            "btts": tk.BooleanVar(value=True),
+            "ou25": tk.BooleanVar(value=True),
+            "ou15": tk.BooleanVar(value=True),
+        }
+        mrow = tk.Frame(params, bg=c["bg"])
+        mrow.grid(row=6, column=0, columnspan=3, sticky="w", padx=2, pady=(6, 0))
+        tk.Label(mrow, text="Bet on:", bg=c["bg"], fg=c["fg"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 6))
+        for _mk, _txt in (("1x2", "1X2"), ("btts", "BTTS"),
+                          ("ou25", "O/U 2.5"), ("ou15", "O/U 1.5")):
+            tk.Checkbutton(mrow, text=_txt, variable=self.mk_vars[_mk],
+                           bg=c["bg"], fg=c["fg"], selectcolor=c["panel"],
+                           activebackground=c["bg"], activeforeground=c["fg"],
+                           font=("Segoe UI", 9)).pack(side="left", padx=3)
+
         ctl = tk.Frame(tab, bg=c["bg"])
         ctl.pack(fill="x", pady=(0, 8))
         self.start_btn = self._styled_button(ctl, "▶  START BET MACHINE",
                                              self.start_bet_machine,
                                              bg=c["ok"], fg="#04110a", width=24)
-        self.start_btn.pack(side="left", padx=(0, 8))
+        self.start_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.stop_btn = self._styled_button(ctl, "■  EMERGENCY STOP",
                                             self.emergency_stop,
                                             bg=c["err"], fg="white", width=20)
         self.stop_btn.config(state="disabled")
-        self.stop_btn.pack(side="left", padx=(0, 8))
+        self.stop_btn.grid(row=0, column=1, sticky="w", padx=(0, 8))
         self.check_balance_btn = self._styled_button(ctl, "⚡ Balance Check",
                                                      self.start_balance_check,
                                                      bg=c["button_bg"], width=16)
-        self.check_balance_btn.pack(side="left", padx=(0, 8))
+        self.check_balance_btn.grid(row=0, column=2, sticky="w", padx=(0, 8))
         self.withdraw_btn = self._styled_button(ctl, "💸 Withdraw",
                                                 self.start_withdraw_flow,
                                                 bg=c["accent_dark"], fg="#201800",
                                                 width=14)
-        self.withdraw_btn.pack(side="left", padx=(8, 0))
+        self.withdraw_btn.grid(row=0, column=3, sticky="w", padx=(0, 8))
         self.deposit_btn = self._styled_button(ctl, "💵 Deposit (M-Pesa)",
                                                self.start_deposit_flow,
                                                bg="#1f7a33", fg="white", width=16)
-        self.deposit_btn.pack(side="left", padx=(8, 0))
+        self.deposit_btn.grid(row=0, column=4, sticky="w", padx=(0, 8))
         self.mega_btn = self._styled_button(ctl, "🎰 MEGA POT",
                                             self.start_mega_pot,
                                             bg="#8a5a00", fg="#ffe08a", width=13)
-        self.mega_btn.pack(side="left", padx=(8, 0))
+        self.mega_btn.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
         self.mid_btn = self._styled_button(ctl, "🀄 MID POT",
                                            self.start_mid_pot,
                                            bg="#5b3d8f", fg="#e8dcff", width=13)
-        self.mid_btn.pack(side="left", padx=(8, 0))
+        self.mid_btn.grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.form_btn = self._styled_button(ctl, "📈 Form cache",
+                                            self.show_form_cache, width=13, font=("Segoe UI", 9),
+                                            bg=c["muted"])
+        self.form_btn.grid(row=1, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.ready_lbl = tk.Label(ctl, text="⚪ jackpot research idle", bg=c["panel"],
+                                  fg=c["muted"], font=("Segoe UI", 9, "bold"))
+        self.ready_lbl.grid(row=1, column=3, columnspan=2, sticky="w", padx=(10, 0), pady=(8, 0))
+        self._last_ready_refresh = 0.0
 
         lbl = tk.Label(tab, text="  Live Machine Log  ", bg=c["bg"], fg=c["muted"],
                        font=("Segoe UI", 9, "bold"), anchor="w")
         lbl.pack(fill="x")
         logrow = tk.Frame(tab, bg=c["bg"])
         logrow.pack(fill="both", expand=True)
-        self.terminal = scrolledtext.ScrolledText(logrow, height=16, state="disabled",
+        _fsize = getattr(self, "_terminal_font_size", 10)
+        self._terminal_font_size = _fsize
+        self.terminal = scrolledtext.ScrolledText(logrow, height=18, state="disabled",
                                                   wrap="word", relief=tk.FLAT, bd=0,
                                                   bg=c["terminal_bg"],
                                                   fg=c["terminal_fg"],
                                                   insertbackground=c["terminal_fg"],
-                                                  font=("Consolas", 9))
+                                                  font=("Consolas", _fsize))
         self.terminal.pack(side="left", fill="both", expand=True)
+
+        # ── Colour-coded log tags ─────────────────────────────────────
+        # Each message type gets a distinct colour so the log is scannable at a glance.
+        self.terminal.tag_configure("win",      foreground="#ffd700", font=("Consolas", _fsize, "bold"))  # gold
+        self.terminal.tag_configure("loss",     foreground="#ff5252", font=("Consolas", _fsize, "bold"))  # red
+        self.terminal.tag_configure("bet",      foreground="#5fd068", font=("Consolas", _fsize, "bold"))  # bright green
+        self.terminal.tag_configure("longshot", foreground="#ffb400", font=("Consolas", _fsize, "bold"))  # amber
+        self.terminal.tag_configure("warn",     foreground="#ff9640")                                     # orange
+        self.terminal.tag_configure("fibi",     foreground="#ff80c8")                                     # pink
+        self.terminal.tag_configure("research", foreground="#40d4ff")                                     # cyan
+        self.terminal.tag_configure("money",    foreground="#ffe066")                                     # yellow
+        self.terminal.tag_configure("ok",       foreground="#5fd068")                                     # green
+        self.terminal.tag_configure("muted",    foreground="#5a6a7a")                                     # dim grey
+        self.terminal.tag_configure("div",      foreground="#2a3848")                                     # very dim separator
+        # Ctrl+scroll zoom on the terminal
+        self.terminal.bind("<Control-MouseWheel>", self._terminal_scroll_zoom)
+        self.terminal.bind("<Control-Button-4>", self._terminal_scroll_zoom)  # Linux up
+        self.terminal.bind("<Control-Button-5>", self._terminal_scroll_zoom)  # Linux down
+
         logtools = tk.Frame(logrow, bg=c["bg"])
         logtools.pack(side="left", fill="y", padx=(8, 0))
         self._styled_button(logtools, "📜 Auto-scroll", self.toggle_auto_scroll, width=13,
                             font=("Segoe UI", 8)).pack(pady=(0, 6))
+        self._styled_button(logtools, "🔍+  Zoom in", self._terminal_zoom_in, width=13,
+                            font=("Segoe UI", 8), bg=c["accent_dark"]).pack(pady=(0, 2))
+        self._styled_button(logtools, "🔍−  Zoom out", self._terminal_zoom_out, width=13,
+                            font=("Segoe UI", 8), bg=c["accent_dark"]).pack(pady=(0, 6))
         self._styled_button(logtools, "🗑 Clear log", lambda: self._clear_log(),
                             width=13, font=("Segoe UI", 8),
                             bg=c["muted"]).pack(pady=(0, 6))
@@ -427,7 +680,7 @@ class BetFlowProGUI:
                                     font=("Segoe UI", 9))
         self.ledger_hint.pack(side="left", padx=12)
 
-        cols = ("id", "placed", "status", "stake", "odds", "win", "markets", "recipe")
+        cols = ("id", "placed", "phone", "status", "stake", "odds", "win", "markets", "recipe")
         wrap = tk.Frame(tab, bg=c["bg"])
         wrap.pack(fill="both", expand=True)
         self.ledger_tree = ttk.Treeview(wrap, columns=cols, show="headings", height=16)
@@ -436,10 +689,11 @@ class BetFlowProGUI:
             style.theme_use("clam")
         except Exception:
             pass
-        heads = {"id": "Bet ID", "placed": "Placed", "status": "Status",
+        heads = {"id": "Bet ID", "placed": "Placed", "phone": "Account",
+                 "status": "Status",
                  "stake": "Stake", "odds": "Odds", "win": "Win",
                  "markets": "Markets", "recipe": "Recipe"}
-        widths = {"id": 90, "placed": 140, "status": 90, "stake": 70, "odds": 70,
+        widths = {"id": 90, "placed": 140, "phone": 100, "status": 90, "stake": 70, "odds": 70,
                   "win": 90, "markets": 190, "recipe": 200}
         for col in cols:
             self.ledger_tree.heading(col, text=heads[col])
@@ -529,6 +783,26 @@ class BetFlowProGUI:
         self.recipe_tree.configure(yscrollcommand=vsb2.set)
         self.recipe_tree.pack(side="left", fill="both", expand=True)
         vsb2.pack(side="right", fill="y")
+
+        tk.Label(tab, text="  Analyst accuracy by confidence bucket  ", bg=c["bg"], fg=c["muted"],
+                 font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", pady=(8, 2))
+        acols = ("bucket", "picks", "wins", "accuracy", "note")
+        wrap3 = tk.Frame(tab, bg=c["bg"])
+        wrap3.pack(fill="both", expand=True)
+        self.analyst_tree = ttk.Treeview(wrap3, columns=acols, show="headings", height=4)
+        aheads = {"bucket": "Confidence", "picks": "Picks used", "wins": "Slips won",
+                  "accuracy": "Win rate", "note": "Verdict"}
+        awidths = {"bucket": 110, "picks": 90, "wins": 90, "accuracy": 90, "note": 260}
+        for col in acols:
+            self.analyst_tree.heading(col, text=aheads[col])
+            self.analyst_tree.column(col, width=awidths[col], anchor="center")
+        vsb3 = ttk.Scrollbar(wrap3, orient="vertical", command=self.analyst_tree.yview)
+        self.analyst_tree.configure(yscrollcommand=vsb3.set)
+        self.analyst_tree.pack(side="left", fill="both", expand=True)
+        vsb3.pack(side="right", fill="y")
+        self.analyst_tree.tag_configure("good", foreground=c["ok"])
+        self.analyst_tree.tag_configure("poor", foreground=c["err"])
+
         self._refresh_learning()
 
     # ── Tools tab ─────────────────────────────────────────────────────
@@ -579,6 +853,42 @@ class BetFlowProGUI:
                  bg=c["panel"], fg=c["muted"], font=("Segoe UI", 9), justify="left",
                  anchor="w").pack(fill="x")
 
+        # ── Diagnostics & Control ──────────────────────────────────────
+        diag = tk.LabelFrame(tab, text="  Diagnostics & Control  ", bg=c["panel"],
+                             fg=c["accent"], font=("Segoe UI", 9, "bold"),
+                             labelanchor="nw", bd=1, relief=tk.GROOVE)
+        diag.pack(fill="x", pady=(10, 0))
+        d1 = tk.Frame(diag, bg=c["panel"])
+        d1.pack(fill="x", padx=10, pady=8)
+        row1 = tk.Frame(d1, bg=c["panel"])
+        row1.pack(fill="x", pady=(0, 6))
+        self._styled_button(row1, "🔄 Full Win-Sync",
+                            self.start_sync_winnings,
+                            width=16, font=("Segoe UI", 9),
+                            bg=c["accent"], fg="#0a1420").pack(side="left", padx=(0, 8))
+        self._styled_button(row1, "🗑️ Clear Usage Memory",
+                            self._clear_usage_memory,
+                            width=18, font=("Segoe UI", 9),
+                            bg=c["muted"]).pack(side="left", padx=(0, 8))
+        self._styled_button(row1, "🔓 Unpark All Accounts",
+                            self._unpark_all_accounts,
+                            width=18, font=("Segoe UI", 9),
+                            bg="#5b3d8f", fg="#e8dcff").pack(side="left", padx=(0, 8))
+        row2 = tk.Frame(d1, bg=c["panel"])
+        row2.pack(fill="x", pady=(0, 6))
+        self._styled_button(row2, "📊 Show Fibi Status",
+                            self._show_fibi_status,
+                            width=16, font=("Segoe UI", 9),
+                            bg=c["button_bg"]).pack(side="left", padx=(0, 8))
+        self._styled_button(row2, "🗂️ Clean Balance Reports",
+                            self._run_cleaner_now,
+                            width=20, font=("Segoe UI", 9),
+                            bg=c["muted"]).pack(side="left", padx=(0, 8))
+        self._styled_button(row2, "🧹 Reset Stale Active Bets",
+                            self._force_settle_stale,
+                            width=22, font=("Segoe UI", 9),
+                            bg=c["err"], fg="white").pack(side="left", padx=(0, 8))
+
     # ── Dashboard actions ─────────────────────────────────────────────
     def _phone_list(self):
         txt = ""
@@ -600,8 +910,203 @@ class BetFlowProGUI:
     def _toggle_show_pw(self):
         self.password_entry.config(show="" if self.password_entry.cget("show") == "*" else "*")
 
+    def _toggle_lock_in(self):
+        """Save or clear the locked-in phone numbers and password."""
+        c = self.colors
+        locked = self.lock_in_var.get()
+        if locked:
+            # Save current phones and password into settings immediately
+            try:
+                import json as _j
+                sp = self._settings_path()
+                try:
+                    with open(sp, "r", encoding="utf-8") as f:
+                        d = _j.load(f)
+                except Exception:
+                    d = {}
+                phones = self._phone_list()
+                pw = self.password_var.get().strip()
+                d["lock_in"] = True
+                d["phones_locked"] = phones
+                d["phones"] = phones
+                d["phone"] = phones[0] if phones else ""
+                d["password_locked"] = pw
+                with open(sp, "w", encoding="utf-8") as f:
+                    _j.dump(d, f, indent=2)
+                self.lock_in_btn.config(fg=c["ok"])
+                self._emit(f"🔒 Locked in {len(phones)} account(s) — will auto-load on next launch.")
+            except Exception as e:
+                self._emit(f"⚠️ Lock-in save failed: {e}")
+        else:
+            # Clear the lock — phones won't auto-load next time
+            try:
+                import json as _j
+                sp = self._settings_path()
+                try:
+                    with open(sp, "r", encoding="utf-8") as f:
+                        d = _j.load(f)
+                except Exception:
+                    d = {}
+                d["lock_in"] = False
+                d.pop("phones_locked", None)
+                d.pop("password_locked", None)
+                with open(sp, "w", encoding="utf-8") as f:
+                    _j.dump(d, f, indent=2)
+                self.lock_in_btn.config(fg=c["fg"])
+                self._emit("🔓 Lock-in cleared — phone numbers will need to be entered on next launch.")
+            except Exception as e:
+                self._emit(f"⚠️ Lock-in clear failed: {e}")
+
+    # ── Diagnostics button handlers ───────────────────────────────────
+
+    def _clear_usage_memory(self):
+        """Clear the no-repeat game memory so all games are eligible again."""
+        try:
+            import json
+            from resource_path import writable_path
+            p = writable_path("sportsape_usage.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+            self.backend._used_games = {}
+            self._emit("🗑️ Usage memory cleared — all games eligible for next slip.")
+        except Exception as e:
+            self._emit(f"⚠️ Could not clear usage memory: {e}")
+
+    def _unpark_all_accounts(self):
+        """Force-unpark all accounts that the engine has parked due to login failures."""
+        try:
+            es = getattr(self.backend, "_engine_state", {})
+            if es:
+                es.pop("force_relogin", None)
+            hub = getattr(self.backend, "_agent_hub", None)
+            if hub:
+                hub.fibi.state.get("parked_since", {}).clear()
+                hub.fibi._save_state()
+                hub.fibi.state["consecutive_aborts"] = 0
+                hub.fibi.state["consecutive_balance_unreadable"] = {}
+                hub.fibi._save_state()
+            self._emit("🔓 All accounts unparked — machine will retry logins immediately.")
+        except Exception as e:
+            self._emit(f"⚠️ Unpark failed: {e}")
+
+    def _show_fibi_status(self):
+        """Print Fibi's current watchdog status to the live log."""
+        try:
+            hub = getattr(self.backend, "_agent_hub", None)
+            if hub is None:
+                self._emit("🌸 Fibi: agents not running (start the bet machine first).")
+                return
+            sl = hub.fibi.status_line()
+            self._emit(f"🌸 Fibi status: {sl}")
+            ws = hub.fibi.state.get("warnings_log") or []
+            if ws:
+                self._emit(f"🌸 Last {min(5, len(ws))} warnings:")
+                for entry in ws[-5:]:
+                    self._emit(f"   • {entry.get('msg', '')}")
+            else:
+                self._emit("🌸 Fibi: no warnings on record.")
+        except Exception as e:
+            self._emit(f"⚠️ Fibi status failed: {e}")
+
+    def _run_cleaner_now(self):
+        """Force-run the balance report cleaner immediately."""
+        try:
+            hub = getattr(self.backend, "_agent_hub", None)
+            if hub is None:
+                # Run without agent hub using the cleaner directly
+                from sportsape_agents import BalanceReportCleaner
+                import os
+                base = os.path.dirname(os.path.abspath(__file__))
+                c = BalanceReportCleaner(search_dir=base)
+                r = c.run(gui_callback=self._emit)
+                self._emit(f"🗂️ Cleaner done: scanned {r['scanned']}, "
+                           f"deleted {r['deleted']}, freed {r['freed_bytes']:,} bytes")
+                return
+            hub.cleaner._last_run = 0  # force next should_run() to return True
+            result = hub.clean_balance_reports(gui_callback=self._emit)
+            if result:
+                self._emit(f"🗂️ Cleaner: scanned {result.get('scanned', 0)}, "
+                           f"deleted {result.get('deleted', 0)}, "
+                           f"freed {result.get('freed_bytes', 0):,} bytes")
+        except Exception as e:
+            self._emit(f"⚠️ Cleaner failed: {e}")
+
+    def _force_settle_stale(self):
+        """Mark any bet active for 48+ hours as lost so the ledger stays clean."""
+        if not messagebox.askyesno("Confirm",
+                                   "Mark all bets older than 48 hours as lost?\n\n"
+                                   "Only do this if the machine didn't sync their results."):
+            return
+        try:
+            from datetime import datetime as _dt
+            self.backend._load_ledger()
+            now = _dt.now()
+            count = 0
+            for b in getattr(self.backend, "_bets", []) or []:
+                if str(b.get("status") or "").startswith("shadow"):
+                    continue
+                if b.get("status") not in ("active", None, ""):
+                    continue
+                try:
+                    age_h = (now - _dt.fromisoformat(b.get("placed_at") or "")).total_seconds() / 3600
+                except Exception:
+                    age_h = 0
+                if age_h >= 48:
+                    b["status"] = "lost"
+                    b["settled_at"] = now.isoformat(timespec="seconds")
+                    b["auto_settled"] = True
+                    count += 1
+            if count:
+                self.backend._save_ledger()
+                self._emit(f"🧹 Force-settled {count} stale bet(s) as lost.")
+                self._refresh_ledger()
+            else:
+                self._emit("🧹 No stale active bets found (all under 48 hours).")
+        except Exception as e:
+            self._emit(f"⚠️ Force-settle failed: {e}")
+
     def toggle_auto_scroll(self):
         self.auto_scroll_enabled = not self.auto_scroll_enabled
+
+    # ── Terminal zoom ─────────────────────────────────────────────────
+    _TERM_FONT_MIN = 7
+    _TERM_FONT_MAX = 26
+
+    def _terminal_zoom_in(self):
+        self._terminal_font_size = min(
+            getattr(self, "_terminal_font_size", 10) + 1, self._TERM_FONT_MAX)
+        self._apply_terminal_font()
+
+    def _terminal_zoom_out(self):
+        self._terminal_font_size = max(
+            getattr(self, "_terminal_font_size", 10) - 1, self._TERM_FONT_MIN)
+        self._apply_terminal_font()
+
+    def _terminal_scroll_zoom(self, event):
+        """Ctrl+scroll wheel zooms the terminal font size."""
+        try:
+            # Windows: event.delta is +/-120 per notch
+            # Linux: event.num 4=up, 5=down
+            if event.delta > 0 or getattr(event, "num", 0) == 4:
+                self._terminal_zoom_in()
+            else:
+                self._terminal_zoom_out()
+        except Exception:
+            pass
+        return "break"  # prevent default scroll
+
+    def _apply_terminal_font(self):
+        size = getattr(self, "_terminal_font_size", 10)
+        if getattr(self, "terminal", None):
+            try:
+                self.terminal.config(font=("Consolas", size))
+                # Keep bold tags in sync with new size
+                for bold_tag in ("win", "loss", "bet", "longshot"):
+                    self.terminal.tag_configure(bold_tag, font=("Consolas", size, "bold"))
+                for normal_tag in ("warn", "fibi", "research", "money", "ok", "muted", "div"):
+                    self.terminal.tag_configure(normal_tag, font=("Consolas", size))
+            except Exception:
+                pass
 
     def _clear_log(self):
         self._log_lines = []
@@ -625,6 +1130,51 @@ class BetFlowProGUI:
         except Exception as e:
             messagebox.showerror("Export", str(e))
 
+    # ── Tag auto-detection rules ─────────────────────────────────────
+    # Each rule is (pattern_to_check_in_text, tag_name).
+    # First match wins.  Case-sensitive on emoji, insensitive on words.
+    _LOG_TAG_RULES = [
+        # Wins
+        ("🏆", "win"), ("WON!", "win"), ("🎉", "win"),
+        # Losses
+        ("❌ LOST", "loss"), ("LOST Bet", "loss"),
+        # Long-shot
+        ("🎯 LONG-SHOT", "longshot"), ("🎯 DAILY LONG-SHOT", "longshot"),
+        # Bets placed
+        ("✅ SMART", "bet"), ("bet placed", "bet"), ("PLACING BET", "bet"),
+        # Warnings / errors
+        ("⚠️", "warn"), ("🚨", "warn"), ("ERROR", "warn"),
+        # Fibi
+        ("🌸 Fibi", "fibi"),
+        # Research / analyst
+        ("🧠 Analyst", "research"), ("🎯 Scout", "research"),
+        ("🔬 Research", "research"), ("APEX:", "research"),
+        ("📋 PLANNED", "research"), ("🔍 BetRecovery", "research"),
+        # Money / balance
+        ("💰", "money"), ("💵", "money"), ("KES ", "money"),
+        ("💸", "money"), ("💹", "money"), ("Savings:", "money"),
+        # OK / success
+        ("✅ Logged", "ok"), ("✅ Session", "ok"), ("✅ Win-Sync", "ok"),
+        # Muted / debug noise
+        ("Crawl-and-bet attempt", "muted"), ("📅 Games (", "muted"),
+        ("  •", "muted"), ("scroll", "muted"),
+    ]
+
+    # Messages that trigger a visual separator line before them
+    _SEPARATOR_TRIGGERS = (
+        "⏱️ Crawl-and-bet attempt",
+        "🎯 DAILY LONG-SHOT",
+        "🎯 LONG-SHOT",
+        "FOOTBALL AUTO-BET:",
+    )
+
+    def _auto_tag(self, text: str) -> str:
+        """Return the best colour tag for this log line, or empty string for default."""
+        for pattern, tag in self._LOG_TAG_RULES:
+            if pattern in text:
+                return tag
+        return ""
+
     def _append_log(self, text, tag=None):
         line = f"[{datetime.now().strftime('%H:%M:%S')}] {text}"
         self._log_lines.append(line)
@@ -633,8 +1183,18 @@ class BetFlowProGUI:
         if not getattr(self, "terminal", None):
             return
         try:
+            # Auto-detect tag from content if caller didn't specify one
+            effective_tag = tag or self._auto_tag(text)
+
             self.terminal.config(state="normal")
-            self.terminal.insert(tk.END, line + "\n", tag)
+
+            # Insert a subtle separator line before new betting rounds
+            if any(trigger in text for trigger in self._SEPARATOR_TRIGGERS):
+                sep = "─" * 72 + "\n"
+                self.terminal.insert(tk.END, sep, "div")
+
+            self.terminal.insert(tk.END, line + "\n", effective_tag or "")
+
             if self.auto_scroll_enabled:
                 self.terminal.see(tk.END)
             self.terminal.config(state="disabled")
@@ -656,7 +1216,17 @@ class BetFlowProGUI:
                       text)
         if m:
             try:
-                self.state.balance = float(m.group(1).replace(",", ""))
+                bal = float(m.group(1).replace(",", ""))
+                self.state.balance = bal
+                # Also push into engine_state.balances for the active phone so the
+                # per-phone strip stays in sync even when the machine is idle.
+                try:
+                    es = getattr(self.backend, "_engine_state", {}) or {}
+                    active = str(es.get("active_phone") or "")
+                    if active:
+                        es.setdefault("balances", {})[active] = bal
+                except Exception:
+                    pass
             except Exception:
                 pass
             self._update_balance_label()
@@ -688,12 +1258,15 @@ class BetFlowProGUI:
         max_bets = integer(self.max_var, 0)
         daily = integer(self.daily_var, 0)
         pct = max(0.0, num(self.pct_var, 2.0))
-        ls_legs = integer(self.ls_legs_var, 10)
+        ls_legs = integer(self.ls_legs_var, 14)
         ls_min = max(3.0, num(self.ls_min_var, 15.0))
         ls_max = max(ls_min, num(self.ls_max_var, 60.0))
         withdraw = max(0.0, num(self.withdraw_var, 200.0))
+        mk_on = [k for k, v in self.mk_vars.items() if v.get()]
+        market_whitelist = "*" if len(mk_on) >= 4 else mk_on
         return {
             "phone": phone,
+            "phones": phones,
             "password": self.password_var.get().strip(),
             "stake": stake,
             "cadence_seconds": max(20.0, cadence_min * 60.0),
@@ -705,10 +1278,11 @@ class BetFlowProGUI:
             "longshot_odds_min": ls_min,
             "longshot_odds_max": ls_max,
             "longshot_legs": ls_legs,
-            "longshot_odds_cap": 1.75,
+            "longshot_odds_cap": 0,
             "auto_withdraw": withdraw > 0,
             "withdraw_amount": withdraw,
             "headless": bool(self.headless_var.get()),
+            "market_whitelist": market_whitelist,
         }
 
     def start_bet_machine(self):
@@ -730,10 +1304,14 @@ class BetFlowProGUI:
                   if q.get("auto_withdraw") else "auto-withdraw OFF | ")
         hd_txt = "HEADLESS | " if q.get("headless") else ""
         pct_txt = f"{q['stake_percent']:g}%" if q["stake_percent"] else "OFF"
+        daily_txt = "∞"
+        if q.get("daily_bets"):
+            db = int(q["daily_bets"])
+            daily_txt = f"{db} (split 18:00 {(db + 1) // 2}+{db // 2})"
         self._append_log("⚽ STARTING Bet Machine | " +
                          f"stake KES {q['stake']:.0f} | " +
                          f"{'HUNGRY chained slips' if q['chain_bets'] else 'classic paced'} | " +
-                         f"daily {'∞' if not q['daily_bets'] else q['daily_bets']} | " +
+                         f"daily {daily_txt} | " +
                          f"bets {'∞' if not q['max_bets'] else q['max_bets']} | " +
                          f"stake% {pct_txt} | " +
                          hd_txt + ls_txt + wd_txt)
@@ -742,19 +1320,25 @@ class BetFlowProGUI:
             qq = q
             try:
                 res = self.backend.run_football_bet_schedule(
-                    qq["phone"], qq["password"], stake=qq["stake"],
+                    qq["phone"], qq["password"], phones=qq.get("phones") or [qq["phone"]],
+                    stake=qq["stake"],
                     cadence_seconds=qq["cadence_seconds"], max_bets=qq["max_bets"],
                     daily_bets=qq["daily_bets"], stake_percent=qq["stake_percent"],
                     chain_bets=qq["chain_bets"], gui_callback=self._emit,
-                    stop_event=self._stop_event, visible=True,
+                    stop_event=self._stop_event, visible=False,
                     longshot=qq.get("longshot", True),
                     longshot_odds_min=qq.get("longshot_odds_min", 15.0),
                     longshot_odds_max=qq.get("longshot_odds_max", 60.0),
-                    longshot_odds_cap=qq.get("longshot_odds_cap", 1.75),
+                    longshot_odds_cap=qq.get("longshot_odds_cap", 0),
                     longshot_legs=qq.get("longshot_legs", 10),
                     auto_withdraw=qq.get("auto_withdraw", False),
                     withdraw_amount=qq.get("withdraw_amount", 200.0),
-                    headless=qq.get("headless", False))
+                    headless=True,
+                    market_whitelist=qq.get("market_whitelist", "*"),
+                    grok_api_key=self._grok_cfg().get("grok_api_key") or None,
+                    grok_model=self._grok_cfg().get("grok_model") or None,
+                    grok_interval=self._grok_cfg().get("grok_interval") or 90.0,
+                    agent_cfg=self._agent_cfg())
                 if isinstance(res, dict) and res.get("deposit_needed"):
                     self.bus.emit("deposit", (res.get("deposit_needed", 0.0),
                                               res.get("balance", 0.0)))
@@ -793,7 +1377,8 @@ class BetFlowProGUI:
     def _set_worker_button(self, name, busy):
         buttons = {"bet": self.start_btn, "balance": self.check_balance_btn,
                    "withdraw": self.withdraw_btn, "markets": self.markets_btn,
-                   "deposit": self.deposit_btn, "jackpot": self.mega_btn}
+                   "deposit": self.deposit_btn, "jackpot": self.mega_btn,
+                   "sync": self.sync_btn, "history": self.history_btn}
         btn = buttons.get(name)
         if btn is None:
             return
@@ -819,9 +1404,142 @@ class BetFlowProGUI:
         def job():
             self.backend.running = True
             self.backend.check_balances(phones, pw, gui_callback=self._emit)
-            self._emit("✅ Balance check completed.")
+            # ── After balance check: push results into the engine's in-memory
+            # cache so any running worker thread picks up the fresh balance
+            # immediately without waiting for its next internal read.
+            try:
+                bc = self.backend._load_balance_cache() or {}
+                if not hasattr(self.backend, '_balance_cache') or self.backend._balance_cache is None:
+                    self.backend._balance_cache = {}
+                for ph, entry in bc.items():
+                    if entry.get("confirmed"):
+                        self.backend._balance_cache[str(ph)] = entry
+                        # Also update engine_state so the per-phone header updates
+                        bal = float(entry.get("balance") or 0)
+                        es = getattr(self.backend, "_engine_state", {})
+                        es.setdefault("balances", {})[str(ph)] = bal
+                        # If balance is enough to bet, signal the win_funded_wait
+                        # loop to re-check immediately
+                        self.backend._engine_state["_balance_refreshed"] = True
+            except Exception:
+                pass
+            self._emit("✅ Balance check completed — engine will resume betting if funded.")
 
         self._worker("balance", job)
+
+    def start_sync_winnings(self, auto: bool = False):
+        """Sync bet history for all phones.
+
+        *auto* = True means this is the silent startup sync — skips the busy
+        guard so it always runs once at launch regardless of other workers.
+        """
+        phones = self._phone_list()
+        if not phones:
+            if not auto:
+                messagebox.showerror("Missing Data", "Enter phone number(s) first.")
+            return
+        if not self.password_var.get().strip():
+            if not auto:
+                messagebox.showerror("Missing Data", "Enter the password.")
+            return
+        if self.state.worker_busy["sync"] and not auto:
+            messagebox.showinfo("Busy", "A win-sync is already running.")
+            return
+        pw = self.password_var.get().strip()
+        if not auto:
+            self._append_log(f"🔄 Win-sync started for {len(phones)} account(s)...")
+
+        def job():
+            try:
+                self.backend._load_ledger()
+                # Count active bets before sync so we can report changes
+                active_before = sum(
+                    1 for b in (getattr(self.backend, "_bets", None) or [])
+                    if b.get("status") == "active")
+                for phone in phones:
+                    self.backend.sync_winnings_now(phone, pw, gui_callback=self._emit)
+                active_after = sum(
+                    1 for b in (getattr(self.backend, "_bets", None) or [])
+                    if b.get("status") == "active")
+                settled = active_before - active_after
+                if settled > 0:
+                    self._emit(f"✅ Sync complete — {settled} bet(s) settled, "
+                               f"{active_after} still active.")
+                else:
+                    self._emit(f"✅ Sync complete — {active_after} active bet(s), nothing changed.")
+                self._refresh_ledger()
+            except Exception as e:
+                self._emit(f"⚠️ Win-sync error: {str(e)[:120]}")
+
+        self._worker("sync", job)
+
+    def _ask_deposit_phones(self, phones):
+        """Modal picker — the human chooses WHICH account(s) get the STK push
+        (e.g. first, second, or both) before any deposit fires."""
+        phones = [p for p in (phones or []) if p]
+        if len(phones) <= 1:
+            return list(phones)
+        result = {"sel": []}
+        top = tk.Toplevel(self.root)
+        top.title("Deposit to which number?")
+        top.configure(bg=self.colors.get("bg", "#111418"))
+        top.resizable(False, False)
+        top.transient(self.root)
+        top.grab_set()
+        fg = self.colors.get("fg", "#e8e8e8")
+        tk.Label(
+            top,
+            text="Choose account(s) to fund.\nApprove the STK push on your phone — "
+                 "the machine bets as the money lands.",
+            bg=self.colors.get("bg", "#111418"), fg=fg,
+            justify="left").pack(padx=16, pady=(14, 8))
+        vars_ = {}
+        for ph in phones:
+            vars_[ph] = tk.BooleanVar(value=True)
+            tk.Checkbutton(
+                top, text=ph, variable=vars_[ph],
+                bg=self.colors.get("bg", "#111418"), fg=fg,
+                selectcolor="#2a2f3a", anchor="w",
+                highlightthickness=0).pack(anchor="w", padx=22)
+        def _ok():
+            result["sel"] = [ph for ph in phones if vars_[ph].get()]
+            top.destroy()
+        def _cancel():
+            top.destroy()
+        row = tk.Frame(top, bg=self.colors.get("bg", "#111418"))
+        row.pack(pady=(10, 14))
+        tk.Button(row, text="OK — Deposit", command=_ok,
+                  bg="#29a34a", fg="white").pack(side="left", padx=6)
+        tk.Button(row, text="Cancel", command=_cancel, bg="#465061", fg="white").pack(side="left", padx=6)
+        self.root.wait_window(top)
+        return result["sel"]
+
+    def show_live_bet_history(self):
+        """Fetch today's bets from SportPesa Bet History page for all phones."""
+        phones = self._phone_list()
+        if not phones:
+            messagebox.showerror("Missing Data", "Enter phone number(s) first.")
+            return
+        if not self.password_var.get().strip():
+            messagebox.showerror("Missing Data", "Enter the password.")
+            return
+        if self.state.worker_busy["history"]:
+            messagebox.showinfo("Busy", "History fetch already running.")
+            return
+        pw = self.password_var.get().strip()
+        self._append_log(f"📋 Fetching live bet history for {len(phones)} account(s)...")
+
+        def job():
+            for phone in phones:
+                try:
+                    self.backend.fetch_bet_history_live(
+                        phone, pw, gui_callback=self._emit)
+                except Exception as e:
+                    self._emit(f"⚠️ History fetch error ({phone}): {str(e)[:80]}")
+            self._emit("✅ Live history fetch done.")
+            self._refresh_ledger()
+
+        self._worker("history", job)
 
     def start_deposit_flow(self):
         """Fill the SportPesa deposit page so the M-Pesa STK pops on your phone."""
@@ -840,13 +1558,18 @@ class BetFlowProGUI:
         except ValueError:
             amount = 99.0
         pw = self.password_var.get().strip()
-        self._append_log(f"💵 Deposit request: KES {amount:,.2f} to {phones[0]} (M-Pesa) — "
-                         "approve the STK prompt on your phone; the machine bets once it lands.")
+        phones = self._ask_deposit_phones(phones)
+        if not phones:
+            self._append_log("🚫 Deposit cancelled — no account selected.")
+            return
+        self._append_log(f"💵 Deposit request: KES {amount:,.2f} each → {', '.join(phones)} "
+                         "(M-Pesa — one STK push per account; approve each on your phone; "
+                         "the machine bets as funds land).")
 
         def job():
             self.backend.running = True
-            self.backend.deposit_funds_browser(phones[0], pw, amount, gui_callback=self._emit)
-            self._emit("✅ Deposit flow done — machine will auto-bet the planned slip when funds arrive.")
+            self.backend.deposit_funds_multi(phones, pw, amount, gui_callback=self._emit)
+            self._emit("✅ Deposit flow done — machine will auto-bet the planned slips when funds arrive.")
 
         self._worker("deposit", job)
 
@@ -926,6 +1649,25 @@ class BetFlowProGUI:
 
     def start_mid_pot(self):
         self._start_jackpot_flow("mid")
+
+    def show_form_cache(self):
+        """Print the cached team-form entries gathered via the H2H stats overlay."""
+        try:
+            cache = self.backend._load_form_cache()
+            if not cache:
+                self._emit("📈 Form cache is empty — it fills as the machine analyses "
+                           "the jackpot pool (search-box lookups).")
+                return
+            rows = []
+            for key, e in sorted(cache.items()):
+                n = int(e.get("n") or 0)
+                rows.append(f"{key}: {'-'.join(str(c) for c in (e.get('results') or '')[-n:])} "
+                            f"({n} games, {int(time.time() - (e.get('ts') or 0))//3600}h old)")
+            self._emit(f"📈 Form cache: {len(rows)} team(s)")
+            for r in rows:
+                self._emit("   " + r)
+        except Exception as e:
+            self._emit(f"⚠️ Form cache view failed: {str(e)[:80]}")
 
     def _start_jackpot_flow(self, pool_key):
         label = "MEGA" if pool_key == "mega" else "MIDWEEK"
@@ -1035,16 +1777,26 @@ class BetFlowProGUI:
                 markets = ",".join(list(b.get("markets") or [])[:5]) or "—"
                 rec = b.get("recipe") or {}
                 recipe = f"{rec.get('legs','?')}L@{rec.get('band','-')}/{rec.get('lead','-')}"
+                ph = (b.get("phone") or "—")
                 self.ledger_tree.insert("", "end", values=(
-                    b.get("id") or "—", b.get("placed_at", "")[:16],
+                    b.get("id") or "—", b.get("placed_at", "")[:16], ph,
                     st or "active", b.get("stake") or "", b.get("odds") or "",
                     b.get("won_amount") or "", markets, recipe), tags=(tag,))
             net = s.get("net_profit", 0.0)
             arrow = "▲" if net >= 0 else "▼"
+            per = s.get("per_phone") or {}
+            per_txt = ""
+            if len(per) > 1:
+                parts = []
+                for p, ps in sorted(per.items()):
+                    a2 = "▲" if ps.get("net_profit", 0) >= 0 else "▼"
+                    parts.append(f"{p[-4:]}: {ps.get('won',0)}W/{ps.get('lost',0)}L "
+                                 f"{a2}{abs(ps.get('net_profit',0)):,.0f}")
+                per_txt = " | " + " · ".join(parts)
             self.winnings_label.config(
                 text=f"📊 {s.get('placed',0)} bets | won {s.get('won',0)} "
                      f"(+KES {s.get('won_return',0):,.2f}) | lost {s.get('lost',0)} | "
-                     f"active {s.get('active',0)} | net {arrow} KES {abs(net):,.2f}")
+                     f"active {s.get('active',0)} | net {arrow} KES {abs(net):,.2f}{per_txt}")
             self.ledger_hint.config(text=f"{len(bets)} tracked bet(s)")
         except Exception:
             pass
@@ -1058,7 +1810,7 @@ class BetFlowProGUI:
         try:
             with open(path, "w", encoding="utf-8", newline="") as f:
                 rows = getattr(self.backend, "_bets", [])
-                fieldnames = ["id", "placed_at", "status", "stake", "odds",
+                fieldnames = ["id", "placed_at", "phone", "status", "stake", "odds",
                               "possible_win", "won_amount", "settled_at",
                               "markets", "recipe"]
                 w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -1077,11 +1829,13 @@ class BetFlowProGUI:
             for tree in (self.learning_tree, self.recipe_tree):
                 for item in tree.get_children():
                     tree.delete(item)
+            # ── Market types ────────────────────────────────────────────
             mt = st.get("market_types") or {}
             for mk, e in sorted(mt.items()):
                 trials = int(e.get("trials") or 0)
-                won = int(e.get("won") or 0)
-                hit = (won / trials) if trials else 0.0
+                won_raw = float(e.get("won") or 0)  # may be fractional from blame-weighting
+                won_disp = f"{won_raw:.1f}" if won_raw != int(won_raw) else str(int(won_raw))
+                hit = (won_raw / trials) if trials else 0.0
                 pred = ((e.get("expected") or 0.0) / trials) if trials else 0.0
                 deficit = pred - hit
                 tag = "retired" if mk in (st.get("retired_markets") or []) else (
@@ -1090,8 +1844,9 @@ class BetFlowProGUI:
                           else f"boost x{e.get('weight',1.0):g}" if float(e.get("weight") or 1.0) > 1.0
                           else "neutral")
                 self.learning_tree.insert("", "end", values=(
-                    mk, trials, won, f"{hit:.1%}", f"{pred:.1%}",
+                    mk, trials, won_disp, f"{hit:.1%}", f"{pred:.1%}",
                     f"{deficit:+.1%}", e.get("weight", 1.0), status), tags=(tag,))
+            # ── Recipes ─────────────────────────────────────────────────
             recipes = st.get("recipes") or {}
             for key, r in sorted(recipes.items()):
                 trials = int(r.get("trials") or 0)
@@ -1101,6 +1856,39 @@ class BetFlowProGUI:
                 roi = ((ret - staked) / staked) if staked else 0.0
                 self.recipe_tree.insert("", "end", values=(
                     key, trials, won, f"{roi:+.1%}", ""))
+            # ── Analyst accuracy ─────────────────────────────────────────
+            analyst_tree = getattr(self, "analyst_tree", None)
+            if analyst_tree is not None:
+                for item in analyst_tree.get_children():
+                    analyst_tree.delete(item)
+                try:
+                    cache = self.backend._agent_hub.cache if self.backend._agent_hub else None
+                    acc = cache.analyst_accuracy_summary() if cache else {}
+                except Exception:
+                    acc = {}
+                # Also pull from stats if available
+                if not acc:
+                    acc = st.get("analyst_calibration") or {}
+                for bucket, e in sorted(acc.items()):
+                    n = int(e.get("n") or 0)
+                    wins = int(e.get("wins") or 0)
+                    if n == 0:
+                        continue
+                    rate = wins / n
+                    conf_f = float(bucket)
+                    # Verdict: is actual win-rate tracking with stated confidence?
+                    if rate >= conf_f - 0.05:
+                        verdict = "✅ Calibrated"
+                        tag = "good"
+                    elif rate >= conf_f * 0.7:
+                        verdict = "⚠️ Slightly overconfident"
+                        tag = ""
+                    else:
+                        verdict = f"❌ Overconfident ({conf_f:.0%} stated vs {rate:.0%} actual)"
+                        tag = "poor"
+                    analyst_tree.insert("", "end", values=(
+                        f"{conf_f:.0%}", n, wins, f"{rate:.0%}", verdict), tags=(tag,))
+
             settled = int(st.get("settled") or 0)
             bandit = "ACTIVE" if settled >= 30 else f"learning ({settled}/30 settled)"
             self.learning_summary.config(
@@ -1118,12 +1906,82 @@ class BetFlowProGUI:
         self.status_chip.config(text=f"● {s}", fg=color)
 
     def _update_balance_label(self):
+        c = self.colors
         try:
             if self.state.balance is None:
                 self.balance_label.config(text="Balance: —")
             else:
                 self.balance_label.config(
                     text=f"Balance: KES {self.state.balance:,.2f}")
+        except Exception:
+            pass
+        # Per-phone strip: rate-limited to once per 3 s to avoid hammering
+        # Tkinter widget updates at log-parsing speed.
+        now = time.time()
+        if now - getattr(self, "_last_per_phone_refresh", 0.0) > 3.0:
+            self._last_per_phone_refresh = now
+            self._update_per_phone_balances()
+
+    def _update_per_phone_balances(self):
+        """Refresh the per-account balance labels in the header strip.
+
+        Reads from _engine_state['balances'] which is a {phone: balance} dict
+        the engine updates every round.  Shows nothing when there is only one
+        account (the main balance label already covers that case) or when the
+        engine isn't running yet.
+        """
+        c = self.colors
+        try:
+            es = getattr(self.backend, "_engine_state", {}) or {}
+            balances = dict(es.get("balances") or {})
+            active_phone = str(es.get("active_phone") or "")
+            phones = list(es.get("phones") or [])
+
+            ppf = getattr(self, "per_phone_frame", None)
+            if ppf is None:
+                return
+
+            # Only show the strip when there are at least 2 phones
+            if len(phones) < 2 or not balances:
+                # Hide all existing labels
+                for lbl in getattr(self, "_per_phone_labels", {}).values():
+                    try:
+                        lbl.pack_forget()
+                    except Exception:
+                        pass
+                self._per_phone_labels = {}
+                return
+
+            existing = getattr(self, "_per_phone_labels", {})
+            shown = set()
+            for phone in phones:
+                bal = balances.get(phone)
+                if bal is None:
+                    continue
+                # Last 4 digits as a short identifier
+                short = str(phone)[-4:]
+                is_active = (phone == active_phone)
+                text = f"{'▶' if is_active else ' '}{short}: KES {bal:,.0f}"
+                fg = c["ok"] if is_active else c["muted"]
+                if phone not in existing:
+                    lbl = tk.Label(ppf, text=text, bg=c["panel"], fg=fg,
+                                   font=("Consolas", 9))
+                    lbl.pack(side="left", padx=(0, 8))
+                    existing[phone] = lbl
+                else:
+                    existing[phone].config(text=text, fg=fg)
+                shown.add(phone)
+
+            # Remove labels for phones no longer in the list
+            for phone in list(existing.keys()):
+                if phone not in shown:
+                    try:
+                        existing[phone].destroy()
+                    except Exception:
+                        pass
+                    del existing[phone]
+
+            self._per_phone_labels = existing
         except Exception:
             pass
 
@@ -1177,7 +2035,13 @@ class BetFlowProGUI:
             self.terminal.config(state="normal")
             self.terminal.delete("1.0", tk.END)
             if self._log_lines:
-                self.terminal.insert(tk.END, "\n".join(self._log_lines) + "\n")
+                for line in self._log_lines:
+                    # Strip the timestamp prefix to get the raw message for tag detection
+                    raw = re.sub(r"^\[\d{2}:\d{2}:\d{2}\] ", "", line)
+                    tag = self._auto_tag(raw)
+                    if any(trigger in raw for trigger in self._SEPARATOR_TRIGGERS):
+                        self.terminal.insert(tk.END, "─" * 72 + "\n", "div")
+                    self.terminal.insert(tk.END, line + "\n", tag or "")
             if self.auto_scroll_enabled:
                 self.terminal.see(tk.END)
             self.terminal.config(state="disabled")
@@ -1202,6 +2066,42 @@ class BetFlowProGUI:
     def _settings_path(self):
         return writable_path("sportsape_settings.json")
 
+    def _grok_cfg(self):
+        try:
+            with open(self._settings_path(), "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            d = {}
+        return {
+            "grok_api_key": str(d.get("grok_api_key") or "").strip(),
+            "grok_model": str(d.get("grok_model") or "").strip(),
+            "grok_interval": float(d.get("grok_interval") or 90.0),
+        }
+
+    def _agent_cfg(self):
+        try:
+            with open(self._settings_path(), "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            d = {}
+        return {
+            "agents_enabled":      bool(d.get("agents_enabled", True)),
+            "alerts_enabled":      bool(d.get("alerts_enabled", False)),
+            "alert_provider":      str(d.get("alert_provider") or "").strip(),
+            "twilio_sid":          str(d.get("twilio_sid") or "").strip(),
+            "twilio_auth":         str(d.get("twilio_auth") or "").strip(),
+            "twilio_from":         str(d.get("twilio_from") or "").strip(),
+            "alert_phone":         str(d.get("alert_phone") or "").strip(),
+            "webhook_url":         str(d.get("webhook_url") or "").strip(),
+            "webhook_token":       str(d.get("webhook_token") or "").strip(),
+            "api_football_key":    str(d.get("api_football_key") or "").strip(),
+            "api_football_keys":   [str(k).strip() for k in (d.get("api_football_keys") or [])
+                                    if str(k or "").strip()],
+            # All AI keys for rotation (Grok + Gemini)
+            "ai_keys":             [str(k).strip() for k in (d.get("ai_keys") or [])
+                                    if str(k or "").strip()],
+        }
+
     def _load_settings(self):
         try:
             with open(self._settings_path(), "r", encoding="utf-8") as f:
@@ -1211,10 +2111,10 @@ class BetFlowProGUI:
                                               (data.get("cadence_seconds", 3600) or 3600) / 60.0)))
             self.max_var.set(str(data.get("max_bets", 0)))
             self.daily_var.set(str(data.get("daily_bets", 20)))
-            self.pct_var.set(str(data.get("stake_percent", 2)))
+            self.pct_var.set(str(data.get("stake_percent", 0)))
             self.chain_var.set(bool(data.get("chain_bets", True)))
             self.longshot_var.set(bool(data.get("longshot", True)))
-            self.ls_legs_var.set(str(data.get("longshot_legs", 10)))
+            self.ls_legs_var.set(str(data.get("longshot_legs", 14)))
             self.ls_min_var.set(str(data.get("longshot_odds_min", 15)))
             self.ls_max_var.set(str(data.get("longshot_odds_max", 60)))
             self.withdraw_var.set(str(data.get("withdraw_amount", 200)))
@@ -1226,11 +2126,38 @@ class BetFlowProGUI:
                 self.jackpot_stake_var.set(str(data.get("jackpot_stake", 99)))
             except Exception:
                 pass
-            if data.get("phone"):
-                self.phone_text.delete("1.0", tk.END)
-                self.phone_text.insert("1.0", str(data["phone"]))
-            if data.get("password"):
-                self.password_var.set(str(data["password"]))
+            try:
+                _mk = data.get("markets") or {}
+                self.mk_vars["1x2"].set(bool(_mk.get("1x2", True)))
+                self.mk_vars["btts"].set(bool(_mk.get("btts", True)))
+                self.mk_vars["ou25"].set(bool(_mk.get("ou25", True)))
+                self.mk_vars["ou15"].set(bool(_mk.get("ou15", True)))
+            except Exception:
+                pass
+            # Load lock-in state and auto-populate phones/password if locked
+            _locked = bool(data.get("lock_in", False))
+            try:
+                self.lock_in_var.set(_locked)
+                c = self.colors
+                self.lock_in_btn.config(fg=c["ok"] if _locked else c["fg"])
+            except Exception:
+                pass
+            if _locked:
+                # Auto-populate phones and password from locked values
+                locked_phones = data.get("phones_locked") or data.get("phones") or []
+                locked_pw     = data.get("password_locked") or data.get("password") or ""
+                if locked_phones:
+                    try:
+                        self.phone_text.delete("1.0", tk.END)
+                        self.phone_text.insert("1.0", "\n".join(str(p) for p in locked_phones))
+                    except Exception:
+                        pass
+                if locked_pw:
+                    self.password_var.set(locked_pw)
+            else:
+                # Not locked — only load password, leave phones blank for security
+                if data.get("password"):
+                    self.password_var.set(str(data["password"]))
         except Exception:
             pass
         if self.autostart_var.get():
@@ -1242,16 +2169,17 @@ class BetFlowProGUI:
             team = self._phone_list()
             data = {
                 "phone": team[0] if team else "",
+                "phones": team,
                 "password": self.password_var.get().strip(),
                 "cadence_minutes": cadence_min,
                 "cadence_seconds": cadence_min * 60.0,
                 "stake": float(self.stake_var.get().strip() or 10),
                 "max_bets": int(float(self.max_var.get().strip() or 0)),
                 "daily_bets": int(float(self.daily_var.get().strip() or 20)),
-                "stake_percent": float(self.pct_var.get().strip() or 2),
+                "stake_percent": float(self.pct_var.get().strip() or 0),
                 "chain_bets": bool(self.chain_var.get()),
                 "longshot": bool(self.longshot_var.get()),
-                "longshot_legs": int(float(self.ls_legs_var.get().strip() or 10)),
+                "longshot_legs": int(float(self.ls_legs_var.get().strip() or 14)),
                 "longshot_odds_min": float(self.ls_min_var.get().strip() or 15),
                 "longshot_odds_max": float(self.ls_max_var.get().strip() or 60),
                 "withdraw_amount": float(self.withdraw_var.get().strip() or 200),
@@ -1260,7 +2188,16 @@ class BetFlowProGUI:
                 "autostart": bool(self.autostart_var.get()),
                 "notify": bool(self.notify_var.get()),
                 "jackpot_stake": float(self.jackpot_stake_var.get().strip() or 99),
+                "markets": {k: bool(v.get()) for k, v in self.mk_vars.items()},
+                # Lock-in state
+                "lock_in": bool(getattr(self, "lock_in_var", tk.BooleanVar()).get()),
+                "phones_locked": team if bool(getattr(self, "lock_in_var", tk.BooleanVar()).get()) else [],
+                "password_locked": self.password_var.get().strip() if bool(getattr(self, "lock_in_var", tk.BooleanVar()).get()) else "",
             }
+            gc = self._grok_cfg()
+            data["grok_api_key"] = gc["grok_api_key"]
+            data["grok_model"] = gc["grok_model"]
+            data["grok_interval"] = gc["grok_interval"]
             with open(self._settings_path(), "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception:
@@ -1274,18 +2211,59 @@ class BetFlowProGUI:
             pass
 
     def _on_close(self):
+        if not messagebox.askyesno("Confirm exit",
+                                   "Are you sure you want to close the tool?\n\n"
+                                   "The bet machine and any browser sessions will be shut down."):
+            return
         try:
             self.backend.running = False
             if self._stop_event is not None:
                 self._stop_event.set()
         except Exception:
             pass
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        # ── Exit cleanup: remove balance report files, pyc cache, and log files
+        # that are no longer needed.  Runs synchronously (fast — just file deletes).
+        try:
+            from sportsape_agents import BalanceReportCleaner
+            import os as _os
+            base = _os.path.dirname(_os.path.abspath(__file__))
+            c = BalanceReportCleaner(max_age_days=0.0, search_dir=base)
+            c._last_run = 0.0  # force run immediately
+            result = c.run(gui_callback=None)
+            freed_kb = round(result.get("freed_bytes", 0) / 1024, 1)
+            if freed_kb > 0:
+                print(f"[exit] Cleaned {result.get('deleted',0)} file(s), freed {freed_kb} KB")
+        except Exception:
+            pass
         self.root.destroy()
 
 
 def main():
+    # Set the AppUserModelID BEFORE creating the Tk window — this is what
+    # Windows uses to group taskbar buttons and associate the .ico with the
+    # process. It must be set before the first HWND is created.
+    set_windows_app_id(f"BetFlowPro.{APP_VERSION}")
+
+    # Also set it via the older ctypes path that some Windows versions need
+    if sys.platform == "win32" and _HAS_CTYPES:
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                f"BetFlowPro.{APP_VERSION}")
+        except Exception:
+            pass
+
     root = tk.Tk()
+    # Withdraw before building UI so the window is never shown with the
+    # default Tk feather icon — it only becomes visible after the icon is set.
+    root.withdraw()
     app = BetFlowProGUI(root)
+    # Show the window after a short delay so _set_app_icon's after(200,...) has
+    # already been scheduled and will fire while the window is visible.
+    root.after(10, root.deiconify)
     root.mainloop()
 
 

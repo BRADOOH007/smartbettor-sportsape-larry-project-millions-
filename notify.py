@@ -1,7 +1,10 @@
 """Sound + desktop toast alerts for BetFlow Pro.
 
-Pure standard library: winsound (Windows built-in) for beeps and a tiny
-tkinter Toplevel for the auto-hiding toast. No new dependencies.
+Pure standard library: winsound (Windows built-in) for soft system beeps
+and a tiny tkinter Toplevel for the auto-hiding toast. No new dependencies.
+
+Soft beep philosophy: single short tones only, no multi-note fanfares.
+Win = one gentle ascending beep. Loss = one low quiet tone. No noise spam.
 """
 import sys
 import threading
@@ -11,37 +14,53 @@ _ACTIVE_TOAST = {"win": None}
 
 
 def sound(kind: str) -> None:
-    """Play a short non-blocking beep pattern for an event kind."""
+    """Play a single soft non-blocking beep for an event kind.
+
+    Uses Windows MB_* system sounds (MessageBeep) where possible —
+    these respect the user's system volume and 'quiet hours' settings.
+    Falls back to a single short winsound.Beep if MessageBeep unavailable.
+    """
     if sys.platform != "win32":
         return
-    patterns = {
-        "placed":    ((880, 90), (660, 90)),
-        "won":       ((880, 130), (1109, 140), (1319, 260)),
-        "lost":      ((330, 220),),
-        "warn":      ((520, 160), (520, 160)),
-        "funds":     ((784, 110), (1047, 190)),
-        "withdraw":  ((1047, 110), (784, 110), (1047, 220)),
-        "planned":   ((1047, 90),),
+
+    # Map event kind to a single (freq, duration_ms) — short and quiet.
+    # MB_ICONINFORMATION = 64, MB_ICONWARNING = 48, MB_ICONERROR = 16,
+    # MB_OK = 0 (default system beep — usually the quietest)
+    _MB_SOUNDS = {
+        "won":      64,   # information sound — pleasant chime
+        "placed":   0,    # default system beep — subtle
+        "lost":     48,   # warning sound — low
+        "warn":     48,   # warning
+        "funds":    0,    # default
+        "withdraw": 64,   # information
+        "planned":  0,    # default
     }
-    pat = patterns.get(kind)
-    if not pat:
-        return
 
     def _play():
         try:
-            import winsound
-            for i, (freq, dur) in enumerate(pat):
-                winsound.Beep(freq, dur)
-                if i < len(pat) - 1:
-                    threading.Event().wait(0.05)
+            import ctypes
+            mb = _MB_SOUNDS.get(kind, -1)  # -1 = no sound
+            if mb >= 0:
+                ctypes.windll.user32.MessageBeep(mb)
         except Exception:
-            pass
+            try:
+                import winsound
+                # Single short soft beep — never a pattern
+                freq, dur = {"won": (880, 120), "placed": (660, 80),
+                             "lost": (330, 150), "warn": (520, 100)}.get(kind, (440, 80))
+                winsound.Beep(freq, dur)
+            except Exception:
+                pass
 
     threading.Thread(target=_play, daemon=True).start()
 
 
-def toast(title: str, msg: str, ms: int = 5000) -> None:
-    """Pop a bottom-right, always-on-top toast that auto-disappears."""
+def toast(title: str, msg: str, ms: int = 4000) -> None:
+    """Pop a small bottom-right toast that auto-disappears after *ms* ms.
+
+    Smaller than before (280×72), slightly transparent, no border flash —
+    visible but not grabbing focus or covering work.
+    """
     try:
         prev = _ACTIVE_TOAST.get("win")
         if prev is not None:
@@ -51,34 +70,26 @@ def toast(title: str, msg: str, ms: int = 5000) -> None:
                 pass
         root = tk._default_root
         if root is None:
-            try:
-                import main_gui
-            except Exception:
-                return
-            if not tk._default_root:
-                return
-            root = tk._default_root
+            return
+
         win = tk.Toplevel(root)
         _ACTIVE_TOAST["win"] = win
         win.overrideredirect(True)
         try:
             win.wm_attributes("-topmost", True)
-        except Exception:
-            pass
-        try:
-            win.wm_attributes("-alpha", 0.96)
+            win.wm_attributes("-alpha", 0.88)   # slightly transparent — less intrusive
         except Exception:
             pass
 
         colors = {
-            "won":      ("#0f2a18", "#2ecc71"),
-            "placed":   ("#101820", "#4db8ff"),
-            "lost":     ("#2a1414", "#ff5252"),
-            "warn":     ("#2a2210", "#ffb400"),
-            "funds":    ("#13202e", "#66ccff"),
-            "withdraw": ("#231c2e", "#b18cff"),
-            "planned":  ("#1a1f18", "#8fe388"),
-            "info":     ("#171c21", "#e6ecf2"),
+            "won":      ("#0c2014", "#27ae60"),
+            "placed":   ("#0d1620", "#3d9be9"),
+            "lost":     ("#1e0f0f", "#c0392b"),
+            "warn":     ("#1e1a0a", "#d4a017"),
+            "funds":    ("#0d1a24", "#4fc3f7"),
+            "withdraw": ("#1a1424", "#9b59b6"),
+            "planned":  ("#141a10", "#7dce82"),
+            "info":     ("#141a1f", "#c8d8e4"),
         }
         bg, accent = colors.get("info")
         for k, (cb, ca) in colors.items():
@@ -88,20 +99,22 @@ def toast(title: str, msg: str, ms: int = 5000) -> None:
 
         sw = win.winfo_screenwidth()
         sh = win.winfo_screenheight()
-        pad, w = 14, 360
-        h = 96
-        win.geometry(f"{w}x{h}+{sw - w - pad}+{sh - h - pad - 8}")
+        w, h, pad = 280, 70, 12
+        win.geometry(f"{w}x{h}+{sw - w - pad}+{sh - h - pad - 40}")
 
-        pad_frame = tk.Frame(win, bg=accent)
-        pad_frame.pack(fill="both", expand=True)
-        body = tk.Frame(pad_frame, bg=bg)
-        body.pack(fill="both", expand=True, padx=2, pady=2)
+        # Thin left-border accent strip
+        border = tk.Frame(win, bg=accent, width=3)
+        border.pack(side="left", fill="y")
+        body = tk.Frame(win, bg=bg)
+        body.pack(side="left", fill="both", expand=True)
+
         tk.Label(body, text=title, bg=bg, fg=accent,
-                 font=("Consolas", 11, "bold"), anchor="w").pack(
-                 fill="x", padx=12, pady=(8, 2))
-        tk.Label(body, text=msg, bg=bg, fg="#dfe7ee", justify="left",
-                 wraplength=w - 30, anchor="w", font=("Segoe UI", 9)).pack(
-                 fill="x", padx=12, pady=(0, 8))
+                 font=("Consolas", 10, "bold"), anchor="w").pack(
+                 fill="x", padx=10, pady=(8, 1))
+        tk.Label(body, text=_squeeze(msg, 100), bg=bg, fg="#c8d8e4",
+                 justify="left", anchor="w",
+                 font=("Segoe UI", 8)).pack(
+                 fill="x", padx=10, pady=(0, 8))
 
         win.after(ms, lambda: _safe_destroy(win))
     except Exception:
