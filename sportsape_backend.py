@@ -30,9 +30,15 @@ import requests
 from sportsape_grok import GrokGovernor
 
 try:
-    from sportsape_agents import AgentHub
+    from sportsape_supabase import get_sync as _sb_get_sync
+except Exception:  # cloud sync optional — engine must run without it
+    _sb_get_sync = None
+
+try:
+    from sportsape_agents import AgentHub, LeagueContextAgent
 except Exception:  # agents layer optional — engine must run without it
     AgentHub = None
+    LeagueContextAgent = None
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -100,7 +106,7 @@ class SportsapeBackend:
         self._preloaded_drivers = []
         self._driver_warmup_in_progress = False
         self._active_drivers = set()
-        self.max_parallel_workers = 3
+        self.max_parallel_workers = 2
         self.max_preloaded_drivers = max(1, self.max_parallel_workers)
         self.balance_cache = {"timestamp": 0, "results": {}}
         self.route_config = self._load_route_config()
@@ -109,8 +115,11 @@ class SportsapeBackend:
         self._jackpot_state = None
         self._jackpot_states = {}      # per-pool research cache: {"MEGA": st, "MIDWEEK": st}
         self._jackpot_cadence = 1500.0
+        self._fit_poisson_cache = {}   # (p1,pd,p2)-rounded -> (lh, la) — _fit_poisson is O(grid²)
         self._engine_busy = False
         self._last_crawled_games = []
+        self._last_emit_key = None
+        self._last_emit_time = 0
         # Per-account worker architecture: each phone owns ONE dedicated browser
         # session (`_worker_drivers[phone]`) and one serializing lock, so deposits/
         # bet rounds / balance touches never open a second login on the same account
@@ -122,6 +131,11 @@ class SportsapeBackend:
         self._bets_lock = threading.Lock()    # serializes the shared bets-placed counter
         self._used_lock = threading.Lock()    # serializes used-game memory (2 workers write it)
         self._account_buckets = {}          # phone -> disjoint board bucket (assigned first-seen)
+        self._game_owners = {}              # gid -> phone (hard single-owner: one
+                                            # game may NEVER be bet by two accounts)
+        self._gid_src = {}                  # gid -> listing URL that contains its row
+                                            # (merged games live on popular/football-1/
+                                            # upcoming listings, not the today tab)
         self._log_ring = deque(maxlen=150)
         self._gov_overrides = {}          # governor runtime overrides: param -> value
         self._gov_paused_reason = None     # governor pause: non-None => engine holds betting
@@ -135,6 +149,15 @@ class SportsapeBackend:
         # headless mode — hides the automation signature from Akamai/Cloudflare.
         self.STEALTH_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                            "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+        # ── Cash-out policy ────────────────────────────────────────────────
+        # When an active accumulator reaches "majority of legs won correctly and
+        # one (or few) left to play", the site offers a cash-out. If the offered
+        # amount is >= this fraction of the possible win we cash out automatically.
+        self.cashout_threshold = 0.75
+        self.auto_cashout_enabled = True
+        self._cashout_probed = {}        # bet_id -> last probe timestamp (rate limiter)
+        self._odds_history = None        # gid -> {first/last odds per market, kickoff}
+        self._dc_scrape_at = {}        # gid -> last Double-Chance full-market scrape time
 
     def _load_route_config(self) -> dict:
         defaults = {
@@ -364,6 +387,7 @@ class SportsapeBackend:
         # STEALTH: present a real Chrome in headless so Akamai/Cloudflare
         # challenges cannot fingerprint the default "HeadlessChrome" UA.
         if use_headless:
+            options.add_argument("--headless=new")
             options.add_argument("--lang=en-KE")
             options.add_argument(f"--user-agent={self.STEALTH_UA}")
         if mobile or (not force_visible and not use_headless):
@@ -385,6 +409,13 @@ class SportsapeBackend:
 
         temp_profile = tempfile.mkdtemp(prefix="sportsape_chrome_")
         options.add_argument(f"--user-data-dir={temp_profile}")
+        # Stability for concurrent workers: prevent the renderer from hanging
+        # (which surfaces as "timeout: Timed out receiving message from renderer")
+        # when multiple Chrome instances share /dev/shm.
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-software-rasterizer")
 
         try:
             # Use a simpler service initialization
@@ -394,8 +425,8 @@ class SportsapeBackend:
             self._track_active_driver(driver)
             self.selenium_driver = driver
 
-            driver.set_page_load_timeout(30)
-            driver.set_script_timeout(20)
+            driver.set_page_load_timeout(90)
+            driver.set_script_timeout(45)
 
             # STEALTH CDP layer: hide automation fingerprints, spoof the UA and
             # client-hint headers to match a genuine Chrome on Windows (this is what
@@ -463,7 +494,14 @@ class SportsapeBackend:
         raise last
 
     def _emit_direct(self, gui_callback, message: str) -> None:
-        """Internal emit that bypasses the verbose check for critical diagnostics"""
+        """Internal emit that bypasses the verbose check for critical diagnostics.
+        Dedup: collapse identical messages within 45s into one."""
+        now = time.time()
+        key = str(message).strip().lower().replace(" ", "")
+        if key == self._last_emit_key and (now - self._last_emit_time) < 45:
+            return
+        self._last_emit_key = key
+        self._last_emit_time = now
         try:
             self._log_ring.append((time.time(), str(message)))
         except Exception:
@@ -1542,14 +1580,7 @@ return true;
 
         self.generate_balance_report(results, gui_callback)
         self.generate_csv_report(results, gui_callback)
-        
-        if gui_callback:
-            try:
-                import winsound
-                winsound.Beep(1000, 300)
-            except Exception:
-                pass
-        
+
         return results
 
     def generate_csv_report(self, results, gui_callback=None):
@@ -1790,89 +1821,208 @@ return true;
                                   "  ⚠️ Login didn't confirm — opening the deposit page anyway "
                                   "(works if the session is actually live).")
 
-            self._emit_direct(gui_callback, "  Opening deposit page...")
+            self._emit_direct(gui_callback, "  Opening deposit page (unified multi-URL flow)...")
             self._inject_xhr_capture(driver)
-            # Live route (the site's own "Deposit" CTA points here, M-Pesa preselected)
-            driver.get(f"{SITE_ORIGIN}/deposit_funds")
-            WebDriverWait(driver, 25).until(lambda d: d.execute_script("return document.readyState") != "loading")
-            time.sleep(6)
+            _deposit_urls = [
+                f"{SITE_ORIGIN}/deposit_funds",
+                f"{SITE_ORIGIN}/en/deposit",
+                f"{SITE_ORIGIN}/deposit",
+            ]
             try:
-                self._dismiss_visible_promos(driver, rounds=1)
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       "config", "discovered_sportsape_routes.json"),
+                          encoding="utf-8") as _f:
+                    _saved = json.load(_f).get("wallet", {}).get("deposit")
+                    if _saved and _saved.get("url"):
+                        from urllib.parse import urlparse
+                        _pu = urlparse(_saved["url"])
+                        _saved_path = _pu.path + ("?" + _pu.query if _pu.query else "")
+                        if _saved_path not in {"".join(urlparse(u).path + ("?" + urlparse(u).query if urlparse(u).query else "")) for u in _deposit_urls}:
+                            _deposit_urls.append(f"{SITE_ORIGIN}{_saved_path}")
             except Exception:
                 pass
 
             deposited = False
-            try:
-                # M-Pesa amount field is input#safaricom_amount[name=amount]
-                amount_inp = None
-                for sel in ("input#safaricom_amount[name='amount']",
-                            "input[name='amount']",
-                            "input[placeholder*='mount']"):
-                    try:
-                        amount_inp = driver.find_element(By.CSS_SELECTOR, sel)
-                        break
-                    except Exception:
-                        continue
-                if amount_inp is None:
-                    amount_inp = next((i for i in driver.find_elements(By.CSS_SELECTOR, "input")
-                                       if "safaricom" in ((i.get_attribute("id") or "") + (i.get_attribute("placeholder") or "")).lower()),
-                                      None)
-                if amount_inp is not None:
-                    try:
-                        amount_inp.clear()
-                    except Exception:
-                        pass
-                    amount_inp.send_keys(str(int(float(amount))))
-                    self._emit_direct(gui_callback, f"  Amount set: KES {amount:,.0f} (M-Pesa)")
-                    # Confirmed button: <button class="amount-input-button">DEPOSIT</button>
-                    for btn in driver.find_elements(By.CSS_SELECTOR,
-                                                    "button.amount-input-button, button, input[type='submit']"):
+
+            def _try_fill_and_submit(drv, amt, ui_cb) -> bool:
+                """Find amount input (main doc or iframe) + submit button; return True if clicked."""
+                search_scopes = [(drv, "main")]
+                try:
+                    for _fr in drv.find_elements(By.TAG_NAME, "iframe"):
                         try:
-                            t = (btn.text or btn.get_attribute("value") or "").strip().lower()
-                            if "deposit" in t and "loading" not in t:
-                                btn.click()
-                                deposited = True
-                                self._emit_direct(gui_callback,
-                                                  "  Payment submitted — STK push sent to your phone.")
+                            drv.switch_to.frame(_fr)
+                            search_scopes.append((drv, "iframe"))
+                            drv.switch_to.default_content()
+                        except Exception:
+                            try:
+                                drv.switch_to.default_content()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                for _scope_drv, _tag in search_scopes:
+                    try:
+                        if _tag == "iframe":
+                            try:
+                                drv.switch_to.default_content()
+                                _all_fr = drv.find_elements(By.TAG_NAME, "iframe")
+                                for _fr in _all_fr:
+                                    try:
+                                        drv.switch_to.frame(_fr)
+                                        break
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                continue
+                        amount_inp = None
+                        for _sel in ("input#safaricom_amount[name='amount']",
+                                     "input[name='amount']",
+                                     "input[placeholder*='mount']",
+                                     "input[data-qa*='amount']",
+                                     "input[aria-label*='amount' i]"):
+                            try:
+                                amount_inp = _scope_drv.find_element(By.CSS_SELECTOR, _sel)
                                 break
+                            except Exception:
+                                continue
+                        if amount_inp is None:
+                            amount_inp = next((i for i in _scope_drv.find_elements(By.CSS_SELECTOR, "input")
+                                               if "safaricom" in ((i.get_attribute("id") or "") + (i.get_attribute("placeholder") or "")).lower()),
+                                              None)
+                        if amount_inp is None:
+                            _all_inputs = _scope_drv.find_elements(By.CSS_SELECTOR,
+                                                                    "input[type='number'], input[type='text'], input")
+                            for inp in _all_inputs:
+                                try:
+                                    pt = (inp.find_element(By.XPATH, "..").text or "").lower()
+                                    ph = (inp.get_attribute("placeholder") or "").lower()
+                                    nm = (inp.get_attribute("name") or inp.get_attribute("id") or "").lower()
+                                    if any(k in pt + ph + nm for k in ["amount", "kes", "topup", "top up"]):
+                                        amount_inp = inp
+                                        break
+                                except Exception:
+                                    continue
+                        if amount_inp is None:
+                            try:
+                                drv.switch_to.default_content()
+                            except Exception:
+                                pass
+                            continue
+                        try:
+                            amount_inp.clear()
                         except Exception:
                             pass
-                else:
-                    self._emit_direct(gui_callback,
-                                      "  Amount input not found — falling back to generic scan...")
-                    amount_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='number'], input[type='text'], input")
-                    for inp in amount_inputs:
-                        try:
-                            parent_text = (inp.find_element(By.XPATH, "..").text or "").lower()
-                            placeholder = (inp.get_attribute("placeholder") or "").lower()
-                            name = (inp.get_attribute("name") or inp.get_attribute("id") or "").lower()
-                            if any(k in parent_text + placeholder + name for k in ["amount", "kes", "topup", "top up"]):
-                                try:
-                                    inp.clear()
-                                except Exception:
-                                    pass
-                                inp.send_keys(str(int(float(amount))))
-                                self._emit_direct(gui_callback, f"  Amount set: KES {amount:,.0f}")
-                                for btn in driver.find_elements(By.CSS_SELECTOR,
-                                                                "button, input[type='submit'], "
-                                                                ".paybtn.clickScale.flex-box-row.middle, "
-                                                                ".btnPwd .paybtn"):
+                        amount_inp.send_keys(str(int(float(amt))))
+                        self._emit_direct(ui_cb,
+                                          f"  [{_tag}] Amount set: KES {amt:,.0f}")
+                        btn_candidates = []
+                        for _sel in ["button.amount-input-button", "button", "input[type='submit']",
+                                     ".paybtn.clickScale.flex-box-row.middle", ".btnPwd .paybtn",
+                                     "[role='button']", "a[href*='deposit' i]"]:
+                            try:
+                                btn_candidates.extend(_scope_drv.find_elements(By.CSS_SELECTOR, _sel))
+                            except Exception:
+                                continue
+                        for _idx, btn in enumerate(btn_candidates[:60]):
+                            try:
+                                if not btn.is_displayed():
+                                    continue
+                                t = (btn.text or btn.get_attribute("value") or btn.get_attribute("aria-label") or "").strip().lower()
+                                if any(k in t for k in ["deposit", "pay", "continue", "confirm", "mpesa", "stk", "submit"]):
+                                    if "loading" in t or "disabled" in (btn.get_attribute("class") or "").lower():
+                                        continue
+                                    btn.click()
                                     try:
-                                        t = (btn.text or btn.get_attribute("value") or "").lower()
-                                        if any(k in t for k in ["deposit", "pay", "continue", "confirm", "mpesa", "stk"]):
-                                            btn.click()
-                                            deposited = True
-                                            self._emit_direct(gui_callback,
-                                                              "  Payment submitted — STK push sent to your phone.")
-                                            break
+                                        drv.switch_to.default_content()
                                     except Exception:
                                         pass
-                                if deposited:
-                                    break
+                                    self._emit_direct(ui_cb,
+                                                      f"  [{_tag}] Payment submitted — STK push sent to your phone.")
+                                    return True
+                            except Exception:
+                                continue
+                        try:
+                            drv.switch_to.default_content()
                         except Exception:
                             pass
-            except Exception as e:
-                self._emit_direct(gui_callback, f"  Form error: {str(e)[:80]}")
+                    except Exception as _fe:
+                        try:
+                            drv.switch_to.default_content()
+                        except Exception:
+                            pass
+                        continue
+                try:
+                    drv.switch_to.default_content()
+                except Exception:
+                    pass
+                return False
+
+            for _ui, _url in enumerate(_deposit_urls, 1):
+                if deposited:
+                    break
+                self._emit_direct(gui_callback, f"  URL {_ui}/{len(_deposit_urls)}: {_url.replace(SITE_ORIGIN,'')}")
+                try:
+                    driver.get(_url)
+                    WebDriverWait(driver, 25).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                        or d.execute_script("return document.body && document.body.innerText.length > 200"))
+                except Exception:
+                    pass
+                _loaded = time.time() + 15
+                while time.time() < _loaded and not deposited:
+                    try:
+                        _bt = driver.execute_script("return (document.body && document.body.innerText) || '';").lower()
+                        if any(k in _bt for k in ["amount", "mpesa", "safaricom", "deposit", "top up"]):
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(1.5)
+                for _pr in range(3):
+                    try:
+                        self._dismiss_visible_promos(driver, rounds=2)
+                    except Exception:
+                        pass
+                    try:
+                        for _el in driver.find_elements(By.CSS_SELECTOR,
+                                                        ".modal .close, [data-dismiss], ._close, .popup-close, .cta-close"):
+                            try:
+                                if _el.is_displayed():
+                                    _el.click()
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                    time.sleep(0.8)
+                try:
+                    if _try_fill_and_submit(driver, amount, gui_callback):
+                        deposited = True
+                        break
+                except Exception as _e:
+                    self._emit_direct(gui_callback, f"  [{_ui}] form scan: {str(_e)[:60]}")
+                if _ui == 2 and not deposited:
+                    try:
+                        self._emit_direct(gui_callback, "  Trying captured API deposit endpoint early...")
+                        _api_r = self._try_api_wallet_action(driver, "deposit",
+                                                             {"amount": int(float(amount))})
+                        if _api_r.get("success"):
+                            deposited = True
+                            self._emit_direct(gui_callback,
+                                              "  ✅ API deposit — STK push sent to your phone.")
+                            break
+                    except Exception:
+                        pass
+
+            if not deposited:
+                try:
+                    self._emit_direct(gui_callback, "  Last resort: API deposit fallback.")
+                    _api_r = self._try_api_wallet_action(driver, "deposit",
+                                                         {"amount": int(float(amount))})
+                    if _api_r.get("success"):
+                        deposited = True
+                        self._emit_direct(gui_callback,
+                                          "  ✅ API fallback — STK push sent to your phone.")
+                except Exception:
+                    pass
 
             if deposited:
                 time.sleep(6)
@@ -1901,19 +2051,6 @@ return true;
                 except Exception:
                     pass
 
-            # API fallback: if the UI form failed but a known-good deposit
-            # endpoint was captured on an earlier run, replay it once.
-            if not deposited:
-                try:
-                    api_r = self._try_api_wallet_action(driver, "deposit",
-                                                        {"amount": int(float(amount))})
-                    if api_r.get("success"):
-                        deposited = True
-                        self._emit_direct(gui_callback,
-                                          "  ✅ Deposit via API endpoint — STK push sent to your phone.")
-                except Exception:
-                    pass
-
             if not deposited:
                 self._emit_direct(gui_callback, "  Could not find the deposit form. Dumping page...")
                 try:
@@ -1922,7 +2059,25 @@ return true;
                 except Exception:
                     pass
 
-            self._logout_current_session(driver)
+            if not borrowed:
+                try:
+                    self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                except Exception:
+                    pass
+            self._engine_state["_balance_refreshed"] = False
+            try:
+                _recheck, _rc_ok = self._read_balance_confirmed(driver, wait=10.0)
+                if _rc_ok:
+                    self._balance_cache = getattr(self, "_balance_cache", None) \
+                        or self._load_balance_cache()
+                    self._balance_cache[str(phone)] = {
+                        "balance": _recheck, "confirmed": True, "ts": time.time()}
+                    self._save_balance_cache()
+                    self._engine_state["_balance_refreshed"] = True
+                    self._emit_direct(gui_callback,
+                                      f"  ⚡ Post-deposit balance for {phone}: KES {_recheck:,.2f}")
+            except Exception:
+                pass
             result = {"status": "success" if deposited else "error",
                       "message": "STK sent" if deposited else "Form not found"}
             self._emit_direct(gui_callback,
@@ -2046,6 +2201,9 @@ return true;
     # a fallback when the today-games tab returns zero rows (e.g. late night or
     # early morning when the day hasn't loaded yet).
     FOOTBALL_HOME_URL = "https://www.ke.sportpesa.com/en/sports-betting/football-1/"
+    # Popular-games listing — another fixture feed that often carries more rows
+    # than the today tab, so the board-gather merges it too.
+    POPULAR_GAMES_URL = "https://www.ke.sportpesa.com/en/sports-betting/football-1/popular-games/"
     BETS_HISTORY_URL = "https://www.ke.sportpesa.com/bets/history"
     LEDGER_PATH = Path(writable_path("sportsape_ledger.json"))
     BALANCES_PATH = Path(writable_path("sportsape_balances.json"))
@@ -2059,8 +2217,34 @@ return true;
     WITHDRAW_PATH = Path(writable_path("sportsape_withdraw.json"))
     FORM_CACHE_PATH = Path(writable_path("sportsape_form_cache.json"))
     FORM_TTL_SECONDS = 6 * 3600  # team form is refreshed at most every ~6h
-    MIN_LEG_CONF = 0.40  # minimum fair probability per leg — permissive enough to always find candidates
+    ENRICH_PATH = Path(writable_path("sportsape_enrich_cache.json"))
+    ENRICH_TTL_SECONDS = 6 * 3600  # game enrichment (injuries, weather) valid 6h
+    ODDS_HISTORY_PATH = Path(writable_path("sportsape_odds_history.json"))
+    MIN_LEG_CONF = 0.55  # minimum fair probability per leg — only markets with a genuine shot
     MIN_LEG_ODDS = 1.20  # owner rule: no leg under x1.20 (never 1.01/1.04 filler legs)
+    RAW_LEG_VETO = 0.50  # hard veto: never bet a leg whose raw fair prob is below this
+    BTTS_STRONG_FLOOR = 0.62  # OWNER RULE (2026-09-19, ENFORCED): a BTTS/GG leg may
+                              # join a slip ONLY when the model's weighted confidence
+                              # clears 0.62 — GG's fair prob is ~55-60% (a coin-flip),
+                              # so any raw "pick GG" decision below this floor is a
+                              # donation waiting to happen. Data must STRONGLY back it.
+    MIN_COMBINED_ODDS = 2.5  # OWNER RULE (2026-09-18, ENFORCED): every betslip must
+                             # clear at LEAST x2.50 combined — no slip ever lands at
+                             # 1.02/1.20 filler odds. The earlier 4.5 floor starved
+                             # thin boards into "no accumulator combination found", and
+                             # the later silent 1.5 floor let junk slips through; the
+                             # correct floor is x2.50: high enough that a winning slip
+                             # is always worth real money, low enough that healthy
+                             # boards still build 2-3 clean legs. Where the engine plays
+                             # a goals/OVER market it always targets a CLEAN Over 1.5 or
+                             # Over 2.5 line (never an Over 0.5 — odds ~1.02, zero value:
+                             # KES 10 stake returns ~KES 1). Over 0.5 is not even in the
+                             # scrape pipeline (fields h3/btts/ou/ou15 only), and the
+                             # MIN_LEG_ODDS x1.20 veto kills any sub-1.20 filler leg.
+    MIN_STAKE = 5.0  # OWNER RULE (reverted 2026-09-16): the KES 1 floor produced
+                     # meaningless 1-shilling tickets that never grow the bank. Floor
+                     # is KES 5 (never below), stake scales with balance/sureness and
+                     # is capped at KES 20 so a single slip can't torch the bankroll.
     DEFAULT_POOL_SHARE = 0.25  # share of each win banked toward the auto-withdraw reserve
 
     # Market groups for the owner's market whitelist (all-on by default).
@@ -2071,6 +2255,8 @@ return true;
         "over": "ou25", "under": "ou25",
         "over15": "ou15",
         "dc_1x": "dc", "dc_x2": "dc", "dc_12": "dc",
+        "dnb_home": "dnb", "dnb_away": "dnb",
+        "ftts_home": "ftts", "ftts_away": "ftts", "ftts_no": "ftts",
     }
 
     def _market_ok(self, mk: str) -> bool:
@@ -2078,7 +2264,10 @@ return true;
         wl = getattr(self, "_market_whitelist", None)
         if not wl or wl == "*":
             return True
-        return (self._MK_GROUP_MAP.get(mk, mk) or mk) in wl
+        grp = self._MK_GROUP_MAP.get(mk)
+        if grp is None and str(mk).startswith(("over", "under")):
+            grp = "ou25"
+        return (grp or mk) in wl
 
 
     def _ensure_bet_login(self, driver, phone: str, password: str, gui_callback=None):
@@ -2108,38 +2297,143 @@ return true;
         """)
 
         with self._login_lock:
-            pi, pw = self._wait_for_login_inputs(driver, gui_callback=gui_callback)
-            if pi and pw:
-                pi.clear(); pi.send_keys(normalized)
-                pw.clear(); pw.send_keys(password)
-                time.sleep(0.5)
-                self._click_login_submit(driver)
-                if self._wait_for_post_login(driver) != "ok":
-                    self._emit_direct(gui_callback, "⚠️ Browser login did not confirm — continuing anyway")
-                else:
-                    self._emit_direct(gui_callback, "✅ Logged in")
+            if phone:
+                if self._hard_spa_login(driver, phone, password, gui_callback=gui_callback):
                     if self._agent_hub is not None:
                         try:
                             self._agent_hub.record_login(phone)
                         except Exception:
                             pass
+                    self._dismiss_visible_promos(driver, rounds=1)
+                    return
+                pi, pw = self._wait_for_login_inputs(driver, gui_callback=gui_callback)
+                if pi and pw:
+                    pi.clear(); pi.send_keys(normalized)
+                    pw.clear(); pw.send_keys(password)
+                    time.sleep(0.5)
+                    self._click_login_submit(driver)
+                    if self._wait_for_post_login(driver) != "ok":
+                        self._emit_direct(gui_callback, "⚠️ Browser login did not confirm — continuing anyway")
+                    else:
+                        self._emit_direct(gui_callback, "✅ Logged in")
+                        if self._agent_hub is not None:
+                            try:
+                                self._agent_hub.record_login(phone)
+                            except Exception:
+                                pass
+                else:
+                    if self._session_is_live(driver, deep_check=False):
+                        self._emit_direct(gui_callback, "✅ Session already live — already logged in")
+                        if self._agent_hub is not None:
+                            try:
+                                self._agent_hub.record_login(phone)
+                            except Exception:
+                                pass
+                    else:
+                        self._emit_direct(gui_callback, "⚠️ Could not find login form — continuing anyway")
             else:
                 if self._session_is_live(driver, deep_check=False):
                     self._emit_direct(gui_callback, "✅ Session already live — already logged in")
-                    if self._agent_hub is not None:
-                        try:
-                            self._agent_hub.record_login(phone)
-                        except Exception:
-                            pass
                 else:
-                    self._emit_direct(gui_callback, "⚠️ Could not find login form — continuing anyway")
+                    self._emit_direct(gui_callback, "⚠️ No phone — continuing without login")
         self._dismiss_visible_promos(driver, rounds=1)
+
+    def _spa_logged_attr(self, driver) -> str:
+        """The server renders `logged=\"1\"` on the SPA only when the Symfony
+        session behind it is genuinely authenticated. This is the single honest
+        signal the SPA uses (isAuthenticated() -> e.logged === '1'); the old
+        \"KES/deposit text\" heuristics below it are useless for gate decisions."""
+        try:
+            return str(driver.execute_script(
+                "return (document.body && "
+                "document.body.innerHTML.indexOf('logged=\"1\"') >= 0) ? '1' : '0';"))
+        except Exception:
+            return "0"
+
+    def _hard_spa_login(self, driver, phone: str, password: str,
+                        gui_callback=None, timeout: int = 50,
+                        force: bool = False) -> bool:
+        """REAL SportPesa web login. Opens the login dialog and SUBMITS the actual
+        #secondary_login form (POST /login_check with username+password), then
+        waits for the server-rendered page to flip `logged=\"1\"`.
+
+        Root cause uncover: the previous flow clicked at "Login" text / mis-matched
+        submit selectors, so the credentials were NEVER posted (zero network POSTs).
+        The SPA then rendered logged=\"0\", placeBet() gates on isAuthenticated() and
+        redirected us to /login — every round died exactly there. Submitting the real
+        form fixes the session bell-to-bell.
+
+        force=True: ALWAYS re-submit the real form, even when logged=\"1\" is already
+        rendered. The SPA silently re-mounts an EMPTY page (bare body, live to the
+        wallet API, logged=\"1\" intact) ~7min after login while we tour games —
+        the only known way back to a hydrated slip is a genuine fresh session POST,
+        so the mint gate calls us with force=True."""
+        normalized = self._format_sportsape_login_phone(phone)
+        if not force:
+            try:
+                if self._spa_logged_attr(driver) == "1":
+                    return True
+            except Exception:
+                pass
+        for _attempt in range(2):
+            try:
+                self._click_login_entry(driver)
+            except Exception:
+                pass
+            inputs_found = None
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                try:
+                    from selenium.webdriver.common.by import By
+                    u = driver.find_element(By.ID, "username")
+                    p = driver.find_element(By.ID, "password")
+                    if u and p:
+                        inputs_found = (u, p)
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.4)
+            if not inputs_found:
+                continue
+            u, p = inputs_found
+            try:
+                u.clear()
+                u.send_keys(normalized)
+                p.clear()
+                p.send_keys(password)
+                time.sleep(0.5)
+                driver.execute_script("document.getElementById('secondary_login').submit();")
+                self._emit_direct(gui_callback,
+                                  f"  🔐 Submitting real login form for {phone}...")
+            except Exception as exc:
+                self._emit_direct(gui_callback,
+                                  f"  ⚠️ login form fill failed: {str(exc)[:80]}")
+                continue
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                time.sleep(1)
+                try:
+                    if self._spa_logged_attr(driver) == "1":
+                        self._emit_direct(gui_callback,
+                                          "  ✅ Logged in (server session confirmed)")
+                        return True
+                except Exception:
+                    pass
+        self._emit_direct(gui_callback,
+                          "  ⚠️ Hard login did not reach logged=\"1\" — session not confirmed")
+        return False
 
     def _session_is_live(self, driver, deep_check: bool = True) -> bool:
         """True when the current page actually has a valid logged-in session.
-        Quick check: DOM text contains KSH/KES/logout/etc.
-        Deep check (default): does a lightweight API probe so stale-DOM false
-        positives (cookies expired server-side but text still in DOM) are caught."""
+        Primary signal: the server-rendered logged=\"1\" attr (the SPA's own
+        isAuthenticated source). Quick fallback: DOM text contains balance/logout.
+        Deep check: probe the wallet API and require a REAL 200 (a 401 proves the
+        session died — the old code treated 401 as live, hiding every logout)."""
+        try:
+            if self._spa_logged_attr(driver) == "1":
+                return True
+        except Exception:
+            pass
         try:
             body = driver.execute_script("return ((document.body && document.body.innerText) || '').toLowerCase();")
             quick_ok = any(k in body for k in ("ksh", "kes", "logout", "deposit", "balance"))
@@ -2153,7 +2447,7 @@ return true;
                 fetch('/api/wallets/balance', {credentials: 'include', cache: 'no-store'})
                     .then(function(r){
                         clearTimeout(tid);
-                        if (r.status === 200 || r.status === 401) { done(true); }
+                        if (r.status === 200) { done(true); }
                         else { done(false); }
                     })
                     .catch(function(){ clearTimeout(tid); done(false); });
@@ -2229,14 +2523,17 @@ return m ? m[0] : '';
     def _place_one_bet(self, driver, phone: str, password: str, stake: float = 10,
                        visible: bool = True, gui_callback=None,
                        target_odds_min: float = 3.0, target_odds_max: float = 6.0,
-                       odds_cap: float = 8.0, max_legs: int = 14,
-                       min_lead_minutes: int = 15,
+                       odds_cap: float = 8.0, max_legs: int = 14, min_legs: int = 2,
+                       min_lead_minutes: int = 5,
                        stake_percent: float = 0.0, stake_cap: float = 500.0,
                        prefer_more_legs: bool = False, reserve_pool: float = 0.0,
                        jitter_seed: int = 0,
                        conf_floor=None, no_odds_cap=False,
-                       researched_only=False, round_risk: bool = True) -> dict:
-        """One complete crawl-and-bet round on an already-built driver.
+                        researched_only=False, round_risk: bool = True,
+                        board_wide: bool = False,
+                        cfg=None,
+                        combined_floor_override: float = 0.0) -> dict:
+        """One complete crawl-and-bot round on an already-built driver.
 
         Crawls + scrolls the listing, intelligently picks the best win-probability
         accumulator (never repeating a GAME across betslips), clicks the
@@ -2261,6 +2558,12 @@ return m ? m[0] : '';
                 return {"status": "error",
                         "message": "Account session could not be re-established"}
             self._close_stray_tabs(driver)
+            # Anchor to the main games page so the wallet header / API is reachable.
+            try:
+                self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                time.sleep(0.8)
+            except Exception:
+                pass
 
             balance, balance_confirmed = self._read_balance_confirmed(driver, wait=20.0)
             if balance_confirmed:
@@ -2300,7 +2603,7 @@ return m ? m[0] : '';
             # Stake is fixed — always use exactly the base stake passed in.
             # Risk manager and compounding are disabled: the owner wants KES 10
             # minimum always, no automatic increases.
-            stake = max(10.0, float(stake))
+            stake = max(self.MIN_STAKE, float(stake))
 
             # Effective pool: waived automatically when balance is low so the
             # savings reserve never blocks a legitimate KES 10 bet.
@@ -2328,7 +2631,7 @@ return m ? m[0] : '';
                                 balance = recheck
                         except Exception:
                             pass
-                    if float(balance) < float(stake):
+                    if float(balance) < self.MIN_STAKE:
                         available = max(0.0, float(balance))
                         deposit_needed = max(0.0, round(float(stake) - available, 2))
                         # Rate-limit the deposit nag — say it once, then go quiet
@@ -2358,7 +2661,11 @@ return m ? m[0] : '';
                                 "balance": balance,
                                 "stake": float(stake)}
             # Stake is always the base value passed in — never reduced by reserve.
-            stake = max(10.0, min(float(stake), float(balance)))
+            # Owner rule: tiny balances get bet in full so they compound.
+            if self.MIN_STAKE <= float(balance) < float(stake):
+                self._emit_direct(gui_callback,
+                                  "Balance KES {:.2f} below base KES {:.2f} -- betting the full available amount to grow it.".format(float(balance), float(stake)))
+            stake = max(self.MIN_STAKE, min(float(stake), float(balance)))
 
             # Wait for the AngularSON-rendered game rows to replace the skeleton placeholders
             render_deadline = time.time() + 25
@@ -2394,12 +2701,61 @@ return { real: real, h: h };
                 except Exception:
                     pass
             if not games:
-                self._emit_direct(gui_callback, "⚠️ No game rows found on either listing page")
-                return {"status": "error", "message": "No games listed"}
+                # Transient crawl failure (DOM not ready / renderer hiccup) — reuse
+                # last good board for 15 min so "fix there many games" doesn't stall.
+                _cached = getattr(self, "_last_crawled_games", None) or []
+                _cached_ts = float(getattr(self, "_last_crawled_games_ts", 0) or 0)
+                if _cached and (time.time() - _cached_ts) < 900:
+                    games = list(_cached)
+                    self._emit_direct(gui_callback,
+                                      f"♻️ Reusing cached board: {len(games)} games (crawl transient)")
+                else:
+                    self._emit_direct(gui_callback, "⚠️ No game rows found on either listing page")
+                    return {"status": "error", "message": "No games listed"}
             try:
                 self._last_crawled_games = games
+                self._last_crawled_games_ts = time.time()
             except Exception:
                 pass
+            self._record_odds_ticks(games)
+
+            # Owner rule (2026-09): fetch MORE than whatever the today tab offers.
+            # Dedup means each of the shared 14-15 games is bet once across all
+            # numbers, so a bigger board every round guarantees the accumulator is
+            # always buildable. When today's tab is thin, merge the dedicated
+            # football-home + upcoming 24-48 h listings (deduped by game id).
+            if len([g for g in games if g.get("start")]) < 20:
+                _known = {str(g.get("id")) for g in games}
+                for _url in (self.POPULAR_GAMES_URL, self.FOOTBALL_HOME_URL,
+                         self.UPCOMING_GAMES_PAGE_URL):
+                    try:
+                        self._safe_get(driver, _url)
+                        time.sleep(1.2)
+                        self._scroll_to_load_more_games(driver, max_scrolls=3,
+                                                        gui_callback=gui_callback)
+                        _batch = self._extract_dom_games(driver) or []
+                        _fresh = [g for g in _batch
+                                  if str(g.get("id")) and str(g.get("id")) not in _known]
+                        if _fresh:
+                            games += _fresh
+                            _known |= {str(g.get("id")) for g in _fresh}
+                            # These rows live on the merged listing, NOT the today tab.
+                            # Remember their source URL so the leg-click flow can open
+                            # the right listing when looking the row up by id.
+                            for _g in _fresh:
+                                self._gid_src[str(_g.get("id"))] = _url
+                            _src = (_url.split("/")[-2] or "listing").replace("-", " ")
+                            self._emit_direct(gui_callback,
+                                              f"📈 Extended board: +{len(_fresh)} games from {_src}")
+                    except Exception as _e:
+                        self._emit_direct(gui_callback,
+                                          f"  ↖ Extra-board scrape skip: {str(_e)[:80]}")
+                # Back on the today listing so the leg-click flow behaves as usual.
+                try:
+                    self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                    time.sleep(1.0)
+                except Exception:
+                    pass
 
             # Annotate every game with minutes remaining to kick-off
             now = datetime.now()
@@ -2412,14 +2768,23 @@ return { real: real, h: h };
 
             # One-line game summary instead of a full listing (keeps the terminal quiet);
             # only the run's selected legs get logged at bet time.
+            # Owner rule (2026-09-22): placeable = today+tomorrow only (far-future
+            # lines from the extended board get suspended before kick-off).
             playable = [g for g in games
-                        if g.get("mins_to_start") is not None and g["mins_to_start"] >= min_lead_minutes]
+                        if g.get("mins_to_start") is not None
+                        and g["mins_to_start"] >= min_lead_minutes
+                        and self._is_recent_enough(g)]
+            far_future = sum(1 for g in games
+                             if g.get("mins_to_start") is not None
+                             and g["mins_to_start"] >= min_lead_minutes
+                             and not self._is_recent_enough(g))
             started = sum(1 for g in games if (g.get("mins_to_start") or 0) < 0)
             closing = sum(1 for g in games
                           if (g.get("mins_to_start") or 0) >= 0 and g["mins_to_start"] < min_lead_minutes)
             self._emit_direct(gui_callback,
                               f"📅 {len(games)} games on tab (⏳ {len(playable)} placeable, "
-                              f"🔜 {closing} too close, 🏁 {started} already underway)")
+                              f"🔜 {closing} too close, 🏁 {started} already underway, "
+                              f"📆 {far_future} beyond tomorrow)")
             if not playable:
                 # No placeable games on today's tab — try the upcoming-games page
                 # which lists fixtures from the next 24–48 h.
@@ -2439,13 +2804,17 @@ return { real: real, h: h };
                             g["mins_to_start"] = None
                     more_playable = [g for g in upcoming
                                      if g.get("mins_to_start") is not None
-                                     and g["mins_to_start"] >= min_lead_minutes]
+                                     and g["mins_to_start"] >= min_lead_minutes
+                                     and self._is_recent_enough(g)]
                     if more_playable:
                         self._emit_direct(gui_callback,
                                           f"✅ Found {len(more_playable)} placeable upcoming games — continuing")
+                        for _g in upcoming:
+                            self._gid_src[str(_g.get("id"))] = self.UPCOMING_GAMES_PAGE_URL
                         games = games + [g for g in upcoming
                                          if str(g.get("id")) not in {str(x.get("id")) for x in games}]
                         playable = more_playable
+                        self._record_odds_ticks(upcoming)
                         lead_by_gid = {str(g.get("id")): g.get("mins_to_start") for g in playable}
                     else:
                         self._emit_direct(gui_callback,
@@ -2460,29 +2829,72 @@ return { real: real, h: h };
                                   f"⚠️ No games currently placeable (need >= {min_lead_minutes}m "
                                   "to kick-off). Re-crawling shortly.")
                 return {"status": "aborted", "message": "No placeable games right now"}
-            # ── Per-account hard split: each worker gets its own disjoint slice of
-            # the board (game-id modulo the number of accounts), so the concurrent
-            # accounts NEVER place the same match in the same betting window.
-            # The global _used_games guard only kicks in AFTER a slip is placed,
-            # which is too late for two rounds running side by side.
-            try:
-                with self._used_lock:
-                    buk = self._account_buckets
-                    if str(phone or "") not in buk:
-                        buk[str(phone or "")] = len(buk)
-                _bkt = buk[str(phone or "")]
-                _nacc = max(2, len(buk))
-                _bucket = [g for g in playable
-                           if (int(str(g.get("id") or "0")) % _nacc) == _bkt]
-                if _bucket:
-                    self._emit_direct(gui_callback,
-                                      f"🔀 {phone}: own slice of the board "
-                                      f"({len(_bucket)}/{len(playable)} games — "
-                                      "accounts never share a match)")
-                    playable = _bucket
-            except Exception:
-                pass
+            # ── Per-account hard split: each worker gets its OWN preferred slice
+            # of the board. Even when the slice is thin and the round falls back
+            # to the full board, the global used_set below blocks the whole game
+            # (owner rule 2026-09: no match repeats today across ANY number) — so
+            # the first account to place a game owns it and the others pick fresh
+            # ones, while still being free to exploit MANY markets per game.
+            if not board_wide:
+                try:
+                    with self._used_lock:
+                        buk = self._account_buckets
+                        if str(phone or "") not in buk:
+                            buk[str(phone or "")] = len(buk)
+                    _bkt = buk[str(phone or "")]
+                    _nacc = max(2, len(buk))
+                    _bucket = [g for g in playable
+                               if (int(str(g.get("id") or "0")) % _nacc) == _bkt]
+                    # ── ADAPTIVE SLICE (owner rule: "so many games — no blocker,
+                    #    make sure ALL the accounts get games, never the
+                    #    'Not enough qualifying games' message") ──
+                    # The account only sticks to its disjoint slice when that slice
+                    # alone is rich enough to build the accumulator. A thin slice
+                    # (narrower than what's needed for the full slip) falls back
+                    # to the FULL board for this round, so a rich results board
+                    # ALWAYS yields a bet on every account instead of starving one
+                    # account while the board sits open.
+                    _need_at_least = max(int(max_legs) * 2, 6)
+                    if _bucket and len(_bucket) >= _need_at_least:
+                        self._emit_direct(
+                            gui_callback,
+                            f"🔀 {phone}: preferred own slice of the board "
+                            f"({len(_bucket)}/{len(playable)} games — "
+                            "accounts prefer not to share a match)")
+                        playable = _bucket  # first draft off own slice
+                    # Shared-board allowance: when the account's own slice is thin
+                    # the account drafts off the FULL board — but NEVER onto a game
+                    # that another account already owns. Every game has a SINGLE
+                    # owner (first-seen claim). A sibling may not touch it even on
+                    # a different market, so one bad game can never bleed two slips:
+                    # each account ends up on its OWN disjoint ~15-game pool.
+                    try:
+                        _own = getattr(self, "_game_owners", None) or {}
+                        _pg = str(phone or "")
+                        for _g in list(playable or []):
+                            _own.setdefault(str(_g.get("id") or ""), _pg)
+                        _blocked = {_gid for _gid, _o in _own.items() if _o != _pg}
+                        if _blocked:
+                            playable = [g for g in playable
+                                        if str(g.get("id") or "") not in _blocked]
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             lead_by_gid = {str(g.get("id")): g.get("mins_to_start") for g in playable}
+
+            # Due-diligence pre-flight: open + READ the stats overlay for the top
+            # candidate games BEFORE picking, caching form/injuries/weather. The
+            # selector then weighs real research, so games with no genuine chance
+            # (bad form, key injuries) are pushed down instead of being bet blind.
+            try:
+                # Study EVERY viable candidate (not just top-N) before selection,
+                # bounded by a hard time budget so the round never stalls.
+                self._preflight_diligence(driver, playable, gui_callback=gui_callback,
+                                          budget=len(playable) or 40, timeout=75.0)
+            except Exception as e:
+                self._emit_direct(gui_callback,
+                                  f"🔎 Pre-flight skip: {str(e)[:80]}")
 
             # Intelligent leg selection for the accumulator — never repeat a GAME
             # that already appeared in an earlier betslip (persisted across restarts),
@@ -2494,8 +2906,34 @@ return { real: real, h: h };
             # but allows: same game+different market (only gid|other_mk blocked).
             used_games = set()
             for gid_key, mks in (self._used_games or {}).items():
+                # Block the WHOLE game (owner rule: the same match must never be
+                # wagered twice today across ANY of the numbers — the 14-15 shared
+                # games each get bet at most once, market choice cannot repeat it).
+                used_games.add(str(gid_key))
                 for mk_val in (mks or {}):
-                    used_games.add(f"{gid_key}|{mk_val}")   # block specific combo
+                    used_games.add(f"{gid_key}|{mk_val}")   # finer legacy net
+
+            # Double-chance pre-flight: read real DC (1X/X2/12) odds off the
+            # full-market page of near-kickoff games so DC legs are selectable
+            # even when the opportunity scout has not visited them.
+            try:
+                self._scrape_dc_odds(driver, playable, gui_callback=gui_callback)
+            except Exception as e:
+                self._emit_direct(gui_callback,
+                                  f"↖ DC scrape skip: {str(e)[:80]}")
+
+            # Full-market expansion: disabled in the BET path (2026-09-22 owner
+            # rule) — the odds we price slips with live on the hydrated LISTING
+            # rows, and the slip is now clicked straight off those rows. Opening
+            # every imminent game's /markets page (which renders 0 boxes) just
+            # stalls the accumulator behind minute-long dead navigations.
+            # Kept OFF here; the idle pre-window research thread may still run it.
+            try:
+                self._scrape_full_markets_all(driver, playable[:2], gui_callback=gui_callback)
+            except Exception as e:
+                self._emit_direct(gui_callback,
+                                  f"🧮 Full-market expansion skip: {str(e)[:80]}")
+
             legs, product = self._select_football_legs(
                 playable,
                 target_min=target_min, target_max=target_max,
@@ -2507,59 +2945,105 @@ return { real: real, h: h };
                 researched_only=researched_only,
                 gui_callback=gui_callback)
             if not legs:
-                # No combo fit the target odds window — retry with a wider window
-                # (any combined odds > 1.5) and 2-leg minimum so we never skip a
-                # round just because the games available don't multiply into x3-x6.
+                # No combo fit the target odds window — one modest widening that
+                # STILL KEEPS the confidence floor (never re-run with floor 0):
+                # we'd rather skip a round than bet legs the model rates poor.
                 self._emit_direct(gui_callback,
                                   f"⚠️ No combo in target x{target_odds_min:.0f}-x{target_odds_max:.0f} "
-                                  f"— widening window and trying best available...")
+                                  f"— widening window slightly and retrying (floor kept)...")
                 legs, product = self._select_football_legs(
                     playable,
-                    target_min=3.0, target_max=target_max * 4,
-                    odds_cap=odds_cap, max_legs=max_legs, min_legs=2,
+                    target_min=max(self.MIN_COMBINED_ODDS, target_min * 0.85),
+                    target_max=min(target_max * 2.0, 30.0),
+                    odds_cap=odds_cap, max_legs=max_legs, min_legs=min_legs,
                     used=used_games,
                     prefer_more_legs=prefer_more_legs,
                     seed=jitter_seed,
-                    conf_floor=0.0, no_odds_cap=no_odds_cap,
-                    researched_only=False,
-                    gui_callback=gui_callback)
-            if not legs:
-                # Last resort: take the single best-available candidate regardless
-                # of target window (2-leg minimum). A modest slip beats no bet.
-                self._emit_direct(gui_callback,
-                                  "⚠️ Still no qualifying combo — using the best "
-                                  "available selections instead of skipping.")
-                legs, product = self._select_football_legs(
-                    playable,
-                    target_min=3.0, target_max=target_max * 10,
-                    odds_cap=odds_cap * 2, max_legs=max_legs, min_legs=2,
-                    used=used_games,
-                    prefer_more_legs=prefer_more_legs,
-                    seed=jitter_seed,
-                    conf_floor=0.0, no_odds_cap=no_odds_cap,
-                    researched_only=False,
+                    conf_floor=conf_floor, no_odds_cap=no_odds_cap,
+                    researched_only=researched_only,
                     gui_callback=gui_callback)
             if not legs:
                 self._emit_direct(gui_callback,
                                   "⚠️ Not enough qualifying games this round — re-crawling shortly.")
                 return {"status": "aborted", "message": "No accumulator combination found"}
 
+            # ── Always-learn shadow pick (owner rule: the tool improves every
+            # round it runs). Record a runner-up slip from the games NOT used in
+            # this round's real pick, so the learning engine scores a fresh data
+            # point even when a bet fires normally. Never touches money.
+            try:
+                chosen_ids = {str(l[2]) for l in legs}
+                _leftover = [g for g in playable if str(g.get("id")) not in chosen_ids]
+                if _leftover:
+                    _shadow_legs, _sp = self._select_football_legs(
+                        _leftover, target_min=target_min, target_max=target_max,
+                        odds_cap=odds_cap, max_legs=max_legs, used=used_games,
+                        prefer_more_legs=prefer_more_legs, seed=(jitter_seed + 7),
+                        conf_floor=conf_floor, no_odds_cap=no_odds_cap,
+                        researched_only=researched_only, gui_callback=gui_callback)
+                    if _shadow_legs:
+                        self._record_shadow_pick(_shadow_legs, phone,
+                                                 playable=_leftover,
+                                                 gui_callback=gui_callback)
+            except Exception:
+                pass
+
             joint_prob = 1.0
             for o, name, gid, market, prob in legs:
                 joint_prob *= prob
             self._emit_direct(gui_callback,
                               f"🎯 Selected {len(legs)} legs → combined x{product:.2f} "
-                              f"| ~{joint_prob * 100:.1f}% estimated win chance:")
+                              f"| ~{joint_prob * 100:.1f}% weighted win chance:")
+            leg_by_gid = {str(g.get("id")): g for g in playable}
+            soonest_ko = None
             for o, name, gid, market, prob in legs:
-                self._emit_direct(gui_callback, f"   • {name} [{market}] @{o:.2f} (~{prob * 100:.0f}%)")
+                _g = leg_by_gid.get(str(gid))
+                kf = _g.get("ko_label") if _g else ""
+                _start = _g.get("start") if _g else None
+                k_end = self._ko_end_hhmm(_start)
+                drift = self._drift_k(gid, market, o)
+                d_mark = f" | drift {'▲' if drift > 1.005 else ('▼' if drift < 0.995 else '＝')}x{drift:.2f}"
+                k_mark = (f" | ⏰ k.o. {kf} → ends ~{k_end}"
+                          if (kf and k_end) else (f" | k.o. {kf}" if kf else ""))
+                self._emit_direct(gui_callback,
+                                  f"   • {name} [{market}] @{o:.2f} (~{prob * 100:.0f}%){k_mark}{d_mark}")
+                if _start:
+                    _mins = (_start - datetime.now()).total_seconds() / 60.0
+                    if soonest_ko is None or _mins < soonest_ko:
+                        soonest_ko = _mins
+            if soonest_ko is not None:
+                if soonest_ko < 0:
+                    self._emit_direct(gui_callback,
+                                      f"⏱ First leg kicks off in-play (+{-soonest_ko:.0f}m) — momentum bet")
+                else:
+                    self._emit_direct(gui_callback,
+                                      f"⏱ First chosen leg kicks off in {soonest_ko:.0f}m — "
+                                      "no artificial minimum, betting it")
 
-            # Stake is always the base value — never altered by quality or risk.
-            stake = max(10.0, float(stake))
+            # ── Owner rule (2026-09-23): binary confidence stake — 20 / 10 ──
+            # A "too good" slip (near-certain legs, or a high joint win chance)
+            # bets KES 20; anything less confident bets KES 10. Never under
+            # MIN_STAKE, never above the configured cap / available balance.
+            _n_legs = len(legs)
+            _max_odds = max(float(o) for o, _n, _g, _m, _p in legs) if legs else 1.0
+            high_conf = (_n_legs <= 4 and _max_odds <= 1.35) or joint_prob >= 0.55
+            sized = 20.0 if high_conf else 10.0
+            if stake_cap and stake_cap > 0:
+                sized = min(sized, float(stake_cap))
+            sized = min(sized, max(1.0, float(balance)))
+            sized = max(self.MIN_STAKE, sized)
+            self._emit_direct(gui_callback,
+                              "🎚 {0}-leg slip @ up-to-x{1:.2f} odds ({2}% joint win) -- "
+                              "stake KES {3:.2f}{4}".format(
+                                  _n_legs, _max_odds, joint_prob * 100.0, sized,
+                                  " (TOO GOOD)" if high_conf else ""))
+            stake = sized
 
             # Kick-off guard: only bail if a chosen match is basically about to kick off
             # (close enough that the leg will be refused/suspended). Everything else
-            # goes to the retry/rebuild machinery.
-            grace_min = max(2, min_lead_minutes - 2)
+            # goes to the retry/rebuild machinery. We allow games right down to the
+            # final moments — no artificial 15-minute minimum.
+            grace_min = max(1, min_lead_minutes - 1)
             chosen_ids = {str(leg[2]) for leg in legs}
             for g in playable:
                 if str(g.get("id")) in chosen_ids:
@@ -2590,12 +3074,20 @@ return { real: real, h: h };
             for rebuild_round in range(1, 4):
                 res = self._open_betslip_and_place(driver, stake, phone, password,
                                                    gui_callback=gui_callback,
-                                                   before_balance=balance)
+                                                   before_balance=balance,
+                                                   legs=used_legs)
                 if isinstance(res, bool) and res:
                     placed = True
                     break
                 if not (isinstance(res, dict) and res.get("needs_legs")):
                     break
+                # The betslip persists across navigation (owner rule): whatever it
+                # still holds from the failed attempt must NOT stack into the new
+                # legs, or the slip silently mixes old+new selections and the odds
+                # read comes out meaningless. Clear it before re-clicking.
+                if self._clear_betslip(driver, gui_callback=gui_callback):
+                    self._emit_direct(gui_callback,
+                                      "  🧹 Cleared the persistent betslip before rebuild.")
                 # Rebuild: only games still kicking off with runway, and none used before
                 now = datetime.now()
                 remaining_playable = [
@@ -2644,6 +3136,7 @@ return { real: real, h: h };
                     "markets": [l[3] for l in used_legs],
                     "probs": [round(l[4], 4) for l in used_legs],
                     "game_ids": [str(l[2]) for l in used_legs],
+                    "leg_names": [l[1] for l in used_legs],
                     "lead_min": min((lead_by_gid.get(l[2]) or 999 for l in used_legs),
                                     default=None) or None,
                     "placed_at": datetime.now().isoformat(timespec="seconds")}
@@ -2652,10 +3145,79 @@ return { real: real, h: h };
             self._emit_direct(gui_callback, f"Football bet error: {str(exc)[:150]}")
             return {"status": "error", "message": str(exc)[:150]}
 
+    def _record_shadow_pick(self, legs, phone: str, playable=None, gui_callback=None):
+        """Record a shadow bet (stake=0, status='shadow') for a slip the machine
+        would pick but is NOT placing with real money. Runs on EVERY round so the
+        learning engine always gains a data point — whether or not funds exist —
+        making the machine measurably smarter the longer it runs 24/7.
+
+        Deduplicates: same game-set within the same session → only one shadow."""
+        try:
+            if not legs:
+                return
+            shadow_game_ids = frozenset(str(l[2]) for l in legs)
+            existing = [
+                b for b in (getattr(self, "_bets", None) or [])
+                if b.get("status") == "shadow"
+                and frozenset(b.get("shadow_game_ids") or []) == shadow_game_ids
+            ]
+            if existing:
+                return
+            if getattr(self, "_bets", None) is None:
+                self._bets = []
+            lead_bucket = self._lead_bucket(
+                min((g.get("mins_to_start") or 999
+                     for g in (playable or [])
+                     if str(g.get("id")) in shadow_game_ids),
+                    default=None))
+            shadow_entry = {
+                "id": None,
+                "phone": phone or "",
+                "placed_at": datetime.now().isoformat(timespec="seconds"),
+                "legs": len(legs),
+                "stake": 0.0,
+                "odds": round(float(self._leg_product(legs)), 2),
+                "possible_win": 0.0,
+                "markets": [l[3] for l in legs],
+                "probs": [round(l[4], 4) for l in legs],
+                "status": "shadow",
+                "settled_at": None,
+                "won_amount": None,
+                "shadow_game_ids": sorted(str(l[2]) for l in legs),
+                "shadow_legs": [
+                    {"gid": str(l[2]), "name": l[1], "market": l[3],
+                     "odds": round(l[0], 3), "prob": round(l[4], 4)}
+                    for l in legs
+                ],
+                "recipe": {
+                    "legs": len(legs),
+                    "band": self._band_of(float(self._leg_product(legs))),
+                    "lead": lead_bucket,
+                    "mix": "-".join(sorted(set(l[3] for l in legs))) or "-",
+                },
+            }
+            self._bets.append(shadow_entry)
+            self._save_ledger()
+            self._emit_direct(gui_callback,
+                              f"🔮 Shadow bet recorded ({len(legs)} legs) — machine will "
+                              "score its outcome for learning regardless of funds.")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _leg_product(legs) -> float:
+        p = 1.0
+        for l in (legs or []):
+            try:
+                p *= float(l[0])
+            except (TypeError, ValueError):
+                continue
+        return p
+
     def _plan_ahead(self, driver, phone: str, password: str, stake: float = 10,
                     target_min: float = 3.0, target_max: float = 6.0,
                     odds_cap: float = 8.0, max_legs: int = 14,
-                    min_lead_minutes: int = 10, gui_callback=None):
+                    min_lead_minutes: int = 5, gui_callback=None):
         """Dry-run while funds are pending: crawl the games and pre-plan the next
         slip WITHOUT clicking anything or placing a bet. Used by win-funded mode
         so the engine always knows which matches to grab the moment balance lands.
@@ -2670,6 +3232,7 @@ return { real: real, h: h };
             self._prune_usage()
             used_games = set()
             for gid_key, mks in (self._used_games or {}).items():
+                used_games.add(str(gid_key))
                 for mk_val in (mks or {}):
                     used_games.add(f"{gid_key}|{mk_val}")
             render_deadline = time.time() + 20
@@ -2728,7 +3291,8 @@ return { real: real, h: h };
                     g["mins_to_start"] = None
             playable = [g for g in games
                         if g.get("mins_to_start") is not None
-                        and g["mins_to_start"] >= min_lead_minutes]
+                        and g["mins_to_start"] >= min_lead_minutes
+                        and self._is_recent_enough(g)]
             # Same per-account slice-of-the-board split as _place_one_bet, so a
             # pre-planned slip never targets a match the other account is on.
             try:
@@ -2745,6 +3309,11 @@ return { real: real, h: h };
             except Exception:
                 pass
             jitter_seed = getattr(self, "_last_jitter_seed", 0)
+            try:
+                self._scrape_dc_odds(driver, playable, gui_callback=gui_callback,
+                                     max_open=8)
+            except Exception:
+                pass
             legs, product = self._select_football_legs(
                 playable, target_min=target_min, target_max=target_max,
                 odds_cap=odds_cap, max_legs=max_legs,
@@ -3429,8 +3998,138 @@ return { real: real, h: h };
         with self._driver_lock:
             self._worker_drivers.pop(phone, None)
 
+\
+    _PROFILE_PREFIX = "sportsape_chrome_"
+
+    def _chromedriver__our_pids(self, live_pids: set = None) -> set:
+        """Return the PIDs of chromedriver.exe processes that belong to THIS
+        tool (i.e. whose spawned chrome.exe uses one of our temp profiles).
+        Chrome instances created by the user's own Selenium/chromedriver or any
+        other tool are never returned, so the sweep below can never kill them."""
+        import subprocess as _sp
+        profile_marker = self._PROFILE_PREFIX
+        driver_cmd = (
+            "powershell -NoProfile -NonInteractive -Command "
+            "\"Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -in @('chromedriver.exe','chrome.exe') } | "
+            "Select-Object Name, ProcessId, ParentProcessId, CommandLine | "
+            "ConvertTo-Json -Compress\""
+        )
+        try:
+            r = _sp.run(driver_cmd, capture_output=True, text=True,
+                        timeout=30, shell=True)
+        except Exception:
+            return set()
+        raw = (r.stdout or "").strip()
+        if not raw:
+            return set()
+        try:
+            import json as _json
+            rows = _json.loads(raw)
+            if isinstance(rows, dict):
+                rows = [rows]
+        except Exception:
+            return set()
+        # Build two maps: chrome pid -> command line, chromedriver pid -> its chrome children
+        chrome_cmdline = {}
+        drv_children = {}
+        drv_pids = set()
+        worker_pids = set()
+        for rec in rows or []:
+            try:
+                pid = int(rec.get("ProcessId") or 0)
+            except Exception:
+                continue
+            name = (rec.get("Name") or "").lower()
+            cmd = (rec.get("CommandLine") or "")
+            if name == "chrome.exe":
+                chrome_cmdline[pid] = cmd
+            elif name == "chromedriver.exe":
+                drv_pids.add(pid)
+                try:
+                    if not cmd or "chrome" not in cmd.lower():
+                        worker_pids.add(pid)
+                except Exception:
+                    pass
+        try:
+            for rec in rows or []:
+                try:
+                    pid = int(rec.get("ProcessId") or 0)
+                    ppid = int(rec.get("ParentProcessId") or 0)
+                except Exception:
+                    continue
+                if pid in drv_pids or ppid in drv_pids:
+                    if (rec.get("Name") or "").lower() == "chrome.exe":
+                        drv_children.setdefault(ppid, []).append(pid)
+        except Exception:
+            pass
+        ours = set()
+        for drv in drv_pids:
+            for child in drv_children.get(drv, []):
+                if profile_marker in (chrome_cmdline.get(child) or ""):
+                    ours.add(drv)
+                    break
+        # Fall back: never touch anything that can't be proven ours.
+        return ours
+
+    def _sweep_orphan_chromedrivers(self, gui_callback=None,
+                                    aggressive: bool = False,
+                                    live_pids: set = None) -> dict:
+        """Kill orphaned chromedriver.exe processes that belong to THIS tool
+        (verified via our -user-data-dir=sportsape_chrome_* temp profile on the
+        child chrome.exe it spawned). Never touches chromedrivers owned by the
+        user or by any other software: without proof the child chrome is ours,
+        the driver is left alone."""
+        import subprocess as _sp
+        live = set(int(p) for p in (live_pids or ()))
+        objs = []
+        try:
+            objs = list(self._worker_drivers.values())
+        except Exception:
+            pass
+        for d in objs:
+            try:
+                pr = d.service.process
+                if pr is not None and pr.pid:
+                    live.add(int(pr.pid))
+            except Exception:
+                pass
+        ours = self._chromedriver__our_pids(live_pids=live)
+        if not ours:
+            return {"killed": 0, "kept_live": list(live),
+                    "note": "ownership probe found no tool chromedrivers"}
+        rows = sorted(o for o in ours if o not in live)
+        if not rows:
+            return {"killed": 0, "kept_live": sorted(live | ours),
+                    "note": "all tool drivers are live/in-use"}
+        kept, killed = [], 0
+        for pid in rows:
+            if pid in live:
+                kept.append(pid)
+                continue
+            if not aggressive:
+                # give freshly-spawned drivers a grace window so we never kill
+                # a driver that is mid-boot for this round.
+                try:
+                    _sp.run(["tasklist", "/FI", "PID eq " + str(pid),
+                             "/FO", "CSV", "/NH"],
+                            capture_output=True, text=True, timeout=12)
+                except Exception:
+                    pass
+            try:
+                _sp.run(["taskkill", "/PID", str(pid), "/F"],
+                        capture_output=True, timeout=12)
+                killed += 1
+            except Exception:
+                kept.append(pid)
+        self._emit_direct(gui_callback,
+                          f"   Orphan chromedriver sweep: killed {killed} | "
+                          f"kept {len(kept)} live/in-use (tool-owned only)")
+        return {"killed": killed, "kept_live": kept}
     def _close_all_account_drivers(self):
         """Emergency stop: quit every dedicated account browser and clear the map."""
+        self._sweep_orphan_chromedrivers(gui_callback=None, aggressive=True)
+
         with self._driver_lock:
             drivers = list(self._worker_drivers.values())
             self._worker_drivers.clear()
@@ -3439,6 +4138,61 @@ return { real: real, h: h };
                 d.quit()
             except Exception:
                 pass
+
+    def shutdown_all_browsers(self) -> int:
+        """Quit EVERY browser this engine ever created, and nothing else.
+        Covers worker drivers, preloaded pool, the shared _bet_driver and the
+        tracked _active_drivers set. Runs at GUI close / app exit so no
+        sportsape_temp Chrome is left alive on the system. Returns count."""
+        closed = 0
+        seen = set()
+        buckets = []
+        try:
+            buckets.append(dict(self._worker_drivers).values())
+        except Exception:
+            pass
+        try:
+            buckets.append(list(self._preloaded_drivers))
+        except Exception:
+            pass
+        try:
+            buckets.append([self._bet_driver] if self._bet_driver else [])
+        except Exception:
+            pass
+        try:
+            buckets.append(list(self._active_drivers))
+        except Exception:
+            pass
+        for bucket in buckets:
+            for d in bucket or []:
+                if not d or id(d) in seen:
+                    continue
+                seen.add(id(d))
+                try:
+                    d.quit()
+                except Exception:
+                    pass
+                tmp = getattr(d, "_sportsape_temp_profile", None)
+                if tmp and os.path.exists(tmp):
+                    shutil.rmtree(tmp, ignore_errors=True)
+                closed += 1
+        with self._active_drivers_lock:
+            self._active_drivers.clear()
+        with self._driver_lock:
+            self._worker_drivers.clear()
+        try:
+            self._preloaded_drivers = []
+        except Exception:
+            pass
+        try:
+            self._bet_driver = None
+        except Exception:
+            pass
+        try:
+            self.selenium_driver = None
+        except Exception:
+            pass
+        return closed
 
     def run_football_bet_schedule(self, phone: str = None, password: str = None,
                                    phones: list = None, stake: float = 10,
@@ -3457,8 +4211,16 @@ return { real: real, h: h };
                                     market_whitelist="*",
                                     grok_api_key: str = None, grok_model: str = "grok-3",
                                     grok_interval: float = 90.0,
-                                    agent_cfg: dict = None,
-                                    cal_interval_hours: float = 4.0) -> dict:
+agent_cfg: dict = None,
+                                     jev_api_key: str = None,
+                                     jev_weight: float = 0.35,
+                                     cashout_enabled: bool = True,
+                                     cashout_threshold: float = 0.75,
+                                     cal_interval_hours: float = 4.0,
+                                     roll_over: bool = False,
+                                     conf_floor: float = None,
+                                     min_legs: int = 2,
+                                     max_legs: int = 4) -> dict:
         """24/7 auto-bet engine: places smart bets AND monitors winnings.
 
         Users ONE long-lived browser session (stable for 24/7 running; the driver is
@@ -3468,6 +4230,8 @@ return { real: real, h: h };
         ledger entries — emitting 🏆 WON / ❌ LOST events and keeping the winnings
         panel honest across restarts (persistent ledger).
         """
+        self.auto_cashout_enabled = bool(cashout_enabled)
+        self.cashout_threshold = max(0.1, min(1.0, float(cashout_threshold or 0.75)))
         # ── Account rotation ───────────────────────────────────────────────
         # When several phone numbers are listed ("20 bets/day per account"),
         # the engine ROTATES through them: each round uses the next account that
@@ -3480,6 +4244,14 @@ return { real: real, h: h };
         acc_list = [str(p).strip() for p in acc_list]
         acc_idx = 0
         active_phone = acc_list[acc_idx] if acc_list else ""
+        # ── Roll-over mode (owner rule): KES 50, exactly 3 clean/sure legs,
+        #    twice per day per account. Only high-confidence (>=0.80) legs allowed.
+        if roll_over:
+            stake = 50
+            daily_bets = 2
+            min_legs = 3
+            max_legs = 3
+            conf_floor = 0.80
         # force a real re-login the first time the active account changes
         session_phone = None
         # ── Persistent rotation state (survives restarts) ──────────────────
@@ -3550,6 +4322,10 @@ return { real: real, h: h };
                           f"{'OFF' if not stake_percent else f'{stake_percent:g}%'}; "
                           f"DAILY LONG-SHOT {'ON (one '+str(int(longshot_legs))+'+-leg ' + f'x{longshot_odds_min:g}-x{longshot_odds_max:g} slip/day)' if longshot else 'OFF'}; "
                           f"AUTO-WITHDRAW {f'ON (KES {withdraw_amount:g}/day)' if auto_withdraw else 'OFF'}")
+        if roll_over:
+            self._emit_direct(gui_callback,
+                              f"🎰 ROLL-OVER MODE ON: KES 50, exactly 3 sure legs "
+                              f"(conf ≥ 0.80), combined x2.5-x3.5, 2 slips/day per account.")
         pool = self._pool()
         self._emit_direct(gui_callback,
                           f"💰 SAVINGS MODE: KES {pool:,.2f} reserved {('('+str(int((self._stats.get('pool_share') or self.DEFAULT_POOL_SHARE)*100))+'% of each win banked)') if pool else '(0 — will bank from first win)'}. "
@@ -3576,11 +4352,17 @@ return { real: real, h: h };
         if _ai_keys:
             try:
                 from sportsape_grok import RotatingGovernor as _RG
-                self._grok = _RG(_ai_keys, timeout=45)
-                key_desc = " + ".join(
-                    ("Grok" if k.startswith("gsk_") or not k.startswith("AQ.")
-                     else "Gemini")
-                    for k in _ai_keys[:3])
+                self._grok = _RG(_ai_keys, timeout=45,
+                                 max_calls_per_hour=int(acfg.get("ai_calls_per_hour") or 0))
+                def _describe(k):
+                    if k.startswith("gsk_"):
+                        return "Grok"
+                    if k.startswith("sk-proj-"):
+                        return "OpenAI"
+                    if k.startswith("AQ."):
+                        return "Gemini"
+                    return "Grok"
+                key_desc = " + ".join(_describe(k) for k in _ai_keys[:3])
                 self._emit_direct(gui_callback,
                                   f"🤖 AI governor ONLINE ({key_desc}, "
                                   f"{len(_ai_keys)} key(s) in rotation)")
@@ -3592,6 +4374,32 @@ return { real: real, h: h };
             self._grok_full_disable = True
             self._emit_direct(gui_callback,
                               "ℹ️ No AI key supplied — engine self-governs on calibrated defaults")
+        # ── JEV: fast independent leg-probability validator ────────────────
+        # JEV (https://jevapi.org/) is a typed-decision model answering in
+        # 70-500ms.  When a key is present we ask it for a second opinion on the
+        # candidate legs each round and blend its probability into the slip
+        # ranking.  Strictly fail-open — no key, timeout, or API error falls
+        # back to the engine's own DU/PTN probabilities.
+        self._jev = None
+        _jev_key = str(acfg.get("jev_api_key") or jev_api_key or "").strip()
+        if _jev_key:
+            try:
+                from sportsape_jev import JevLegValidator, DEFAULT_BLEND
+                if jev_weight is None:
+                    jev_weight = float(acfg.get("jev_weight") or DEFAULT_BLEND)
+                self._jev = JevLegValidator(api_key=_jev_key, weight=jev_weight)
+                self._emit_direct(gui_callback,
+                                  f"🧠 JEV leg validator ONLINE (blend "
+                                  f"{jev_weight:.0%} second-opinion)")
+            except Exception as _je:
+                self._jev = None
+                self._emit_direct(gui_callback,
+                                  f"⚠️ JEV disabled after start error: {str(_je)[:80]}")
+        elif acfg.get("jev_api_key") or jev_api_key:
+            self._emit_direct(gui_callback, "⚠️ JEV start failure — key ignored")
+        else:
+            self._emit_direct(gui_callback,
+                              "ℹ️ No JEV key — leg probs from DU/PTN model only")
         self._engine_state.update({
             "started_at": time.time(),
             "phones":     acc_list,
@@ -3717,6 +4525,7 @@ return { real: real, h: h };
             "stake": float(stake),
             "visible": bool(visible),
             "headless": bool(headless),
+            "roll_over": bool(roll_over),
             "cadence": cadence,
             "retry": retry,
             "monitor": monitor,
@@ -3737,6 +4546,13 @@ return { real: real, h: h };
             "recheck_wait": recheck_wait,
             "multi": len(acc_list) > 1,
         }
+        if roll_over:
+            # ROLL-OVER owns the day: disable the OTHER owner-rule bets — the
+            # KES-10 "sure-single" and the x15-x60 long-shot — so they can never
+            # consume the two daily roll-over slots with slips that are NOT
+            # "KES 50 @ ~x3.00 / exactly 3 legs".
+            cfg["sure_single"] = False
+            cfg["longshot"] = False
         # ── shared["bets_placed"] starts from the actual today-count in the
         # ledger, not 0, so restarting doesn't lose track of the daily cap.
         _today_str = datetime.now().strftime("%Y-%m-%d")
@@ -3794,14 +4610,40 @@ return { real: real, h: h };
 
         self._worker_cap_reached = cap_reached
         self._prev_stop_event = stop_event
+        # ── Warm browsers BEFORE workers start (cold-start was causing
+        # 45s renderer timeouts on first round). Each account gets its
+        # own pre-heated session so the first crawl is instant.
+        try:
+            self._emit_direct(gui_callback,
+                              f"🔥 Warming {len(acc_list)} browser(s) before first bet — "
+                              "please wait ~10s...")
+            for _wp in acc_list:
+                if not self._account_driver(_wp):
+                    try:
+                        _drv = self._build_driver(gui_callback=gui_callback,
+                                                  force_visible=cfg["visible"], mobile=False,
+                                                  headless=cfg["headless"],
+                                                  capture_perf=False, minimize=True)
+                        self._set_account_driver(_wp, _drv)
+                        self._emit_direct(gui_callback, f"   ✅ {_wp} browser ready")
+                    except Exception as _we:
+                        self._emit_direct(gui_callback, f"   ⚠️ warmup {_wp} failed: {str(_we)[:80]}")
+            self._emit_direct(gui_callback, "🔥 All browsers warmed — starting workers...")
+        except Exception:
+            pass
         self._worker_threads = []
+        self._phone_workers = {}
+        self._acc_list_last = [str(p) for p in acc_list]
         for _p in acc_list:
+            _pstop = threading.Event()
             _t = threading.Thread(
                 target=self._run_account_worker,
-                args=(_p, password, cfg, shared, cap_reached, gui_callback, stop_event),
+                args=(_p, password, cfg, shared, cap_reached,
+                      gui_callback, stop_event, _pstop),
                 daemon=True, name=f"acc-worker-{_p}")
             _t.start()
             self._worker_threads.append(_t)
+            self._phone_workers[str(_p)] = {"thread": _t, "stop": _pstop}
         self._emit_direct(
             gui_callback,
             f"🚀 {len(acc_list)} dedicated per-account worker(s) started "
@@ -3813,9 +4655,20 @@ return { real: real, h: h };
                     break
                 if cap_reached.is_set():
                     break
+                try:
+                    self._reconcile_account_workers(
+                        password, cfg, shared, cap_reached,
+                        gui_callback=gui_callback, stop_event=stop_event)
+                except Exception as _re:
+                    self._emit_direct(gui_callback,
+                                      f"⚠️ worker reconcile error: {str(_re)[:80]}")
                 time.sleep(2.0)
         finally:
             cap_reached.set()
+            try:
+                self._phone_workers = {}
+            except Exception:
+                pass
             for _t in self._worker_threads:
                 try:
                     _t.join(timeout=10)
@@ -3842,8 +4695,59 @@ return { real: real, h: h };
         return {"status": "stopped", "message": "Scheduler stopped",
                 "bets_placed": shared["bets_placed"], "summary": summary}
 
+    def _reconcile_account_workers(self, password, cfg, shared, cap_reached,
+                                   gui_callback=None, stop_event=None):
+        """Diff the engine_state phone list (owned live by the GUI phone box)
+        against the running per-account workers. Numbers newly typed into the
+        box get a dedicated worker; numbers deleted get their worker wound down.
+        Called every ~2s from the scheduler's supervise loop while betting."""
+        wanted = [str(p) for p in (self._engine_state.get("phones") or []) if str(p).strip()]
+        if not wanted:
+            wanted = [str(p) for p in (getattr(self, "_acc_list_last", None) or []) if str(p).strip()]
+        if not wanted:
+            return
+        workers = dict(getattr(self, "_phone_workers", None) or {})
+        changed = False
+        for ph in list(workers.keys()):
+            if ph in wanted:
+                continue
+            changed = True
+            entry = workers[ph]
+            try:
+                entry["stop"].set()
+            except Exception:
+                pass
+            t = entry.get("thread")
+            if t is not None:
+                try:
+                    t.join(timeout=12)
+                except Exception:
+                    pass
+            self._emit_direct(gui_callback,
+                              f"🛑 {ph} removed from phone list — worker winding down.")
+            workers.pop(ph, None)
+        for ph in wanted:
+            if ph in workers:
+                continue
+            if self._bet_schedule_stopped(stop_event) or cap_reached.is_set():
+                break
+            changed = True
+            pstop = threading.Event()
+            t = threading.Thread(
+                target=self._run_account_worker,
+                args=(ph, password, cfg, shared, cap_reached,
+                      gui_callback, stop_event, pstop),
+                daemon=True, name=f"acc-worker-{ph}")
+            t.start()
+            workers[ph] = {"thread": t, "stop": pstop}
+            self._worker_threads.append(t)
+            self._emit_direct(gui_callback,
+                              f"🆕 {ph} added to phone list — dedicated worker started.")
+        if changed:
+            self._phone_workers = workers
+
     def _run_account_worker(self, phone, password, cfg, shared, cap_reached,
-                            gui_callback=None, stop_event=None):
+                            gui_callback=None, stop_event=None, phone_stop_event=None):
         """Dedicated betting loop for ONE account: owns its own browser session
         (registered in self._worker_drivers[phone]) and runs every task for that
         phone — balance-aware betting, win-sync, WIN-FUNDED wait, auto-withdraw —
@@ -3890,13 +4794,21 @@ return { real: real, h: h };
         waiting_since = None
         login_fail_count = 0
         dead_until = 0.0
+        no_funds_confirmed_count = 0
         last_placed_ts = 0.0
         next_cooldown_msg = 0.0
         next_cap_msg = 0.0
         day_cap, night_cap = self._period_caps(daily_bets)  # initialise before loop
 
         def _stop():
-            return (self._bet_schedule_stopped(stop_event) or cap_reached.is_set())
+            if self._bet_schedule_stopped(stop_event) or cap_reached.is_set():
+                return True
+            try:
+                if phone_stop_event is not None and phone_stop_event.is_set():
+                    return True
+            except Exception:
+                pass
+            return False
 
         while True:
             if _stop():
@@ -3939,9 +4851,26 @@ return { real: real, h: h };
             budget_txt = None
             if daily_bets:
                 remaining, _p, _cap, _placed_now = self._period_remaining_for(
-                    active_phone, daily_bets, today, include_orphans=inc_orph)
-                if remaining <= 0 and waiting_since is None:
-                    budget_txt = f"{_placed_now}/{_cap}"
+                    active_phone,                 daily_bets, today, include_orphans=inc_orph)
+                if cfg.get("roll_over"):
+                    # ROLL-OVER (owner rule): exactly 2 slips/day per account —
+                    # KES 50 @ ~x3.00, exactly 3 legs, split 1 daytime + 1 after
+                    # 18:00. When both slots are used the account turns
+                    # monitor-only (win-sync + jackpot research) and the machine
+                    # bets again at the next window / next day.
+                    if remaining <= 0:
+                        budget_txt = (f"{_p} roll-over slot used "
+                                      f"({_placed_now}/2 today)")
+                else:
+                    # Owner rule (2026-09-18, ENFORCED IN CODE): in normal mode a
+                    # fixed daily slip-count NEVER parks a healthy account —
+                    # budget_txt stays None. The daily budget remains a hard
+                    # SAFETY floor only (never stake more than balance allows),
+                    # never a fixed game-count ceiling; parking is reserved ONLY
+                    # for genuinely exhausted banks (no playable games / no
+                    # balance), driven by the playable-board + balance checks
+                    # below — never by a fixed slip-count.
+                    budget_txt = None
             if budget_txt is not None:
                 # Account hit its period cap → monitor winnings AND research jackpots.
                 if time.time() >= next_cap_msg:
@@ -4033,7 +4962,49 @@ return { real: real, h: h };
                         time.sleep(min(10.0, retry - waited))
                         waited += 10.0
                     continue
-# ── Dedicated browser: build / heal / forced rebuild. ──
+                # ── Parked (no funds → rest hour; login failures) → follow winnings
+                # ONLY while parked: settle the ledger, surface WON/LOST events, and
+                # keep the balance cache warm — but place NO bets until the rest ends.
+                if dead_until and time.time() < dead_until:
+                    _park_rem = int((dead_until - time.time()) / 60.0)
+                    self._emit_direct(gui_callback,
+                                      f"💤 {active_phone} RESTING (no funds / login down) — "
+                                      f"{_park_rem} more min of rest, win-sync only (no bets). "
+                                      "Other accounts continue with available funds.")
+                    self._engine_busy = False
+                    waited = 0.0
+                    _park = max(retry, dead_until - time.time())
+                    while waited < _park and not _stop():
+                        # ── REST ≠ idle: follow winnings on the rest account ──
+                        # settle any active bets and keep the cached balance fresh so
+                        # the next fund check resumes the moment a win lands.
+                        try:
+                            if driver is not None and self._driver_is_usable(driver) \
+                                    and (waited >= 30.0) and ((waited % 150.0) < 15.0):
+                                try:
+                                    self._monitor_and_sync_winnings(
+                                        driver, gui_callback=gui_callback)
+                                except Exception:
+                                    pass
+                            elif driver is not None and self._driver_is_usable(driver) \
+                                    and (waited % 150.0) < 8.0:
+                                self._emit_direct(gui_callback,
+                                                  f"🔭 ({active_phone}) rest-room research: "
+                                                  "scanning live games, scores + odds drift "
+                                                  "to pre-stage the comeback slips...")
+                                try:
+                                    self._research_between_bets(
+                                        driver, gui_callback=gui_callback,
+                                        timeout=float(self._gov("research_seconds",
+                                                                cfg.get("research_seconds", 45.0))))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        time.sleep(min(10.0, _park - waited))
+                        waited += 10.0
+                    continue
+                # ── Dedicated browser: build / heal / forced rebuild. ──
                 # A deposit (or withdraw) may have registered a fresh session for
                 # this account since our last round — adopt it instead of keeping
                 # two browsers alive on the same account (that re-creates the old
@@ -4133,20 +5104,12 @@ return { real: real, h: h };
                     except Exception as e:
                         self._emit_direct(gui_callback,
                                           f"⚠️ Win-sync catch-up hiccup: {str(e)[:90]}")
-                if dead_until and time.time() < dead_until:
-                    self._engine_busy = False
-                    waited = 0.0
-                    _park = max(retry, dead_until - time.time())
-                    while waited < _park and not _stop():
-                        time.sleep(min(10.0, _park - waited))
-                        waited += 10.0
-                    continue
                 self._emit_direct(gui_callback,
                                   f"⏱️ Crawl-and-bet attempt #{attempt} ({active_phone}) ...")
                 # Governor overrides (whitelisted + clamped upstream) applied per round.
                 _gov_stake_percent = self._gov('stake_percent', stake_percent)
                 _gov_stake_cap = self._gov('stake_cap', stake_cap)
-                _gov_mll = self._gov('min_lead_minutes', 15.0)
+                _gov_mll = self._gov('min_lead_minutes', 5.0)
                 _gov_oc = self._gov('odds_cap', 6.0)
                 _gov_pref_legs = bool(self._gov('prefer_more_legs', 0))
                 # Daily LONG-SHOT: TWO x15-x60 accumulators per day —
@@ -4155,7 +5118,70 @@ return { real: real, h: h };
                 # BUDGET GUARD: if remaining balance can cover ≤ 2 more bets, fire
                 # any pending longshot immediately rather than waiting for later.
                 want_longshot = False
-                if longshot:
+                # DAILY SURE-SINGLE (owner rule — "one odd for sure roll over daily on
+                # ALL accounts so we never go broke"): fires FIRST each day, at x1.50-
+                # x2.50 on 2-3 sure-researched 1X2 legs, board-wide so every account
+                # always gets a qualifying game. Day-gated once per account.
+                want_sure = False
+                if bool((cfg or {}).get("sure_single", True)):
+                    with self._sched_lock:
+                        st = self._load_sched_state()
+                        if st.get("date") != today:
+                            st.update({"date": today, "bets_placed_today": 0,
+                                       "longshot_placed_day": "",
+                                       "longshot2_placed_day": "", "sure_placed_day": ""})
+                        _sure_day = st.get("sure_placed_day") or ""
+                        _sure_pend = float(st.get("sure_pending_ts") or 0)
+                    if _sure_day != today and (time.time() - _sure_pend) > 900:
+                        with self._sched_lock:
+                            st = self._load_sched_state()
+                            st["sure_pending_ts"] = time.time()
+                            self._save_sched_state(st)
+                        want_sure = True
+                if want_sure:
+                    _sure_stake = 10.0
+                    try:
+                        _cached_bal = 999.0
+                        _bc = self._cached_balance_for(active_phone, allow_stale=True)
+                        if _bc and _bc.get("confirmed"):
+                            _cached_bal = float(_bc.get("balance") or 999)
+                    except Exception:
+                        pass
+                    self._emit_direct(gui_callback,
+                                      f"🎯 {active_phone} DAILY SURE-SINGLE: 2-3 x1.50-x2.50 "
+                                      f"researched legs (stake {_sure_stake:.0f}) — earliest "
+                                      f"rollover so we never go broke")
+                    res = self._place_one_bet(
+                        driver, active_phone, password,
+                        stake=_sure_stake,
+                        cfg=cfg,
+                        board_wide=True,
+                        researched_only=True,
+                        target_odds_min=1.5,
+                        target_odds_max=2.5,
+                        max_legs=3,
+                        prefer_more_legs=False,
+                        stake_percent=self._gov('stake_percent', 5.0),
+                        stake_cap=self._gov('stake_cap', 20.0),
+                        reserve_pool=0,
+                        jitter_seed=(int((re.sub(r"\D", "", str(active_phone or "")) or "0")[-6:])
+                                     + int(datetime.now().strftime("%Y%m%d%H"))),
+                        no_odds_cap=True,
+                        conf_floor=0,
+                        gui_callback=gui_callback,
+                        odds_cap=self._gov('odds_cap', 5.0),
+                        min_lead_minutes=5.0)
+                    with self._sched_lock:
+                        st = self._load_sched_state()
+                        st["sure_placed_day"] = today
+                        st["sure_pending_ts"] = 0
+                        self._save_sched_state(st)
+                    if res and res.get("ok"):
+                        self._emit_direct(gui_callback,
+                                          f"✅ {active_phone} SURE-SINGLE placed "
+                                          f"({res.get('odd', '')}) — bankroll rolls over.")
+                        continue
+                if False and longshot:
                     with self._sched_lock:
                         st = self._load_sched_state()
                         if st.get("date") != today:
@@ -4197,6 +5223,75 @@ return { real: real, h: h };
                                 st["longshot_which"] = 2
                                 self._save_sched_state(st)
                                 want_longshot = True
+                # ── FISHNET LOTTERY (owner rule) ───────────────────────────
+                # Once or twice a day per account: bundle every game the machine
+                # already bet today (across ALL accounts) into one long multi-leg
+                # lottery slip. Fires only after the pool has enough games, so it
+                # never runs before the normal slips have built a meaningful fishnet.
+                want_fishnet = False
+                with self._sched_lock:
+                    st = self._load_sched_state()
+                    if st.get("date") != today:
+                        st.update({"date": today, "bets_placed_today": 0,
+                                   "fishnet_placed_day": "", "fishnet2_placed_day": ""})
+                    _fn_day  = st.get("fishnet_placed_day") or ""
+                    _fn2_day = st.get("fishnet2_placed_day") or ""
+                    _fn_pend = float(st.get("fishnet_pending_ts") or 0)
+                    _fn2_pend = float(st.get("fishnet2_pending_ts") or 0)
+                    hour_now = datetime.now().hour
+                    _pool = self._fishnet_pool_today()
+                    _pool_ready = len(_pool) >= 4
+                    if False and (_fn_day != today and _pool_ready and (time.time() - _fn_pend) > 1800):
+                        st["fishnet_pending_ts"] = time.time()
+                        st["fishnet_which"] = 1
+                        self._save_sched_state(st)
+                        want_fishnet = True
+                    elif False and (_fn2_day != today and _pool_ready and (time.time() - _fn2_pend) > 1800 \
+                            and hour_now >= 18):
+                        st["fishnet2_pending_ts"] = time.time()
+                        st["fishnet_which"] = 2
+                        self._save_sched_state(st)
+                        want_fishnet = True
+                if want_fishnet:
+                    with self._sched_lock:
+                        st = self._load_sched_state()
+                        _which_label = "2nd" if int(st.get("fishnet_which") or 1) == 2 else "1st"
+                    self._emit_direct(gui_callback,
+                                      f"🐟 {active_phone} FISHNET LOTTERY ({_which_label}): "
+                                      f"bundling today's pooled games into one long slip")
+                    _fn_res = self._place_fishnet_bet(
+                        driver, active_phone, password, stake=stake,
+                        gui_callback=gui_callback, max_legs=14)
+                    if isinstance(_fn_res, dict) and _fn_res.get("status") == "success":
+                        with self._sched_lock:
+                            st = self._load_sched_state()
+                            _which = int(st.get("fishnet_which") or 1)
+                            if _which == 2:
+                                st["fishnet2_placed_day"] = today
+                                st.pop("fishnet2_pending_ts", None)
+                            else:
+                                st["fishnet_placed_day"] = today
+                                st.pop("fishnet_pending_ts", None)
+                            st.pop("fishnet_which", None)
+                            self._save_sched_state(st)
+                        self._record_bet_from_result(_fn_res, phone=active_phone)
+                        with self._bets_lock:
+                            shared["bets_placed"] += 1
+                        self._emit_direct(gui_callback,
+                                          f"🐟 {active_phone} FISHNET placed "
+                                          f"({_fn_res.get('legs')} legs @x{_fn_res.get('odds')})")
+                        continue
+                    else:
+                        # Fishnet failed this round — clear the pending marker so a
+                        # later round retries instead of losing the daily slot.
+                        with self._sched_lock:
+                            st = self._load_sched_state()
+                            st["fishnet_pending_ts"] = 0
+                            st.pop("fishnet_which", None)
+                            self._save_sched_state(st)
+                        self._emit_direct(gui_callback,
+                                          f"🐟 Fishnet skipped this round: "
+                                          f"{(isinstance(_fn_res, dict) and _fn_res.get('message')) or 'not enough live pooled games'}")
                 # Per-account deterministic tie-break seed (never stack identical slips).
                 jitter_seed = (int((re.sub(r"\D", "", str(active_phone or "")) or "0")[-6:])
                                + int(datetime.now().strftime("%Y%m%d%H")))
@@ -4214,32 +5309,55 @@ return { real: real, h: h };
                                               gui_callback=gui_callback,
                                               target_odds_min=longshot_odds_min,
                                               target_odds_max=longshot_odds_max,
-                                              odds_cap=longshot_odds_cap_v or 2.5,
+                                              odds_cap=longshot_odds_cap or 8.0,
                                               max_legs=int(longshot_legs),
                                               stake_percent=_gov_stake_percent,
                                               stake_cap=_gov_stake_cap,
                                               min_lead_minutes=_gov_mll,
                                               prefer_more_legs=True,
+                                              board_wide=True,
                                               reserve_pool=0,
                                               jitter_seed=jitter_seed,
                                               no_odds_cap=(longshot_odds_cap_v <= 0),
                                               conf_floor=0.0,
                                               researched_only=bool(longshot_odds_cap_v <= 0))
                 else:
-                    lo, hi = self._bandit_target_range(
-                        self._gov('target_odds_min', 5.0),
-                        self._gov('target_odds_max', 15.0))
-                    res = self._place_one_bet(driver, active_phone, password, stake=stake,
-                                              visible=cfg["visible"],
-                                              gui_callback=gui_callback,
-                                              target_odds_min=lo, target_odds_max=hi,
-                                              odds_cap=_gov_oc,
-                                              stake_percent=_gov_stake_percent,
-                                              stake_cap=_gov_stake_cap,
-                                              min_lead_minutes=_gov_mll,
-                                              prefer_more_legs=_gov_pref_legs,
-                                              reserve_pool=0,
-                                              jitter_seed=jitter_seed)
+                    if cfg.get("roll_over"):
+                        # ROLL-OVER (owner rule): KES 50, exactly 3 legs, combined
+                        # odds ~x3.00 (2.5-3.5), ONLY high-confidence legs — this
+                        # is the dedicated roll-over slip, not the flat x5-6 plan.
+                        self._emit_direct(gui_callback,
+                            f"🎰 {active_phone}: ROLL-OVER slip — KES 50, "
+                            f"3 legs, x2.5-x3.5, conf ≥ 0.80")
+                        res = self._place_one_bet(
+                            driver, active_phone, password, stake=stake,
+                            visible=cfg["visible"],
+                            gui_callback=gui_callback,
+                            target_odds_min=2.5, target_odds_max=3.5,
+                            odds_cap=_gov_oc,
+                            max_legs=3, min_legs=3, conf_floor=0.80,
+                            stake_percent=_gov_stake_percent,
+                            stake_cap=_gov_stake_cap,
+                            min_lead_minutes=_gov_mll,
+                            prefer_more_legs=False,
+                            reserve_pool=0,
+                            jitter_seed=jitter_seed)
+                    else:
+                        lo, hi = self._bandit_target_range(
+                            self._gov('target_odds_min', 5.0),
+                            self._gov('target_odds_max', 6.0))
+                        res = self._place_one_bet(driver, active_phone, password, stake=stake,
+                                                  visible=cfg["visible"],
+                                                  gui_callback=gui_callback,
+                                                  target_odds_min=lo, target_odds_max=hi,
+                                                  odds_cap=_gov_oc,
+                                                  max_legs=4,
+                                                  stake_percent=_gov_stake_percent,
+                                                  stake_cap=_gov_stake_cap,
+                                                  min_lead_minutes=_gov_mll,
+                                                  prefer_more_legs=False,
+                                                  reserve_pool=0,
+                                                  jitter_seed=jitter_seed)
                 # A long-shot that didn't qualify on this account → try the other
                 # accounts before falling back to a normal bet.  This handles the
                 # common case where a game is suspended mid-placement on one account
@@ -4255,7 +5373,7 @@ return { real: real, h: h };
                     # Try other accounts for the longshot if this one failed
                     _alt_tried = False
                     if _ls_suspended or (isinstance(res, dict) and res.get("status") != "success"):
-                        _all_phones = list(acc_list or [])
+                        _all_phones = list((shared or {}).get("phones") or [])
                         _alt_phones = [p for p in _all_phones if p != active_phone]
                         for _alt_ph in _alt_phones[:2]:
                             try:
@@ -4271,6 +5389,7 @@ return { real: real, h: h };
                                 _alt_res = self._place_one_bet(
                                     _alt_driver, _alt_ph, password, stake=stake,
                                     visible=cfg["visible"], gui_callback=gui_callback,
+                                    board_wide=True,
                                     target_odds_min=longshot_odds_min,
                                     target_odds_max=longshot_odds_max,
                                     odds_cap=longshot_odds_cap_v2 or 2.5,
@@ -4309,16 +5428,19 @@ return { real: real, h: h };
                     if not _alt_tried and not (isinstance(res, dict) and res.get("status") == "success"):
                         lo, hi = self._bandit_target_range(
                             self._gov('target_odds_min', 5.0),
-                            self._gov('target_odds_max', 15.0))
+                            self._gov('target_odds_max', 6.0))
                         res = self._place_one_bet(driver, active_phone, password, stake=stake,
                                                   visible=cfg["visible"],
                                                   gui_callback=gui_callback,
                                                   target_odds_min=lo, target_odds_max=hi,
                                                   odds_cap=_gov_oc,
+                                                  max_legs=max_legs,
+                                                  min_legs=min_legs,
+                                                  conf_floor=conf_floor,
                                                   stake_percent=_gov_stake_percent,
                                                   stake_cap=_gov_stake_cap,
                                                   min_lead_minutes=_gov_mll,
-                                                  prefer_more_legs=_gov_pref_legs,
+                                                  prefer_more_legs=False,
                                                   reserve_pool=0,
                                                   jitter_seed=jitter_seed)
                         want_longshot_eff = False
@@ -4361,6 +5483,7 @@ return { real: real, h: h };
                 if status == "success":
                     login_fail_count = 0
                     dead_until = 0.0
+                    no_funds_confirmed_count = 0
                     if self._agent_hub is not None:
                         try:
                             self._agent_hub.supervisor.beat_unparked(active_phone)
@@ -4390,6 +5513,10 @@ return { real: real, h: h };
                         st["bets_placed_today"] = int(st.get("bets_placed_today", 0)) + 1
                         if st.get("date") != today:
                             st["date"] = today
+                        # Rich per-number counters (used by the daily cap board).
+                        _per_num = st.setdefault("bets_by_number", {})
+                        _per_num[str(active_phone)] = int(_per_num.get(str(active_phone), 0)) + 1
+                        st["acc_idx"] = 0  # this worker owns exactly one account
                         self._save_sched_state(st)
                     with self._bets_lock:
                         shared["bets_placed"] += 1
@@ -4442,246 +5569,208 @@ return { real: real, h: h };
                 elif res.get("deposit_needed") if isinstance(res, dict) else None:
                     need = res.get("deposit_needed", 0.0)
                     bal = res.get("balance", 0.0)
-                    # No hard maximum wait — keep going indefinitely, doing picks
-                    # and learning, until real funds land.
-                    win_wait_max = 86400.0  # effectively unlimited — break on funds
-                    waiting_since = time.time()
-                    self._emit_direct(gui_callback,
-                                      f"⏳ {active_phone}: KES {bal:,.2f} available, "
-                                      f"need KES {stake:,.0f} — doing shadow picks and "
-                                      "learning while waiting for funds.")
+                    bal_confirmed_in_round = bool(res.get("balance") and float(res.get("balance") or 0) > 0)
                     self._engine_state["win_funded_wait"] = True
-                    self._engine_busy = False
-                    plan_next = time.time()  # start plan-ahead immediately
-                    wait_deadline = time.time() + win_wait_max
-                    funds_landed = False
-                    while not _stop():
-                        if driver is None or not self._driver_is_usable(driver):
-                            self._emit_direct(gui_callback,
-                                              f"🔧 ({active_phone}) rebuilding browser for "
-                                              "fund-wait mode...")
-                            self._engine_state["driver_heals"] = int(self._engine_state.get("driver_heals", 0)) + 1
-                            if self._agent_hub is not None:
-                                try:
-                                    self._agent_hub.supervisor.beat_driver_heal()
-                                except Exception:
-                                    pass
-                            self._quit_bet_driver(driver)
-                            driver = self._set_account_driver(
-                                active_phone,
-                                self._build_driver(gui_callback=gui_callback,
-                                                   force_visible=cfg["visible"], mobile=False,
-                                                   headless=cfg["headless"],
-                                                   capture_perf=False, minimize=True))
-                        # Trigger immediate win-sync when a win just landed or
-                        # a manual balance check completed — don't wait for the
-                        # normal monitor interval.
-                        _win_signal = self._engine_state.pop("_win_just_landed", False)
-                        _bal_signal = self._engine_state.get("_balance_refreshed", False)
-                        if _win_signal or _bal_signal or (time.time() - last_sync) >= monitor:
+                    waiting_since = waiting_since or time.time()
+                    _inner_done = False
+                    _shadow_promoted_ok = False
+                    while not _inner_done and not _stop():
+                        _balance_read_attempted = False
+                        _balance_was_confirmed = False
+                        _b2 = 0.0
+                        if driver is not None and self._driver_is_usable(driver):
                             try:
-                                if _win_signal:
-                                    self._emit_direct(gui_callback,
-                                                      f"🏆 Win detected — syncing immediately!")
-                                self._monitor_and_sync_winnings(driver,
-                                                                gui_callback=gui_callback)
-                                last_sync = time.time()
-                            except Exception as e:
-                                self._emit_direct(gui_callback,
-                                                  f"⚠️ Win-sync hiccup: {str(e)[:100]}")
-                        b2 = 0.0
-                        b2_confirmed = False
-                        try:
-                            b2, b2_confirmed = self._read_balance_confirmed(driver, wait=8.0)
-                        except Exception:
-                            b2, b2_confirmed = 0.0, False
-                        if b2_confirmed:
-                            self._balance_cache = getattr(self, "_balance_cache", None) \
-                                or self._load_balance_cache()
-                            self._balance_cache[str(active_phone)] = {
-                                "balance": b2, "confirmed": True, "ts": time.time()}
-                            self._save_balance_cache()
-                        if not b2_confirmed:
-                            # Try harder: use _read_balance_patient on the existing
-                            # driver (avoids opening a second browser just for balance)
+                                driver.switch_to.window(driver.window_handles[0])
+                                self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                                time.sleep(0.8)
+                            except Exception:
+                                pass
                             try:
-                                b2 = self._read_balance_patient(driver, wait=6.0)
-                                if b2 and b2 > 0:
-                                    b2_confirmed = True
+                                _b2, _b2c = self._read_balance_confirmed(driver, wait=8.0)
+                                _balance_read_attempted = True
+                                if _b2c:
+                                    _balance_was_confirmed = True
                                     self._balance_cache = getattr(self, "_balance_cache", None) \
                                         or self._load_balance_cache()
                                     self._balance_cache[str(active_phone)] = {
-                                        "balance": b2, "confirmed": True, "ts": time.time()}
+                                        "balance": _b2, "confirmed": True, "ts": time.time()}
                                     self._save_balance_cache()
+                                else:
+                                    try:
+                                        _b2p = self._read_balance_patient(driver, wait=5.0)
+                                        if _b2p and _b2p > 0:
+                                            _b2 = _b2p
+                                            _balance_was_confirmed = True
+                                            self._balance_cache = getattr(self, "_balance_cache", None) \
+                                                or self._load_balance_cache()
+                                            self._balance_cache[str(active_phone)] = {
+                                                "balance": _b2, "confirmed": True, "ts": time.time()}
+                                            self._save_balance_cache()
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
-                        if not b2_confirmed:
-                            # Fall back: estimated balance from launch sweep minus stakes
-                            est, src = self._est_balance_for(active_phone)
-                            if src != "none":
-                                b2 = est
-                                if b2 >= stake:
-                                    b2_confirmed = True
-                        if not b2_confirmed:
-                            # Last resort: stale cache value
-                            ent = self._cached_balance_for(active_phone, allow_stale=True)
-                            if ent and ent.get("confirmed"):
-                                b2 = max(0.0, float(ent.get("balance") or 0))
-                                if b2 >= stake:
-                                    b2_confirmed = True
-                        if not b2_confirmed:
-                            # Genuinely unknown — do plan-ahead and wait.
-                            # But first check if a manual balance check just ran
-                            # and pushed a fresh value into the cache.
+                        if not _balance_was_confirmed:
                             if self._engine_state.pop("_balance_refreshed", False):
-                                ent = self._cached_balance_for(active_phone, allow_stale=True)
-                                if ent and ent.get("confirmed"):
-                                    b2 = max(0.0, float(ent.get("balance") or 0))
-                                    if b2 >= stake:
-                                        b2_confirmed = True
+                                _ent = self._cached_balance_for(active_phone, allow_stale=True)
+                                if _ent and _ent.get("confirmed"):
+                                    _b2 = max(0.0, float(_ent.get("balance") or 0))
+                                    if _b2 >= stake:
+                                        _balance_was_confirmed = True
                                         self._emit_direct(gui_callback,
                                                           f"⚡ {active_phone}: manual balance check "
-                                                          f"confirmed KES {b2:,.2f} — resuming betting!")
-                            if not b2_confirmed:
-                                self._emit_direct(gui_callback,
-                                                  f"⏳ {active_phone}: balance temporarily "
-                                                  "unreadable — doing shadow picks while waiting.")
-                                if time.time() >= plan_next:
-                                    plan_next = time.time() + 120
+                                                          f"confirmed KES {_b2:,.2f} — resuming!")
+                        if not _balance_was_confirmed:
+                            _est, _src = self._est_balance_for(active_phone)
+                            if _src != "none" and _est >= stake:
+                                _b2 = _est
+                        pool_r = self._pool()
+                        eff_stake = stake
+                        funds_sufficient_now = (
+                            (float(_b2) - pool_r) >= eff_stake
+                            or (not _balance_was_confirmed and not bal_confirmed_in_round))
+                        if funds_sufficient_now and float(_b2) >= eff_stake:
+                            no_funds_confirmed_count = 0
+                            waiting_since = None
+                            self._engine_state["win_funded_wait"] = False
+                            self._emit_direct(gui_callback,
+                                              f"💵 KES {_b2:,.2f} in {active_phone} covers "
+                                              f"KES {eff_stake:,.0f} (reserve KES {pool_r:,.2f}) — GO!")
+                            if self._agent_hub is not None:
+                                try:
+                                    self._agent_hub.supervisor.beat_unparked(active_phone)
+                                except Exception:
+                                    pass
+                            if driver is not None and self._driver_is_usable(driver) and float(_b2) >= eff_stake:
+                                _shadow = None
+                                try:
+                                    _shadows = [
+                                        b for b in (getattr(self, "_bets", None) or [])
+                                        if b.get("status") == "shadow" and b.get("shadow_legs")
+                                    ]
+                                    if _shadows:
+                                        _shadows.sort(key=lambda x: x.get("placed_at") or "", reverse=True)
+                                        _shadow = _shadows[0]
+                                except Exception:
+                                    _shadow = None
+                                if _shadow and _shadow.get("shadow_legs"):
+                                    _legs_info = _shadow.get("shadow_legs") or []
+                                    self._emit_direct(gui_callback,
+                                                      f"⚡ Promoting pre-built shadow slip "
+                                                      f"({len(_legs_info)} legs, x{_shadow.get('odds', '?'):.2f})")
+                                    _promoted_legs = []
+                                    for _lg in _legs_info:
+                                        _promoted_legs.append((
+                                            float(_lg.get("odds") or 1.5),
+                                            str(_lg.get("name") or ""),
+                                            str(_lg.get("gid") or ""),
+                                            str(_lg.get("market") or "over"),
+                                            float(_lg.get("prob") or 0.5),
+                                        ))
                                     try:
+                                        self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                                        time.sleep(1.2)
+                                        self._scroll_to_load_more_games(driver, gui_callback=gui_callback)
+                                        _pc = self._click_selected_legs(driver, _promoted_legs, gui_callback=gui_callback)
+                                        if _pc >= 2:
+                                            _pres = self._open_betslip_and_place(
+                                                driver, stake, active_phone, password,
+                                                gui_callback=gui_callback, before_balance=_b2,
+                                                legs=_promoted_legs)
+                                            if isinstance(_pres, bool) and _pres:
+                                                _shadow["status"] = "shadow_promoted"
+                                                _shadow["settled_at"] = datetime.now().isoformat(timespec="seconds")
+                                                self._save_ledger()
+                                                self._record_bet_from_result({
+                                                    "status": "success",
+                                                    "legs": len(_promoted_legs),
+                                                    "stake": stake,
+                                                    "odds": float(_shadow.get("odds") or 1.5),
+                                                    "possible_win": round(stake * float(_shadow.get("odds") or 1.5), 2),
+                                                    "markets": _shadow.get("markets") or [],
+                                                    "probs": _shadow.get("probs") or [],
+                                                    "game_ids": _shadow.get("shadow_game_ids") or [],
+                                                    "placed_at": datetime.now().isoformat(timespec="seconds"),
+                                                }, phone=active_phone)
+                                                self._emit_direct(gui_callback,
+                                                                  f"✅ Shadow promoted and placed on {active_phone}!")
+                                                with self._bets_lock:
+                                                    shared["bets_placed"] += 1
+                                                last_placed_ts = time.time()
+                                                _shadow_promoted_ok = True
+                                    except Exception as _pe:
+                                        self._emit_direct(gui_callback,
+                                                          f"⚠️ Shadow promotion failed ({str(_pe)[:80]})")
+                            _inner_done = True
+                            continue
+                        if _balance_was_confirmed:
+                            no_funds_confirmed_count += 1
+                            _backoff_s = max(300.0, float(recheck_wait) * 0.5 if no_funds_confirmed_count >= 2 else 120.0)
+                            if no_funds_confirmed_count >= 2:
+                                # OWNER RULE (2026-09-23): rest the account for a full
+                                # hour when NO FUNDS are confirmed. During that hour we
+                                # follow winnings (settle ledger, emit WON/LOST) but place
+                                # NO bets. Browser stays open on purpose so the rest-hour
+                                # win-sync below can actually read Bet History.
+                                _park_s = max(3600.0, float(recheck_wait))
+                                self._emit_direct(
+                                    gui_callback,
+                                    f"🛑 {active_phone}: confirmed NO FUNDS x{no_funds_confirmed_count} "
+                                    f"(KES {_b2:,.2f} < KES {eff_stake:,.0f}) — resting this account "
+                                    f"for {_park_s / 60:.0f} min: following winnings only, "
+                                    "NO bets until funds return. Other accounts continue betting.")
+                                dead_until = time.time() + _park_s
+                                if self._agent_hub is not None:
+                                    try:
+                                        self._agent_hub.supervisor.beat_parked(active_phone)
+                                    except Exception:
+                                        pass
+                                _inner_done = True
+                                continue
+                            else:
+                                self._emit_direct(
+                                    gui_callback,
+                                    f"⏳ {active_phone}: KES {_b2:,.2f} < KES {eff_stake:,.0f} "
+                                    f"(confirm #{no_funds_confirmed_count}) — waiting {_backoff_s / 60:.0f} min, "
+                                    "one plan-ahead scan, then recheck.")
+                                try:
+                                    if driver is not None and self._driver_is_usable(driver):
                                         self._plan_ahead(driver, active_phone, password,
                                                          stake=stake, gui_callback=gui_callback)
-                                    except Exception as e:
-                                        self._emit_direct(gui_callback,
-                                                          f"⚠️ Plan-ahead scan hiccup: {str(e)[:100]}")
-                                if _stop():
-                                    break
-                                if time.time() >= wait_deadline:
-                                    break
-                                self._yield_session_for_deposit(lock, active_phone,
-                                                                gui_callback=gui_callback)
+                                except Exception:
+                                    pass
+                                _wait_til = time.time() + _backoff_s
+                                while time.time() < _wait_til and not _stop():
+                                    time.sleep(min(10.0, _wait_til - time.time()))
+                                    if self._engine_state.get("_balance_refreshed"):
+                                        break
+                                _inner_done = True
                                 continue
-                        # Stake locked at the KES 10 minimum — never scaled.
-                        eff_stake = stake
-                        pool_r = self._pool()
-                        if b2 and (b2 - pool_r) >= eff_stake:
-                            self._engine_state["win_funded_wait"] = False
-                            self._engine_state["engine_busy"] = True
-                            waiting_since = None
-                            funds_landed = True
+                        else:
                             self._emit_direct(gui_callback,
-                                              f"💵 KES {b2:,.2f} in {active_phone} covers a "
-                                              f"KES {eff_stake:,.0f} ticket above the "
-                                              f"KES {pool_r:,.2f} reserve — GO!")
-                            break
-                        if time.time() >= plan_next:
-                            plan_next = time.time() + 120
+                                              f"⏳ {active_phone}: balance temporarily unreadable "
+                                              f"(KES {bal:,.2f} cached) — quick plan-ahead, then cycling.")
                             try:
-                                self._plan_ahead(driver, active_phone, password,
-                                                 stake=stake, gui_callback=gui_callback)
-                            except Exception as e:
-                                self._emit_direct(gui_callback,
-                                                  f"⚠️ Plan-ahead scan hiccup: {str(e)[:100]}")
-                        if _stop():
-                            break
-                        if time.time() >= wait_deadline:
-                            self._emit_direct(gui_callback,
-                                              f"🔁 {active_phone} still short after "
-f"{win_wait_max / 60:.0f} min (KES {b2:,.2f}) — "
-                                              "I'll keep rechecking until funds land.")
-                            break
-                        self._yield_session_for_deposit(lock, active_phone,
-                                                        gui_callback=gui_callback)
-                    if funds_landed:
-                        # ── Smart: try to promote the most recent shadow bet into a
-                        # real slip before doing a full fresh crawl.  The shadow bet
-                        # was built during the no-funds wait, so its legs are pre-
-                        # researched and the markets are almost certainly still live.
-                        _shadow = None
-                        try:
-                            _shadows = [
-                                b for b in (getattr(self, "_bets", None) or [])
-                                if b.get("status") == "shadow"
-                                and b.get("shadow_legs")
-                            ]
-                            if _shadows:
-                                # Most recent shadow first
-                                _shadows.sort(
-                                    key=lambda x: x.get("placed_at") or "", reverse=True)
-                                _shadow = _shadows[0]
-                        except Exception:
-                            _shadow = None
-
-                        if _shadow and _shadow.get("shadow_legs"):
-                            _legs_info = _shadow.get("shadow_legs") or []
-                            self._emit_direct(gui_callback,
-                                              f"⚡ Funds landed — promoting pre-built shadow "
-                                              f"slip ({len(_legs_info)} legs, "
-                                              f"x{_shadow.get('odds', '?'):.2f}) "
-                                              "directly to betslip")
-                            # Rebuild the legs tuple expected by _click_selected_legs:
-                            # (odds, display_name, gid, market, prob)
-                            _promoted_legs = []
-                            for _lg in _legs_info:
-                                _promoted_legs.append((
-                                    float(_lg.get("odds") or 1.5),
-                                    str(_lg.get("name") or ""),
-                                    str(_lg.get("gid") or ""),
-                                    str(_lg.get("market") or "over"),
-                                    float(_lg.get("prob") or 0.5),
-                                ))
-                            # Navigate back to today-games then attempt to place
-                            try:
-                                self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
-                                time.sleep(1.5)
-                                self._scroll_to_load_more_games(driver,
-                                                                gui_callback=gui_callback)
-                                _pc = self._click_selected_legs(
-                                    driver, _promoted_legs, gui_callback=gui_callback)
-                                if _pc >= 2:
-                                    _pres = self._open_betslip_and_place(
-                                        driver, stake, active_phone, password,
-                                        gui_callback=gui_callback,
-                                        before_balance=b2)
-                                    if isinstance(_pres, bool) and _pres:
-                                        # Mark the shadow as consumed
-                                        _shadow["status"] = "shadow_promoted"
-                                        _shadow["settled_at"] = datetime.now().isoformat(
-                                            timespec="seconds")
-                                        self._save_ledger()
-                                        self._record_bet_from_result({
-                                            "status": "success",
-                                            "legs": len(_promoted_legs),
-                                            "stake": stake,
-                                            "odds": float(_shadow.get("odds") or 1.5),
-                                            "possible_win": round(
-                                                stake * float(_shadow.get("odds") or 1.5), 2),
-                                            "markets": _shadow.get("markets") or [],
-                                            "probs": _shadow.get("probs") or [],
-                                            "game_ids": _shadow.get("shadow_game_ids") or [],
-                                            "placed_at": datetime.now().isoformat(
-                                                timespec="seconds"),
-                                        }, phone=active_phone)
-                                        self._emit_direct(gui_callback,
-                                                          f"✅ Shadow slip promoted and placed "
-                                                          f"on {active_phone}!")
-                                        with self._bets_lock:
-                                            shared["bets_placed"] += 1
-                                        last_placed_ts = time.time()
-                                        # Don't continue to the normal crawl — bet done
-                                        wait = self._gov('chain_gap', chain_gap) \
-                                            if chain_bets else cadence
-                                        self._engine_busy = False
-                                        waited = 0.0
-                                        while waited < wait and not _stop():
-                                            time.sleep(min(10.0, wait - waited))
-                                            waited += 10.0
-                                        continue
-                            except Exception as _pe:
-                                self._emit_direct(gui_callback,
-                                                  f"⚠️ Shadow promotion failed "
-                                                  f"({str(_pe)[:80]}) — doing fresh crawl")
-                        # Fall through: no usable shadow bet → normal crawl
+                                if driver is not None and self._driver_is_usable(driver):
+                                    self._plan_ahead(driver, active_phone, password,
+                                                     stake=stake, gui_callback=gui_callback)
+                            except Exception:
+                                pass
+                            _quick_wait = 180.0
+                            _wt = time.time() + _quick_wait
+                            while time.time() < _wt and not _stop():
+                                time.sleep(min(10.0, _wt - time.time()))
+                                if self._engine_state.get("_balance_refreshed"):
+                                    break
+                            _inner_done = True
+                            continue
+                    if _shadow_promoted_ok:
+                        wait = self._gov('chain_gap', chain_gap) if chain_bets else cadence
+                        self._engine_busy = False
+                        waited = 0.0
+                        while waited < wait and not _stop():
+                            time.sleep(min(10.0, wait - waited))
+                            waited += 10.0
                         continue
                     wait = retry
                 else:
@@ -4712,22 +5801,84 @@ f"{win_wait_max / 60:.0f} min (KES {b2:,.2f}) — "
                         self._emit_direct(gui_callback,
                                           f"⚠️ Auto-withdraw skip: {str(e)[:80]}")
             except Exception as exc:
-                consec_fail += 1
-                self._engine_state["consecutive_failures"] = consec_fail
-                self._emit_direct(gui_callback,
-                                  f"⚠️ {active_phone} round crashed: {str(exc)[:120]} "
-                                  f"(fail #{consec_fail})")
-                if self._agent_hub is not None:
+                _exc_s = str(exc).lower()
+                _is_net = ("err_internet_disconnected" in _exc_s or "err_name_not_resolved" in _exc_s
+                           or "err_connection" in _exc_s or "net::err_" in _exc_s)
+                _is_renderer = ("timed out receiving message from renderer" in _exc_s
+                                or "timeout: timed out" in _exc_s)
+                # Network down — keep browser, just wait for net to return
+                if _is_net:
+                    self._emit_direct(gui_callback,
+                                      f"🌐 {active_phone} offline (net down) — keeping browser, "
+                                      "retrying in 60s until net returns.")
+                    consec_fail = max(0, consec_fail - 1)  # don't penalise net blips
+                    self._engine_state["consecutive_failures"] = consec_fail
+                    if self._agent_hub is not None:
+                        try:
+                            self._agent_hub.supervisor.beat_abort(f"net down: {str(exc)[:60]}")
+                        except Exception:
+                            pass
+                    self._engine_busy = False
+                    # keep driver alive — don't quit
+                    wait = 60.0
+                elif _is_renderer:
+                    consec_fail += 1
+                    self._engine_state["consecutive_failures"] = consec_fail
                     try:
-                        self._agent_hub.supervisor.beat_abort(f"crash: {str(exc)[:90]}")
+                        import traceback as _tb
+                        _crash_body = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+                        _crash_file = os.path.join(self._data_dir or os.path.dirname(os.path.abspath(__file__)),
+                                                   "sportsape_crash_trace.txt")
+                        with open(_crash_file, "a", encoding="utf-8") as _cf:
+                            _cf.write(f"[{datetime.now().isoformat(timespec='seconds')}] "
+                                      f"{active_phone} renderer hang (fail #{consec_fail})\n{_crash_body}\n")
                     except Exception:
-                        pass
-                self._quit_bet_driver(driver)
-                driver = None
-                self._clear_account_driver(active_phone)
+                        _crash_body = ""
+                    self._emit_direct(gui_callback,
+                                      f"🔧 {active_phone} renderer hang (45s) — rebuilding browser "
+                                      f"(fail #{consec_fail})"
+                                      + (f" → trace saved" if _crash_body else ""))
+                    if self._agent_hub is not None:
+                        try:
+                            self._agent_hub.supervisor.beat_driver_heal()
+                        except Exception:
+                            pass
+                    self._quit_bet_driver(driver)
+                    driver = None
+                    self._clear_account_driver(active_phone)
+                else:
+                    consec_fail += 1
+                    self._engine_state["consecutive_failures"] = consec_fail
+                    try:
+                        import traceback as _tb
+                        _crash_body = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+                        _crash_file = os.path.join(self._data_dir or os.path.dirname(os.path.abspath(__file__)),
+                                                   "sportsape_crash_trace.txt")
+                        with open(_crash_file, "a", encoding="utf-8") as _cf:
+                            _cf.write(f"[{datetime.now().isoformat(timespec='seconds')}] "
+                                      f"{active_phone} round crash (fail #{consec_fail})\n{_crash_body}\n")
+                    except Exception:
+                        _crash_body = ""
+                    self._emit_direct(gui_callback,
+                                      f"⚠️ {active_phone} round crashed: {str(exc)[:120]} "
+                                      f"(fail #{consec_fail})"
+                                      + (f" → full trace saved to sportsape_crash_trace.txt"
+                                         if _crash_body else ""))
+                    if self._agent_hub is not None:
+                        try:
+                            self._agent_hub.supervisor.beat_abort(f"crash: {str(exc)[:90]}")
+                        except Exception:
+                            pass
+                    self._quit_bet_driver(driver)
+                    driver = None
+                    self._clear_account_driver(active_phone)
                 self._engine_busy = False
-                wait = 60.0 if consec_fail >= 4 else retry
-                if consec_fail >= 4:
+                # keep 60s for net blips even when consec_fail low
+                if _is_net:
+                    wait = 60.0
+                else:
+                    wait = 60.0 if consec_fail >= 4 else retry
+                if consec_fail >= 4 and not _is_net:
                     self._emit_direct(
                         gui_callback,
                         f"🌐 {active_phone}: no connection or browser trouble — staying on, "
@@ -4986,6 +6137,10 @@ f"{win_wait_max / 60:.0f} min (KES {b2:,.2f}) — "
 
     def _fit_poisson(self, p1, pd, p2):
         """Fit (lambda_home, lambda_away) to fair 1X2 probabilities (coarse grid + refine)."""
+        key = (round(float(p1), 4), round(float(pd), 4), round(float(p2), 4))
+        cached = self._fit_poisson_cache.get(key)
+        if cached is not None:
+            return cached
         best = None
         best_err = 1e9
         step = 0.15
@@ -4999,6 +6154,7 @@ f"{win_wait_max / 60:.0f} min (KES {b2:,.2f}) — "
                     best_err = err
                     best = (lh, la)
         if best is None:
+            self._fit_poisson_cache[key] = None
             return None
         lh, la = best
         step2 = 0.01
@@ -5013,6 +6169,7 @@ f"{win_wait_max / 60:.0f} min (KES {b2:,.2f}) — "
                         if err < best_err - 1e-12:
                             best_err = err
                             lh, la = lh2, la2
+        self._fit_poisson_cache[key] = (lh, la)
         return lh, la
 
     def _total_goals_from_ou(self, over_prob, lo=0.5, hi=6.0):
@@ -5029,6 +6186,61 @@ f"{win_wait_max / 60:.0f} min (KES {b2:,.2f}) — "
             else:
                 lo = mid
         return (lo + hi) / 2.0
+
+    def _poisson_over_under(self, lam_total, line=2.5):
+        """P(total > line) for a Poisson total-goal model with expected lam_total."""
+        import math
+        k_max = int(max(3, lam_total + 8))
+        p_gt = 0.0
+        for k in range(k_max + 1):
+            if k > line:
+                p_gt += math.exp(-lam_total) * (lam_total ** k) / math.factorial(k)
+        return p_gt
+
+    def _calibrated_goals_probs(self, g, h3_probs, ou_probs):
+        """Calibrate the goals-market probabilities with a real O/U line.
+
+        2026-09-24 (#5): the 2.5-line probability already comes from the book's
+        own O/U line (the strongest single source). The Poisson fit to the 1X2
+        odds adds the SHAPE — it rescales 1X2-derived goals to the book's total-
+        goals line, then derives a consistent Over/Under 1.5 probability. When
+        no real 1.5 line exists on the listing, the model still yields one;
+        when it does, the two independent estimates get blended 50/50 so no
+        single listing glitch warps the leg probability.
+
+        Returns {"over25": p, "under25": p, "over15": p, "under15": p} or None
+        when there is nothing to calibrate."""
+        try:
+            if not ou_probs or float(ou_probs[0] or 0) <= 0.03:
+                return None
+            p_over25_book = float(ou_probs[0])
+            lam_total = self._total_goals_from_ou(p_over25_book)
+            p_over15_cal = self._poisson_over_under(lam_total, 1.5)
+            p_over25_cal = self._poisson_over_under(lam_total, 2.5)
+            # Optionally use the 1X2 Poisson fit as a second estimate on the 1.5 line
+            if len(h3_probs) >= 3 and all(float(x or 0) > 0.01 for x in h3_probs):
+                try:
+                    fit = self._fit_poisson(float(h3_probs[0]), float(h3_probs[1]),
+                                            float(h3_probs[2]))
+                    if fit:
+                        lh, la = fit
+                        tot = lh + la
+                        if tot > 0.1:
+                            lh = lh / tot * lam_total
+                            la = la / tot * lam_total
+                            p15_h2 = self._poisson_over_under(lh + la, 1.5)
+                            p_over15_cal = 0.5 * p_over15_cal + 0.5 * p15_h2
+                except Exception:
+                    pass
+            p_over15_cal = max(0.02, min(0.98, p_over15_cal))
+            return {
+                "over25": p_over25_book,
+                "under25": 1.0 - p_over25_book,
+                "over15": p_over15_cal,
+                "under15": 1.0 - p_over15_cal,
+            }
+        except Exception:
+            return None
 
     def _crawl_ou_for_match(self, ev, games):
         """Match a jackpot event to a crawled today-game and return the fair Over-2.5
@@ -5092,7 +6304,28 @@ f"{win_wait_max / 60:.0f} min (KES {b2:,.2f}) — "
         H = 0.62 * H + 0.38 * p1
         D = 0.62 * D + 0.38 * pd
         A = 0.62 * A + 0.38 * p2
-        D = max(D, 0.235)  # draws are the jackpot blind-spot — never starve them out
+        D = max(D, 0.235)
+        _gid = str(ev.get("match_id") or ev.get("id") or "")
+        _home_n = str(ev.get("home") or "")
+        _away_n = str(ev.get("away") or "")
+        _ev_enr = None
+        try:
+            _ev_enr = self._enrichment_for(_gid) if _gid else None
+        except Exception:
+            _ev_enr = None
+        if _ev_enr and (_ev_enr.get("injuries") or _ev_enr.get("suspensions")):
+            _inj = " ".join(_ev_enr.get("injuries") or []) + " " + " ".join(_ev_enr.get("suspensions") or [])
+            _low = _inj.lower()
+            if _home_n and any(w for w in _home_n.split() if len(w) > 3 and w.lower()[:5] in _low):
+                _cut = min(0.08, max(H, 0.04) * 0.18)
+                H = max(0.02, H - _cut)
+                D += _cut * 0.40
+                A += _cut * 0.60
+            if _away_n and any(w for w in _away_n.split() if len(w) > 3 and w.lower()[:5] in _low):
+                _cut = min(0.08, max(A, 0.04) * 0.18)
+                A = max(0.02, A - _cut)
+                D += _cut * 0.40
+                H += _cut * 0.60
         totp = H + D + A
         H, D, A = H / totp, D / totp, A / totp
         mx = max(H, D, A)
@@ -5176,6 +6409,138 @@ f"{win_wait_max / 60:.0f} min (KES {b2:,.2f}) — "
         if n < 3:
             return None
         return entry
+
+    def _load_enrich_cache(self) -> dict:
+        """Persistent per-game enrichment (injuries, weather, venue...). keyed by game id."""
+        try:
+            if self.ENRICH_PATH.exists():
+                data = json.loads(self.ENRICH_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_enrich_cache(self):
+        try:
+            self.ENRICH_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self.ENRICH_PATH.write_text(
+                json.dumps(getattr(self, "_enrich_cache", {}), indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _enrichment_for(self, game_id) -> dict | None:
+        """Return fresh enrichment for a game id, or None."""
+        if not game_id:
+            return None
+        cache = getattr(self, "_enrich_cache", None)
+        if cache is None:
+            cache = self._load_enrich_cache()
+            self._enrich_cache = cache
+        ent = cache.get(str(game_id))
+        if not ent or not isinstance(ent, dict):
+            return None
+        if time.time() - (float(ent.get("ts") or 0)) > self.ENRICH_TTL_SECONDS:
+            return None
+        if not (ent.get("injuries") or ent.get("suspensions")
+                or ent.get("weather") or ent.get("raw_snippet")):
+            return None
+        return ent
+
+    def _set_enrichment(self, game_id, enr: dict):
+        if not game_id or not enr:
+            return
+        try:
+            cache = getattr(self, "_enrich_cache", None)
+            if cache is None:
+                cache = self._load_enrich_cache()
+                self._enrich_cache = cache
+            cache[str(game_id)] = dict(enr, ts=time.time())
+            self._save_enrich_cache()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_enrichment_from_text(content: str) -> dict:
+        """Extract injuries/suspensions/weather/venue/referee from a Betradar
+        stats-overlay text dump. Shared by the per-leg stats reader and the
+        research enrichment path so both keep the same findings."""
+        result = {}
+        if not content:
+            return result
+        low = content.lower()
+        snippet = content[:600]
+        inj_lines = []
+        for line in content.splitlines():
+            if any(kw in line.lower() for kw in
+                   ("injured", "injury", "doubt", "suspended", "suspension",
+                    "missing", "unavailable", "out ")):
+                l = line.strip()
+                if 5 < len(l) < 150:
+                    inj_lines.append(l)
+        if inj_lines:
+            result["injuries"] = inj_lines[:6]
+        for pat in (r"weather[:\s]+([^\n]{3,60})",
+                    r"(sunny|cloudy|rain|wind|snow|clear|overcast)[^\n]{0,40}"):
+            m = re.search(pat, content, re.IGNORECASE)
+            if m:
+                result["weather"] = m.group(0).strip()[:80]
+                break
+        for pat in (r"venue[:\s]+([^\n]{3,60})",
+                    r"stadium[:\s]+([^\n]{3,60})"):
+            m = re.search(pat, content, re.IGNORECASE)
+            if m:
+                result["venue"] = m.group(1).strip()[:60]
+                break
+        m = re.search(r"referee[:\s]+([^\n]{3,50})", content, re.IGNORECASE)
+        if m:
+            result["referee"] = m.group(1).strip()[:50]
+        result["raw_snippet"] = snippet
+        return result
+
+    @staticmethod
+    def _enrichment_k(el: dict, home_n: str = "", away_n: str = "") -> float:
+        """Score a game's enrichment into a multiplier applied to its legs.
+
+        Injury/suspension noise genuinely trims a game: each distinct injury line
+        costs ~6% (capped), a named-side hit costs ~8% more. Returns a float in
+        [0.70, 1.0] — real signal, not a cosmetic -0.05."""
+        if not el:
+            return 1.0
+        inj = el.get("injuries") or []
+        sus = el.get("suspensions") or []
+        con = " ".join(inj) + " " + " ".join(sus)
+        if not con.strip():
+            return 1.0
+        n_inj = len(inj)
+        k = 1.0 - min(0.20, 0.06 * float(n_inj))   # each injury line ~6%, capped 20%
+        low = con.lower()
+        if home_n:
+            if any(w for w in (home_n or "").split() if len(w) > 3 and w.lower()[:5] in low):
+                k -= 0.08
+        if away_n:
+            if any(w for w in (away_n or "").split() if len(w) > 3 and w.lower()[:5] in low):
+                k -= 0.08
+        return max(0.70, k)
+
+    @staticmethod
+    def _enrichment_veto(el: dict) -> str | None:
+        """Return a human reason to DROP this game entirely (skip every leg), or
+        None when the game is clear. A game with several injuries/suspensions or a
+        stated key-absence is not a value bet — it's a donation."""
+        if not el:
+            return None
+        inj = el.get("injuries") or []
+        sus = el.get("suspensions") or []
+        lines = inj + sus
+        if len(lines) >= 3:
+            return f"{len(lines)} injury/suspension flags"
+        low = " ".join(lines).lower()
+        for kw in ("out for", "ruled out", "sidelined", "long-term", "season",
+                   "top scorer", "key player", "captain", "first choice", "doubtful"):
+            if kw in low:
+                return f"key absence: {kw}"
+        return None
 
     def _cache_form_entry(self, team: str, entry: dict):
         """Persist a freshly researched form entry for one team (extends TTL)."""
@@ -5544,7 +6909,15 @@ return 'noicon';
         if not text:
             return out
         scores = re.findall(r"Overall Form\s*\n?\s*(\d{1,3})\s*\n?\s*/\s*100", text)
-        # split per-team Last Matches sections
+        # Also accept bare "N / 100" pair (limited-coverage layout shows two
+        # big numbers, one per team, only the second labelled Overall Form).
+        if len(scores) < 2:
+            bare = re.findall(r"(\d{1,3})\s*\n?\s*/\s*100", text)
+            for b in bare:
+                if len(scores) >= 2:
+                    break
+                scores.append(int(b))
+        # m[0] = junk, then (label, content) pairs
         m = re.split(r"Last Matches-\s*([A-Za-z0-9 .'&\u2011-]{2,40})", text)
         # m[0] = junk, then (label, content) pairs
         sections = []
@@ -5582,6 +6955,16 @@ return 'noicon';
                 # blocks[1] -> home zone ends at next 'Overall Form'
                 res_h = "".join(re.findall(r"\b([WDL])\b", blocks[1][:300]))[:5]
                 res_a = "".join(re.findall(r"\b([WDL])\b", blocks[2][:300]))[:5]
+            # limited-coverage fallback: Betradar 'WDL Direction' regions. Only
+            # accepted when BOTH sides yield >=3 letters — otherwise the page is
+            # too sparse to trust and we keep the No-Form (tilt=0) outcome.
+            if len(res_h) < 3 or len(res_a) < 3:
+                regions = re.split(r"WDL Direction", text)
+                if len(regions) >= 2:
+                    r0 = "".join(re.findall(r"[WDL]", regions[0]))[:5]
+                    r1 = "".join(re.findall(r"[WDL]", regions[1]))[:5]
+                    if len(r0) >= 3 and len(r1) >= 3:
+                        res_h, res_a = r0, r1
         h_score = scores[0] if scores else None
         a_score = scores[1] if len(scores) > 1 else None
         if res_h and len(res_h) >= 3:
@@ -5695,8 +7078,8 @@ return 'noicon';
 
             # Crawl today + upcoming
             games = []
-            for url in (self.TODAY_GAMES_PAGE_URL, self.UPCOMING_GAMES_PAGE_URL,
-                        self.FOOTBALL_HOME_URL):
+            for url in (self.TODAY_GAMES_PAGE_URL, self.POPULAR_GAMES_URL,
+                    self.UPCOMING_GAMES_PAGE_URL, self.FOOTBALL_HOME_URL):
                 try:
                     self._safe_get(driver, url)
                     time.sleep(1.2)
@@ -6514,6 +7897,141 @@ return 'noicon';
             self.LEDGER_PATH.write_text(json.dumps(self._bets, indent=2), encoding="utf-8")
         except Exception:
             pass
+        self._sb_push_ledger()
+
+    def _sb_sync(self):
+        """Return the shared Supabase sync singleton (or None). Thread-safe + cheap."""
+        try:
+            if _sb_get_sync is None:
+                return None
+            return _sb_get_sync()
+        except Exception:
+            return None
+
+    def _sb_push_ledger(self):
+        """Mirror the full ledger (placed + shadow bets) to Supabase, non-blocking."""
+        try:
+            sb = self._sb_sync()
+            if sb is not None and getattr(self, "_bets", None) is not None:
+                sb.push_bets(self._bets)
+        except Exception:
+            pass
+
+    def _sb_push_games(self, games: list):
+        """Mirror observed games (betted or not) to Supabase, non-blocking."""
+        try:
+            sb = self._sb_sync()
+            if sb is not None and games:
+                sb.push_games(games)
+        except Exception:
+            pass
+
+    def _sb_push_observed_games(self, games: list):
+        """Convert a crawl's game dicts into the Supabase game schema and mirror
+        them (throttled — every game observed, betted or not, for calibration)."""
+        try:
+            sb = self._sb_sync()
+            if sb is None or not games:
+                return
+            now = time.time()
+            last = float(getattr(self, "_sb_games_last_ts", 0.0) or 0.0)
+            if now - last < 60.0:
+                return
+            self._sb_games_last_ts = now
+            betted_ids = set()
+            for b in (getattr(self, "_bets", None) or []):
+                for gid in (b.get("game_ids") or []):
+                    if gid:
+                        betted_ids.add(str(gid))
+            rows = []
+            hist = self._odds_history or {}
+            for g in games or []:
+                if not isinstance(g, dict):
+                    continue
+                gid = str(g.get("id") or "")
+                if not gid:
+                    continue
+                rec = hist.get(gid) or {}
+                rows.append({
+                    "id": gid,
+                    "game_id": gid,
+                    "name": str(g.get("name") or ""),
+                    "home": str(g.get("home") or ""),
+                    "away": str(g.get("away") or ""),
+                    "kickoff": g.get("start"),
+                    "first_odds": rec.get("first") or {},
+                    "last_odds": rec.get("last") or {},
+                    "betted": gid in betted_ids,
+                    "status": "seen",
+                    "result": {},
+                })
+            sb.push_games(rows)
+        except Exception:
+            pass
+
+    def _sb_push_stats(self):
+        """Mirror the calibration/stats snapshot to Supabase, non-blocking."""
+        try:
+            sb = self._sb_sync()
+            if sb is not None:
+                self._load_stats()
+                sb.push_stats(self._stats)
+        except Exception:
+            pass
+
+    def _sb_push_results(self, results: list):
+        """Mirror per-game settled results to Supabase, non-blocking."""
+        try:
+            sb = self._sb_sync()
+            if sb is not None and results:
+                sb.push_results(results)
+        except Exception:
+            pass
+
+    def _sb_restore_ledger(self):
+        """Pull the full ledger history back from Supabase into `_bets` (used when
+        the local ledger is empty/corrupt and the cloud copy is authoritative)."""
+        try:
+            sb = self._sb_sync()
+            if sb is None:
+                return None
+            restored = sb.restore_ledger()
+            if restored:
+                if getattr(self, "_bets", None) is None:
+                    self._bets = []
+                known_ids = {str(b.get("id")) for b in self._bets if b.get("id")}
+                added = 0
+                for b in restored:
+                    if b.get("id") and str(b["id"]) in known_ids:
+                        continue
+                    self._bets.append(b)
+                    if b.get("id"):
+                        known_ids.add(str(b["id"]))
+                    added += 1
+                if added:
+                    self._save_ledger()
+                return added
+            return 0
+        except Exception:
+            return None
+
+    def _sb_restore_stats(self):
+        """Pull the calibration/stats snapshot back from Supabase into `_stats`."""
+        try:
+            sb = self._sb_sync()
+            if sb is None:
+                return False
+            cloud = sb.pull_stats()
+            if cloud and isinstance(cloud, dict):
+                self._load_stats()
+                # Prefer the cloud copy only when it has more settled history.
+                if int(cloud.get("settled") or 0) > int(self._stats.get("settled") or 0):
+                    self._stats = cloud
+                    self._save_stats()
+                    return True
+            return False
+        except Exception:
+            return False
 
     def _record_bet_from_result(self, res: dict, phone: str = None):
         if getattr(self, "_bets", None) is None:
@@ -6529,6 +8047,7 @@ return 'noicon';
             "markets": list(res.get("markets") or []),
             "probs": [round(float(p), 4) for p in (res.get("probs") or [])],
             "game_ids": list(res.get("game_ids") or []),   # per-leg game IDs for analyst feedback
+            "leg_names": list(res.get("leg_names") or []), # per-leg game name+suffix for league volatility
             "status": "active",
             "settled_at": None,
             "won_amount": None,
@@ -6571,6 +8090,12 @@ return 'noicon';
             for b in getattr(self, "_bets", []) or []:
                 pt = b.get("placed_at") or ""
                 if not pt.startswith(today):
+                    continue
+                # Only count slips that actually landed on the site — a bet is only
+                # "placed" once the site returns a real slip/bet id. Shadow research
+                # rows and failed-then-recorded phantoms carry no site id and must
+                # NOT burn today's cap budget (phantom-only inflation hit here).
+                if not b.get("id"):
                     continue
                 try:
                     t = self._ts(pt)
@@ -6702,9 +8227,19 @@ return 'noicon';
     # settled, an epsilon-greedy bandit starts steering the odds band toward the
     # top-ROI recipes.
     MIN_BANDIT_SETTLED = 30
-    RETIRE_TRIALS = 24          # sample size before we trust a market type
-    RETIRE_HINT = 0.06          # real hit-rate must fall this far below predicted
+    RETIRE_TRIALS = 50          # need 50+ trials before we trust a retirement decision
+    RETIRE_HINTS = 0.15         # real hit-rate must fall this far below predicted to retire
+    RETIRE_HINT  = 0.15         # alias used in _maybe_recalibrate
     RECHECK_DAYS = 1
+    RECALIB_BET_STEP = 25          # redraw market weights after this many settled bets (Brier-informed)
+    # League volatility filter (2026-09-24): per-league×market hit-rate tracking.
+    # Leagues whose settled bets underperform prediction get downweighted once we
+    # have enough trials to trust the signal; stable leagues get a small boost.
+    LEAGUE_MIN_TRIALS = 20
+    LEAGUE_VOLATILE_GAP = 0.10     # real hit-rate this far below predicted → volatile
+    LEAGUE_DOWNWEIGHT_MULT = 0.88
+    LEAGUE_UPWEIGHT_MULT = 1.08
+    STATS_CACHE_TTL = 5.0       # seconds to trust in-memory stats before re-reading from disk
 
     @staticmethod
     def _band_of(odds: float) -> str:
@@ -6735,6 +8270,12 @@ return 'noicon';
         return "45+"
 
     def _load_stats(self):
+        # Cache: skip disk I/O if stats were loaded within TTL seconds.
+        now = time.time()
+        if (getattr(self, "_stats", None) is not None
+                and hasattr(self, "_stats_cache_time")
+                and (now - self._stats_cache_time) < self.STATS_CACHE_TTL):
+            return
         if getattr(self, "_stats", None) is None:
             self._stats = {"market_types": {}, "recipes": {}, "retired_markets": [],
                            "settled": 0, "last_recalib": None}
@@ -6745,14 +8286,17 @@ return 'noicon';
                     self._stats = data
         except Exception:
             pass
+        self._stats_cache_time = now
 
     def _save_stats(self):
+        self._stats_cache_time = time.time()
         try:
             self._stats["settled"] = int(self._stats.get("settled") or 0)
             self.STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
             self.STATS_PATH.write_text(json.dumps(self._stats, indent=2), encoding="utf-8")
         except Exception:
             pass
+        self._sb_push_stats()
 
     def _record_settled_stats(self, b: dict):
         """File one settled bet into lifetime stats (market types + recipe).
@@ -6788,10 +8332,13 @@ return 'noicon';
             for i, mk in enumerate(markets):
                 p_i = float(probs[i]) if i < len(probs) else 0.5
                 e = mt.setdefault(str(mk), {"trials": 0, "won": 0, "expected": 0.0,
-                                            "bad_streak": 0, "weight": 1.0})
+                                            "bad_streak": 0, "weight": 1.0,
+                                            "brier": 0.0})
                 e["trials"]  = int(e.get("trials") or 0) + 1
                 e["won"]     = int(e.get("won") or 0) + 1
                 e["expected"] = float(e.get("expected") or 0.0) + p_i
+                # Brier: outcome is 1 for a won slip, forecast p_i
+                e["brier"] = float(e.get("brier") or 0.0) + (1.0 - p_i) ** 2
         else:
             # Slip lost: distribute blame by failure probability weight
             fail_probs = [max(0.01, 1.0 - (float(probs[i]) if i < len(probs) else 0.5))
@@ -6802,14 +8349,48 @@ return 'noicon';
                 blame = fail_probs[i] / total_fail   # fraction of loss attributed to this leg
                 e = mt.setdefault(str(mk), {"trials": 0, "won": 0, "expected": 0.0,
                                             "bad_streak": 0, "weight": 1.0,
-                                            "weighted_blame": 0.0})
+                                            "weighted_blame": 0.0, "brier": 0.0})
                 e["trials"]  = int(e.get("trials") or 0) + 1
                 # partial credit proportional to how confident we were this leg would win
                 # (avoids over-penalising high-prob legs when the low-prob leg killed the slip)
                 e["won"]     = float(e.get("won") or 0) + (1.0 - blame)
                 e["expected"] = float(e.get("expected") or 0.0) + p_i
                 e["weighted_blame"] = float(e.get("weighted_blame") or 0.0) + blame
+                # Brier with blame-weighted outcome: E[(y - p)^2] with y=1 w.p. (1-blame)
+                e_brier = blame * (0.0 - p_i) ** 2 + (1.0 - blame) * (1.0 - p_i) ** 2
+                e["brier"] = float(e.get("brier") or 0.0) + e_brier
 
+        # ── Per-league × market tracking (league volatility filter) ──────────
+        # Attribute each leg to the league its game belongs to (rule-based team
+        # name detection) and file the same probability-blame signal into a
+        # league_markets table. After enough trials per league×market the
+        # selector downweights volatile competitions (leagues whose bets
+        # underperform their prediction) and upweights stable ones.
+        try:
+            _legs_meta = (b.get("shadow_legs") or []) if b.get("status") == "shadow" else []
+            lm = self._stats.setdefault("league_markets", {})
+            for i, mk in enumerate(markets):
+                gname = ""
+                if i < len(b.get("leg_names") or []):
+                    gname = (b.get("leg_names") or [])[i]
+                elif i < len(_legs_meta):
+                    gname = _legs_meta[i].get("name") or ""
+                league = self._league_name(gname)
+                le = lm.setdefault(league, {}).setdefault(
+                    str(mk), {"trials": 0, "won": 0, "expected": 0.0})
+                p_i = float(probs[i]) if i < len(probs) else 0.5
+                le["trials"] = int(le.get("trials") or 0) + 1
+                le["expected"] = float(le.get("expected") or 0.0) + p_i
+                if won:
+                    le["won"] = float(le.get("won") or 0) + 1.0
+                else:
+                    fail_probs = [max(0.01, 1.0 - (float(probs[j]) if j < len(probs) else 0.5))
+                                  for j in range(len(markets))]
+                    t_fail = sum(fail_probs) or 1.0
+                    le["won"] = float(le.get("won") or 0) + \
+                        (1.0 - (fail_probs[i] / t_fail))
+        except Exception:
+            pass
         # ── Recipe stats (unchanged — recipe tracks overall slip outcome) ───
         key = (b.get("recipe") or
                {"legs": b.get("legs"), "band": self._band_of(b.get("odds")),
@@ -6855,19 +8436,58 @@ return 'noicon';
         self._stats["settled"] = int(self._stats.get("settled") or 0) + 1
         self._maybe_recalibrate()
         self._save_stats()
+        self._sb_push_settled_results(b, won, markets, game_ids)
+
+    def _sb_push_settled_results(self, b: dict, won: bool, markets: list, game_ids: list):
+        """Mirror this slip's per-game settled results to Supabase so the cloud
+        builds a calibration denominator across EVERY betted (and eventually
+        unbetted) game. Won slip → every leg won. Lost slip → legs carry the
+        slip's lost outcome (per-leg truth isn't available without bookie API)."""
+        try:
+            rows = []
+            source = "shadow" if str(b.get("status") or "").startswith("shadow") else "bet"
+            outcome = "won" if won else "lost"
+            settled = b.get("settled_at") or datetime.now().isoformat(timespec="seconds")
+            phone = str(b.get("phone") or "")
+            for i, mk in enumerate(markets or []):
+                gid = str(game_ids[i]) if i < len(game_ids or []) else ""
+                if not gid:
+                    continue
+                rows.append({
+                    "game_id": gid,
+                    "market": mk,
+                    "outcome": outcome,
+                    "source": source,
+                    "phone": phone,
+                    "slip_status": outcome,
+                    "settled_at": settled,
+                })
+            if rows:
+                self._sb_push_results(rows)
+        except Exception:
+            pass
 
     def _maybe_recalibrate(self):
-        """Daily: recompute market-type weights/retirement + preferred odds band.
+        """Daily OR after enough settled bets: recompute market weights/retirement.
 
         Retirement is now faster — one bad streak is enough (was two).
         Weight boosting is also more aggressive — markets that beat
         expectation by 3%+ get a material boost.
+
+        2026-09-24: Brier-score calibration added — a market's weight now also
+        reflects how well its forecast probabilities were calibrated, not just
+        the win/loss rate. The daily gate is supplemented by a settled-count
+        gate: once RECALIB_BET_STEP bets have settled since the last redraw the
+        weights are recomputed even if a full day hasn't elapsed.
         """
         stats = self._stats
         try:
             last = stats.get("last_recalib")
+            step_gate = (int(stats.get("settled") or 0) -
+                         int(stats.get("settled_at_last_recalib") or 0)) >= self.RECALIB_BET_STEP
             if last and (datetime.now() - datetime.fromisoformat(last)).days < self.RECHECK_DAYS:
-                return
+                if not step_gate:
+                    return
         except Exception:
             pass
         # market-type calibration vs fair probability
@@ -6879,6 +8499,14 @@ return 'noicon';
             real = (e.get("won") or 0) / trials
             pred = (e.get("expected") or 0.0) / trials
             deficit = pred - real
+            brier_avg = (e.get("brier") or 0.0) / trials
+            # Brier benchmark: a perfectly calibrated forecast with hit-rate pred
+            # has expected Brier = pred*(1-pred) (the best achievable forecast).
+            brier_baseline = pred * (1.0 - pred)
+            if brier_avg > brier_baseline + 0.045:
+                # Forecast probabilities were substantially miscalibrated (the
+                # market's confidence was worse than its win rate justifies).
+                deficit = max(deficit, brier_avg - brier_baseline)
             if deficit >= self.RETIRE_HINT:
                 e["bad_streak"] = int(e.get("bad_streak") or 0) + 1
                 # Retire after ONE bad streak (was two) — faster learning
@@ -6889,21 +8517,74 @@ return 'noicon';
                                       f"vs predicted {pred:.0%} ({trials} bets)")
             else:
                 e["bad_streak"] = 0
+                boost = 0.0
                 if real >= pred + 0.03:
                     # More aggressive boost: scale by how far above expectation
                     boost = round((real - pred) * 6, 2)  # was *5
-                    e["weight"] = min(1.6, 1.0 + boost)  # ceiling raised from 1.5 to 1.6
+                # Calibration bonus: a market whose Brier beats its own baseline
+                # (forecast confident AND right) earns extra weight; a market
+                # whose probabilities were sloppy gets its boost clawed back.
+                calib_adj = (brier_baseline - brier_avg) * 2.0
+                boost = round(boost + calib_adj, 2)
+                if abs(boost) >= 0.02:
+                    e["weight"] = min(1.6, max(0.85, 1.0 + boost))
                     self._emit_direct(None,
-                                      f"🧠 BOOSTING market '{mk}': weight → {e['weight']:.2f} "
-                                      f"(real {real:.0%} vs expected {pred:.0%})")
+                                      f"🧠 WEIGHT '{mk}': → {e['weight']:.2f} "
+                                      f"(real {real:.0%} vs expected {pred:.0%}, "
+                                      f"brier {brier_avg:.3f} vs base {brier_baseline:.3f})")
         stats["retired_markets"] = sorted(retired)
         stats["last_recalib"] = datetime.now().isoformat(timespec="seconds")
+        stats["settled_at_last_recalib"] = int(stats.get("settled") or 0)
 
     def _market_type_weight(self, mk: str) -> float:
         self._load_stats()
         return float((self._stats.get("market_types") or {}).get(str(mk), {}).get("weight") or 1.0)
 
+    def _league_name(self, game_name: str) -> str:
+        """Best-effort league label for a 'Home vs Away' row (rule-based, no API)."""
+        try:
+            if LeagueContextAgent is not None:
+                league, _s = LeagueContextAgent.detect(str(game_name or ""))
+                return league or "Unknown"
+        except Exception:
+            pass
+        return "Unknown"
+
+    def _league_k(self, mk: str, game_name: str) -> float:
+        """League volatility multiplier: downweight legs from leagues whose
+        settled bets keep underperforming prediction, upweight stable ones.
+
+        Only engages after LEAGUE_MIN_TRIALS settled legs exist for that
+        (league × market) pair; otherwise returns 1.0 so a cold league is never
+        punished just because we haven't learned about it yet."""
+        try:
+            self._load_stats()
+            league = self._league_name(game_name)
+            le = ((self._stats.get("league_markets") or {}).get(league) or {}).get(str(mk))
+            if not le:
+                return 1.0
+            trials = int(le.get("trials") or 0)
+            if trials < self.LEAGUE_MIN_TRIALS:
+                return 1.0
+            real = (le.get("won") or 0) / trials
+            pred = (le.get("expected") or 0.0) / trials
+            deficit = pred - real
+            if deficit >= self.LEAGUE_VOLATILE_GAP:
+                # Volatile competition — bets there keep losing vs expectation
+                return self.LEAGUE_DOWNWEIGHT_MULT
+            if deficit <= -0.05 and real >= pred:
+                return self.LEAGUE_UPWEIGHT_MULT
+            return 1.0
+        except Exception:
+            return 1.0
+
+    # Markets permanently blocked — never allowed in any slip regardless of stats.
+    # over1 = Over 1.0 goals (too easy, bookmakers underprice it heavily)
+    _PERMANENTLY_BLOCKED_MARKETS = frozenset({"over1"})
+
     def is_market_retired(self, mk: str) -> bool:
+        if str(mk) in self._PERMANENTLY_BLOCKED_MARKETS:
+            return True
         self._load_stats()
         return str(mk) in (self._stats.get("retired_markets") or [])
 
@@ -6957,8 +8638,9 @@ return 'noicon';
 
         import random
         eps = 0.15
-        if random.random() < eps:
-            band = random.choice(list(bands))
+        profitable_bands = [b for b in bands if bands[b][1] >= self.MIN_COMBINED_ODDS]
+        if random.random() < eps and profitable_bands:
+            band = random.choice(profitable_bands)
         else:
             band = max(eligible, key=lambda b: sum(eligible[b]) / len(eligible[b]))
         lo, hi = bands[band]
@@ -6989,8 +8671,15 @@ return 'noicon';
                 max(leg_roi, key=lambda n: sum(leg_roi[n]) / len(leg_roi[n]))
                 if leg_roi else 0)
 
-        # never leave the caller's safe overall window
-        return max(float(default_lo), lo), min(float(default_hi), hi)
+        # never leave the caller's safe overall window, and keep it a
+        # valid, profitable window: lo <= hi and combined odds >= floor
+        hi = min(hi, 6.0)
+        lo = max(self.MIN_COMBINED_ODDS, min(lo, hi - 1.0))
+        if hi < self.MIN_COMBINED_ODDS:
+            hi = self.MIN_COMBINED_ODDS
+        if hi < lo:
+            hi = max(lo + 1.0, self.MIN_COMBINED_ODDS)
+        return lo, hi
 
     # ── Bet History scraping for win monitoring ─────────────────────────────
     def _extract_bet_history(self, driver, max_scroll: int = 8) -> list[dict]:
@@ -7052,13 +8741,15 @@ return out;
                     return None
                 return round(float(m.group(1).replace(",", "")), 2)
             legs_m = re.search(r"\((\d+)\)", r.get("desc") or "")
+            raw_status = (r.get("status") or "").strip()
             parsed.append({
                 "id": str(r.get("id") or "").strip(),
                 "date": (r.get("date") or "").strip(),
                 "legs": int(legs_m.group(1)) if legs_m else 0,
                 "stake": money(r.get("amount")),
                 "win": money(r.get("win")),
-                "status": (r.get("status") or "").strip(),
+                "status": raw_status,
+                "cashout_available": "cashout" in raw_status.lower(),
             })
         return parsed
 
@@ -7244,34 +8935,24 @@ return out;
             getattr(self, "_daily_bucket_cache", {}).clear()
             self._save_ledger()
         # ── Cash-out opportunity detection ────────────────────────────
-        # If any bet has "CashOut ACTIVE" status on the site, alert the user.
-        # We don't auto-cashout (too risky to click without user confirmation)
-        # but we surface it prominently so the user can decide.
+        # Read per-leg status on every cash-out-eligible bet, log which games
+        # are done/won/pending, and auto cash out under the owner's policy
+        # (majority legs already won correctly + offer close to possible win).
         try:
-            cashout_bets = [r for r in rows
-                            if "cashout" in str(r.get("status") or "").lower()
-                            and "active" in str(r.get("status") or "").lower()]
-            if cashout_bets:
-                for cr in cashout_bets:
-                    # Look up this bet in the local ledger to see possible_win
-                    lid = str(cr.get("id") or "")
-                    local_b = next((b for b in (getattr(self, "_bets", None) or [])
-                                    if str(b.get("id") or "") == lid), None)
-                    pw = float(local_b.get("possible_win") or cr.get("win") or 0) if local_b else float(cr.get("win") or 0)
-                    stake = float(cr.get("stake") or 0)
+            cashout_rows = [r for r in rows
+                            if r.get("cashout_available")
+                            and (r.get("legs") or 0) >= 2]
+            for cr in cashout_rows:
+                lid = str(cr.get("id") or "")
+                local_b = next((b for b in (getattr(self, "_bets", None) or [])
+                                if str(b.get("id") or "") == lid), None)
+                if local_b is None:
+                    pw = float(cr.get("win") or 0)
                     self._emit_direct(gui_callback,
                                       f"💱 CASHOUT AVAILABLE on Bet #{lid}: "
-                                      f"stake KES {stake:.0f} → possible KES {pw:.0f} — "
-                                      "tap 'Sync Winnings' to check current cashout value")
-                    if self._agent_hub is not None:
-                        try:
-                            self._agent_hub.alert(
-                                "cashout",
-                                f"CASHOUT available on Bet #{lid} — "
-                                f"possible win KES {pw:.0f}. Check the app.",
-                                gui_callback=gui_callback)
-                        except Exception:
-                            pass
+                                      f"stake KES {(cr.get('stake') or 0):,.0f} → "
+                                      f"possible KES {pw:,.0f} (not in local ledger)")
+            self._auto_cashout_pass(driver, rows, gui_callback=gui_callback)
         except Exception:
             pass
         # ── Shadow bet scoring: settle any no-funds planned slips whose games
@@ -7285,6 +8966,381 @@ return out;
                           f"{summary['lost']} lost | {summary['void']} void | "
                           f"{summary['active']} active | net {summary['net_profit']:+,.2f}")
         return summary
+
+    # ── Smart cash-out: per-leg reads + thresholded auto cash-out ─────────
+    def _read_bet_leg_details(self, driver, bet_id: str, expand: bool = True,
+                              expected_legs: int = 0) -> dict:
+        """Expand the matching .bet-container card and read its per-leg rows.
+
+        Returns leg_rows (game / date / odds / market / pick / results per leg),
+        plus won / pending / finished_not_won counts and the possible win.
+        READ-ONLY: never clicks the final cash-out confirm in here.
+        The card is re-read until the expected number of leg rows are rendered.
+        """
+        result = {"leg_rows": [], "possible_win": None, "stake": None,
+                  "won": 0, "pending": 0, "finished_not_won": 0}
+        try:
+            if expand:
+                driver.execute_script(r"""
+var id = arguments[0];
+var cards = document.querySelectorAll('.bet-container');
+for (var i = 0; i < cards.length; i++) {
+    var el = cards[i].querySelector('.bet_id');
+    var t = el ? (el.innerText || '') : '';
+    if (t.indexOf(id) >= 0) {
+        try { cards[i].click(); } catch (e) {}
+        var o = cards[i].querySelector('.bet-details-opener');
+        if (o) { try { o.click(); } catch (e2) {} }
+        break;
+    }
+}
+""", bet_id)
+            ready = False
+            for _ in range(12):
+                time.sleep(0.5)
+                try:
+                    n = driver.execute_script(
+                        "var c=null; var cards=document.querySelectorAll('.bet-container');"
+                        "for(var i=0;i<cards.length;i++){var e=cards[i].querySelector('.bet_id');"
+                        "if(e&&(e.innerText||'').indexOf(arguments[0])>=0){c=cards[i];break;}}"
+                        "return c?(c.querySelectorAll('.bet-detail').length):0;", bet_id)
+                    if n and n > 0:
+                        ready = True
+                        break
+                except Exception:
+                    pass
+            if not ready:
+                return result
+            # Re-read the detail rows until the expected count is rendered so a
+            # slow Angular render can't leave us half-empty per-leg data.
+            rendered = []
+            pw_val = stake_val = None
+            for _attempt in range(4):
+                time.sleep(0.9)
+                info = driver.execute_script(r"""
+var id = arguments[0];
+var c = null;
+var cards = document.querySelectorAll('.bet-container');
+for (var i = 0; i < cards.length; i++) {
+    var e = cards[i].querySelector('.bet_id');
+    if (e && (e.innerText || '').indexOf(id) >= 0) { c = cards[i]; break; }
+}
+if (!c) return null;
+function cell(d, sel, re) {
+    var e = d.querySelector(sel);
+    if (!e) return '';
+    var s = (e.innerText || '').replace(/\s+/g, ' ').trim();
+    return re ? s.replace(re, '') : s;
+}
+var rows = [];
+c.querySelectorAll('.bet-detail').forEach(function(d) {
+    var dot = d.querySelector('.bet-prizes-status .dot, .dot');
+    var resTxt = cell(d, '.bet_results');
+    rows.push({
+        game: cell(d, '.bet_game'),
+        game_id: cell(d, '.bet_id', /Game ID\s*:?\s*/i),
+        date: cell(d, '.bet_date'),
+        odds: cell(d, '.bet_odds', /Odds\s*:?\s*/i),
+        market: cell(d, '.bet_market'),
+        pick: cell(d, '.bet_pick'),
+        results: resTxt,
+        won: (dot && (dot.className || '').indexOf('green') >= 0) ? 1 : 0
+    });
+});
+var pwEl = c.querySelector('.bet_winnings');
+var amtEl = c.querySelector('.bet_amount');
+return JSON.stringify({
+    rows: rows,
+    pw: pwEl ? (pwEl.innerText || '') : '',
+    amount: amtEl ? (amtEl.innerText || '') : ''
+});
+""", bet_id)
+                try:
+                    data = json.loads(info or "null")
+                except Exception:
+                    data = None
+                if not data:
+                    continue
+
+                def moneyz(s):
+                    m = re.search(r"([0-9][0-9,]*\.?[0-9]{0,2})", s or "")
+                    return round(float(m.group(1).replace(",", "")), 2) if m else None
+                if pw_val is None:
+                    pw_val = moneyz(data.get("pw"))
+                if stake_val is None:
+                    stake_val = moneyz(data.get("amount"))
+                rendered = []
+                for r in data.get("rows") or []:
+                    leg = {
+                        "game": r.get("game") or "",
+                        "game_id": (r.get("game_id") or "").strip(),
+                        "date": (r.get("date") or "").strip(),
+                        "odds": r.get("odds") or "",
+                        "market": r.get("market") or "",
+                        "pick": r.get("pick") or "",
+                        "results": r.get("results") or "",
+                        "won": bool(r.get("won")),
+                    }
+                    # Skip rows that haven't rendered their text yet
+                    if not (leg["game"] or leg["pick"] or leg["results"]):
+                        continue
+                    leg["finished"] = bool(leg["results"] and leg["results"] != "-")
+                    rendered.append(leg)
+                if rendered and (expected_legs <= 0 or len(rendered) >= expected_legs):
+                    break
+            result["possible_win"] = pw_val
+            result["stake"] = stake_val
+            for leg in rendered:
+                result["leg_rows"].append(leg)
+                if leg["won"]:
+                    result["won"] += 1
+                elif leg["finished"]:
+                    result["finished_not_won"] += 1
+                else:
+                    result["pending"] += 1
+        except Exception:
+            pass
+        return result
+
+    def _probe_cashout_offer(self, driver, bet_id: str) -> float | None:
+        """Click 'Request CashOut' on the card so the site exposes the current
+        cash-out value, then return it as KES. Does NOT confirm the cash-out."""
+        try:
+            clicked = False
+            for _ in range(10):
+                try:
+                    hit = driver.execute_script(r"""
+var id = arguments[0];
+var cards = document.querySelectorAll('.bet-container');
+var c = null;
+for (var i = 0; i < cards.length; i++) {
+    var e = cards[i].querySelector('.bet_id');
+    if (e && (e.innerText || '').indexOf(id) >= 0) { c = cards[i]; break; }
+}
+if (!c) return 'no-card';
+var req = c.querySelector('.bet-btn--request-cashout');
+if (!req) return 'no-request';
+try { req.click(); } catch (e) { return 'click-fail'; }
+return 'clicked';
+""", bet_id)
+                except Exception:
+                    hit = 'err'
+                if hit == 'no-request':
+                    return None
+                if hit == 'clicked':
+                    clicked = True
+                    break
+                time.sleep(0.4)
+            if not clicked:
+                return None
+            for _ in range(10):
+                time.sleep(0.5)
+                try:
+                    val = driver.execute_script(r"""
+var id = arguments[0];
+var cards = document.querySelectorAll('.bet-container');
+var c = null;
+for (var i = 0; i < cards.length; i++) {
+    var e = cards[i].querySelector('.bet_id');
+    if (e && (e.innerText || '').indexOf(id) >= 0) { c = cards[i]; break; }
+}
+if (!c) return '';
+var amt = c.querySelector('[data-qa="cashout-amount"]');
+return amt ? (amt.innerText || '') : '';
+""", bet_id)
+                except Exception:
+                    val = ''
+                m = re.search(r"([0-9][0-9,]*\.?[0-9]{0,2})", val or "")
+                if m:
+                    return round(float(m.group(1).replace(",", "")), 2)
+                try:
+                    expired = driver.execute_script(r"""
+var id = arguments[0];
+var cards = document.querySelectorAll('.bet-container');
+var c = null;
+for (var i = 0; i < cards.length; i++) {
+    var e = cards[i].querySelector('.bet_id');
+    if (e && (e.innerText || '').indexOf(id) >= 0) { c = cards[i]; break; }
+}
+if (!c) return 1;
+return c.querySelector('.bet-btn--cashout-countdown') ? 0 : 1;
+""", bet_id)
+                except Exception:
+                    expired = 1
+                if expired:
+                    # countdown lapsed -> request a fresh quote and read again
+                    try:
+                        driver.execute_script(r"""
+var id = arguments[0];
+var cards = document.querySelectorAll('.bet-container');
+for (var i = 0; i < cards.length; i++) {
+    var e = cards[i].querySelector('.bet_id');
+    if (e && (e.innerText || '').indexOf(id) >= 0) {
+        var r = cards[i].querySelector('.bet-btn--request-cashout');
+        if (r) r.click();
+        break;
+    }
+}
+""", bet_id)
+                    except Exception:
+                        pass
+        except Exception:
+            return None
+        return None
+
+    def _confirm_cashout(self, driver, bet_id: str) -> bool:
+        """Click the exposed confirm-cash-out control (data-qa="cashout-confirm").
+        Returns True when the cash-out was accepted (offer control disappears)."""
+        try:
+            from selenium.webdriver.common.alert import Alert
+        except Exception:
+            Alert = None
+        try:
+            for _ in range(3):
+                try:
+                    r = driver.execute_script(r"""
+var id = arguments[0];
+var cards = document.querySelectorAll('.bet-container');
+var c = null;
+for (var i = 0; i < cards.length; i++) {
+    var e = cards[i].querySelector('.bet_id');
+    if (e && (e.innerText || '').indexOf(id) >= 0) { c = cards[i]; break; }
+}
+if (!c) return 'no-card';
+var cf = c.querySelector('[data-qa="cashout-confirm"]');
+if (!cf) return 'no-confirm';
+var amt = cf.querySelector('[data-qa="cashout-amount"]');
+(amt || cf).click();
+return 'clicked';
+""", bet_id)
+                except Exception:
+                    r = 'err'
+                if r == 'clicked':
+                    time.sleep(2.0)
+                    if Alert is not None:
+                        try:
+                            Alert(driver).accept()
+                        except Exception:
+                            pass
+                    for _ in range(8):
+                        time.sleep(0.75)
+                        try:
+                            gone = driver.execute_script(r"""
+var id = arguments[0];
+var cards = document.querySelectorAll('.bet-container');
+var c = null;
+for (var i = 0; i < cards.length; i++) {
+    var e = cards[i].querySelector('.bet_id');
+    if (e && (e.innerText || '').indexOf(id) >= 0) { c = cards[i]; break; }
+}
+if (!c) return 1;
+return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]')) ? 0 : 1;
+""", bet_id)
+                        except Exception:
+                            gone = 1
+                        if gone:
+                            return True
+                    return True   # processed even if the card stayed visible
+                if r == 'no-confirm':
+                    self._probe_cashout_offer(driver, bet_id)
+                    time.sleep(1.0)
+                else:
+                    time.sleep(0.6)
+        except Exception:
+            pass
+        return False
+
+    def _auto_cashout_pass(self, driver, rows: list, gui_callback=None):
+        """Smart cash-out pass: for each active ledger bet where the site offers
+        a cash-out, read per-leg status, then decide under owner policy:
+          • any finished leg that didn't win → no cash-out (slip wounded)
+          • need ≥1 won leg AND ≥1 leg still playing (won ≥ pending)
+          • cash out when offer ≥ threshold × possible win
+        Emits a per-game "done / won / pending" line for the log."""
+        try:
+            if not getattr(self, "auto_cashout_enabled", True):
+                return
+            cashout_rows = [r for r in rows
+                            if r.get("cashout_available")
+                            and (r.get("legs") or 0) >= 2]
+            if not cashout_rows:
+                return
+            if not getattr(self, "_cashout_probed", None):
+                self._cashout_probed = {}
+            now = time.time()
+            for lid, cr in list({str(r.get("id")): r
+                                 for r in cashout_rows}.items())[:6]:
+                local_b = next((b for b in (getattr(self, "_bets", None) or [])
+                                if str(b.get("id") or "") == lid), None)
+                if local_b is None or (local_b.get("status") or "") not in ("active",):
+                    continue
+                if now - (self._cashout_probed.get(lid, 0.0)) < 600:
+                    continue     # don't hammer the account faster than once/10 min
+                self._cashout_probed[lid] = now
+                detail = self._read_bet_leg_details(driver, lid, expand=True,
+                                                    expected_legs=int(cr.get("legs") or 0))
+                if not detail.get("leg_rows"):
+                    continue
+                leg_line = " | ".join(
+                    f"{l.get('game') or '?'}->{('WON' if l.get('won') else ('done' if l.get('finished') else 'pend'))}"
+                    for l in detail.get("leg_rows"))
+                self._emit_direct(gui_callback, f"💱 Bet #{lid}: " + leg_line)
+                pw = detail.get("possible_win") or 0
+                won, pending, bad = (detail.get("won") or 0,
+                                     detail.get("pending") or 0,
+                                     detail.get("finished_not_won") or 0)
+                total = won + pending + bad
+                if bad > 0 and pending == 0 and won == 0:
+                    if (local_b.get("status") or "") != "lost":
+                        local_b["status"] = "lost"
+                        local_b["settled_at"] = datetime.now().isoformat(timespec="seconds")
+                        self._save_ledger()
+                        try:
+                            self._record_settled_stats(local_b)
+                        except Exception:
+                            pass
+                    self._emit_direct(gui_callback,
+                        f"❌ Bet #{lid}: all legs finished, 0 wins — pre-settled LOST "
+                        f"(stake KES {(cr.get('stake') or 0):,.2f})")
+                    continue
+                if bad > 0:
+                    self._emit_direct(gui_callback,
+                        f"⛔ Bet #{lid}: a finished leg did NOT win — cash-out abandoned "
+                        f"(won {won}, playing {pending}, finished-lost {bad})")
+                    continue
+                if pending < 1 or won < 1 or won < pending:
+                    self._emit_direct(gui_callback,
+                        f"⏸ Bet #{lid}: {won} ok / {pending} still playing of {total} — "
+                        f"holding off")
+                    continue
+                offer = self._probe_cashout_offer(driver, lid)
+                if not offer:
+                    self._emit_direct(gui_callback,
+                        f"💱 Bet #{lid}: no cash-out value shown (won {won}, pending "
+                        f"{pending}) — retry next pass")
+                    continue
+                ratio = offer / pw if pw else 0.0
+                if ratio >= self.cashout_threshold:
+                    self._emit_direct(gui_callback,
+                        f"💱 AUTO CASH-OUT Bet #{lid}: KES {offer:,.2f} = {ratio:.0%} "
+                        f"of possible KES {pw:,.2f} (≥{self.cashout_threshold:.0%}) → confirming…")
+                    if self._confirm_cashout(driver, lid):
+                        local_b["status"] = "cashed_out"
+                        local_b["settled_at"] = datetime.now().isoformat(timespec="seconds")
+                        local_b["cashed_out_amount"] = offer
+                        self._save_ledger()
+                        self._emit_direct(gui_callback,
+                            f"✅ CASHED OUT Bet #{lid}: +KES {offer:,.2f} banked "
+                            f"after {won}/{total} legs won (left: {pending})")
+                    else:
+                        self._emit_direct(gui_callback,
+                            f"⚠️ Cash-out confirm on Bet #{lid} FAILED — check the app")
+                else:
+                    self._emit_direct(gui_callback,
+                        f"⏸ Bet #{lid}: cash-out KES {offer:,.2f} = {ratio:.0%} of "
+                        f"possible — under {self.cashout_threshold:.0%} threshold, holding")
+        except Exception:
+            pass
 
     def _settle_shadow_bets(self, site_rows: list, gui_callback=None):
         """Score shadow (no-funds planned) bets against the live bet-history rows.
@@ -7714,6 +9770,56 @@ return out;
                 return None
         return None
 
+    def _near_term_cutoff(self) -> datetime:
+        """Owner rule (2026-09-22): only today's + tomorrow's fixtures are bet.
+        The extended board reaches 20+ days out; their lines get suspended or
+        drift to garbage before kick-off, so far-future legs just burn rounds
+        with 'Not valid (selection suspended/removed)'. A game whose start is
+        past the end of tomorrow never enters the pick pool."""
+        return datetime.now().replace(hour=23, minute=59, second=59, microsecond=0) + timedelta(days=1)
+
+    def _is_recent_enough(self, g) -> bool:
+        """True when g has no start time or is within the today+tomorrow window."""
+        try:
+            gst = g.get("start")
+            return gst is None or gst <= self._near_term_cutoff()
+        except Exception:
+            return True
+
+    def _ko_hhmm(self, dt) -> str:
+        """'HH:MM' kick-off label, or '' when unknown."""
+        try:
+            return dt.strftime("%H:%M") if dt else ""
+        except Exception:
+            return ""
+
+    def _ko_end_hhmm(self, dt) -> str:
+        """Estimated full-time 'HH:MM' (kick-off + ~105 min: 90' + half-time + stoppage),
+        or '' when unknown. An estimate, not a guaranteed finish time."""
+        try:
+            if not dt:
+                return ""
+            return (dt + timedelta(minutes=105)).strftime("%H:%M")
+        except Exception:
+            return ""
+
+    def _ko_epoch(self, dt) -> int:
+        """Kick-off unix epoch (0 when unknown)."""
+        try:
+            return int(dt.timestamp()) if dt else 0
+        except Exception:
+            return 0
+
+    def _ko_session_bucket(self, dt) -> str:
+        """'day' / 'night' kick-off session (used for the 10+10 day-night split)."""
+        try:
+            if not dt:
+                return "day"
+            h = dt.hour
+            return "night" if h >= 18 else "day"
+        except Exception:
+            return "day"
+
     def _scroll_to_load_more_games(self, driver, max_scrolls: int = 6,
                                    gui_callback=None) -> int:
         """Crawl the listing: scroll the page + inner containers to trigger the
@@ -7757,12 +9863,20 @@ var rows = document.querySelectorAll('.event-row:not(.event-row-header)');
 for (var r = 0; r < rows.length; r++) {
     var row = rows[r];
     var text = (row.innerText || '').replace(/\s+/g, ' ');
+    // Team containers in the current template (.event-team / competitors QA).
+    var teamEls = row.querySelectorAll('.event-team, [data-qa="prematch-event-competitors"]');
+    var teamList = [];
+    for (var t = 0; t < teamEls.length; t++) {
+        var tv = (teamEls[t].innerText || teamEls[t].getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+        if (tv) teamList.push(tv);
+    }
     var names = row.querySelectorAll('.event-names .event-text');
     var nameList = [];
     var skip = { '3 WAY': 1, '2 WAY': 1, '1X2': 1, 'MATCH': 1, 'MATCH WINNER': 1,
                  'OVER/UNDER': 1, 'OVER': 1, 'UNDER': 1, 'BOTH TEAMS TO SCORE': 1,
                  'HANDICAP': 1, 'DOUBLE CHANCE': 1, 'FIRST TEAM TO SCORE': 1,
-                 'DRAW': 1, 'YES': 1, 'NO': 1, '1': 1, '2': 1, 'X': 1 };
+                 'DRAW': 1, 'YES': 1, 'NO': 1, '1': 1, '2': 1, 'X': 1,
+                 'HOME': 1, 'AWAY': 1 };
     function firstLine(v) { return (v || '').split(/[\n\r]+/)[0].trim(); }
     function isLabel(v) {
         var up = firstLine(v).toUpperCase();
@@ -7772,8 +9886,21 @@ for (var r = 0; r < rows.length; r++) {
         var v = (names[n].innerText || '').trim();
         if (v && !names[n].classList.contains('placeholder') && !isLabel(v)) nameList.push(v);
     }
-    var home = nameList.length > 0 ? nameList[0] : '';
-    var away = nameList.length > 1 ? nameList[1] : '';
+    // Prefer real team containers; if a container's value looks like a market
+    // outcome (e.g. "1 or X", "X or 2", "NEITHER") treat it as junk.
+    function isOutcomeLike(v) {
+        var up = String(v).toUpperCase().replace(/\s+/g, ' ');
+        if (/^\d+$/.test(up) || up === 'X' || up === '1X' || up === 'X2' || up === '12') return true;
+        if (up.indexOf(' OR ') >= 0 || up.indexOf('AND') >= 0) return true;
+        if (up.indexOf('NEITHER') >= 0) return true;
+        return false;
+    }
+    var realTeams = [];
+    for (var t2 = 0; t2 < teamList.length; t2++) {
+        if (!isOutcomeLike(teamList[t2])) realTeams.push(teamList[t2]);
+    }
+    var home = realTeams.length > 0 ? realTeams[0] : (nameList.length > 0 ? nameList[0] : '');
+    var away = realTeams.length > 1 ? realTeams[1] : (nameList.length > 1 ? nameList[1] : '');
     if (!home && !away) {
         var filtered = [];
         var all = row.querySelectorAll('.event-text');
@@ -7782,6 +9909,7 @@ for (var r = 0; r < rows.length; r++) {
             var v2 = (el.innerText || '').trim();
             if (!v2 || el.classList.contains('placeholder')) continue;
             if (isLabel(v2)) continue;
+            if (isOutcomeLike(v2)) continue;
             filtered.push(v2);
         }
         home = filtered.length > 0 ? filtered[0] : '';
@@ -7879,6 +10007,10 @@ return results;
                 "under_15":     _fl("ou15")[1] if len(_fl("ou15")) > 1 else None,
                 "start": self._parse_sportpesa_kickoff(g.get("rawTime")),
                 "start_raw": g.get("rawTime") or "",
+                # ── Kickoff-time presentation + grouping fields ──────────
+                "ko_label":  self._ko_hhmm(self._parse_sportpesa_kickoff(g.get("rawTime"))),
+                "ko_epoch":  self._ko_epoch(self._parse_sportpesa_kickoff(g.get("rawTime"))),
+                "ko_session": self._ko_session_bucket(self._parse_sportpesa_kickoff(g.get("rawTime"))),
             })
         return games
 
@@ -7923,13 +10055,21 @@ return results;
         except Exception:
             pass
 
-    def _open_stats_then_close(self, driver, game_id, gui_callback=None, read_timeout: float = 4.0):
-        """Per-leg Statistics routine (what the user asked for on EVERY bet):
-        find the game row, open its H2H/Stats overlay, then close it and return
-        to the market list. Fully guarded — a failure just skips stats and never
-        blocks the market click. Returns True when stats were opened+closed."""
+    def _open_stats_then_close(self, driver, game_id, home: str = "", away: str = "",
+                               gui_callback=None, read_timeout: float = 6.0):
+        """Per-leg Statistics routine: find the game row, open its H2H/Stats
+        overlay, EXTRACT enrichment data (injuries, suspensions, weather, venue,
+        referee) from the page, cache it for downstream pick quality, ALSO parse
+        and cache both teams' form when team names are provided, then close the
+        overlay and return to the market list. Fully guarded — a failure just
+        skips stats and never blocks the market click.
+
+        Returns True when stats were opened AND at least one useful field of
+        enrichment was extracted; False on any miss/failure."""
+        found_enrichment = False
         try:
             before = len(driver.window_handles)
+            gid_str = str(game_id)
             clicked = driver.execute_script(r"""
 var gid = arguments[0];
 var rows = document.querySelectorAll('.event-row:not(.event-row-header)');
@@ -7955,25 +10095,61 @@ for (var i = 0; i < cands.length; i++) {
     }
 }
 return 'noicon';
-""", str(game_id))
+""", gid_str)
             if clicked != "clicked":
                 return False
-            # give the overlay a beat to load (its own tab), then read nothing
-            # more — we just want the stats page to be genuinely opened.
             deadline = time.time() + read_timeout
+            content = ""
+            in_new_tab = False
             while time.time() < deadline:
                 try:
                     handles = driver.window_handles
-                    if len(handles) > before:
+                    if len(handles) > before and not in_new_tab:
                         driver.switch_to.window(handles[-1])
-                        break
+                        in_new_tab = True
+                        time.sleep(1.0)
                     txt = driver.execute_script(
                         "return (document.body && document.body.innerText) || '';") or ""
-                    if "Overall Form" in txt or re.search(r"\bForm\b", txt):
-                        break
+                    if ("Overall Form" in txt or re.search(r"\bForm\b", txt)
+                            or "injury" in txt.lower() or "weather" in txt.lower()):
+                        content = txt
+                        if len(content) > 400:
+                            break
                 except Exception:
                     break
-                time.sleep(0.8)
+                time.sleep(0.7)
+            if in_new_tab and not content:
+                try:
+                    content = driver.execute_script(
+                        "return (document.body && document.body.innerText) || '';") or ""
+                except Exception:
+                    content = ""
+            if not content:
+                try:
+                    content = driver.execute_script(
+                        "return (document.body && document.body.innerText) || '';") or ""
+                except Exception:
+                    content = ""
+            if content:
+                enr = self._parse_enrichment_from_text(content)
+                if enr and (enr.get("injuries") or enr.get("suspensions")
+                            or enr.get("weather") or enr.get("venue")
+                            or enr.get("referee")):
+                    self._set_enrichment(gid_str, enr)
+                    found_enrichment = True
+                # Form: parse + cache both teams from the same overlay text, so
+                # the NEXT selection run can tilt markets by real recent results.
+                if home and away:
+                    try:
+                        parsed = self._parse_h2h_form(content, home, away) or {}
+                        e_home = parsed.get("home") or {}
+                        e_away = parsed.get("away") or {}
+                        if (e_home.get("n") or 0) >= 3:
+                            self._cache_form_entry(home, e_home)
+                        if (e_away.get("n") or 0) >= 3:
+                            self._cache_form_entry(away, e_away)
+                    except Exception:
+                        pass
             self._close_analysis_pages(driver, gui_callback=gui_callback)
             return True
         except Exception:
@@ -7981,13 +10157,17 @@ return 'noicon';
                 self._close_analysis_pages(driver, gui_callback=gui_callback)
             except Exception:
                 pass
-            return False
+            return found_enrichment
 
     def _scrape_game_enrichment(self, driver, game_id: str,
+                                home: str = "", away: str = "",
                                 gui_callback=None) -> dict:
         """Open the stats/H2H overlay for a game and extract enrichment data
         (injuries, suspensions, weather note, venue, referees) that is NOT
-        available on the main listings page.
+        available on the main listings page. When *home* and *away* team names
+        are given it ALSO parses and caches both teams' form (W/D/L + Betradar
+        rating) from the same overlay, so one click does the whole due-diligence
+        pass the owner asks for on every slip.
 
         Returns a dict with whatever was found:
           {"injuries": [...], "suspensions": [...], "weather": str,
@@ -8044,128 +10224,142 @@ return 'noicon';
                 time.sleep(0.6)
 
             if content:
-                # Extract key sections — SportPesa's Betradar overlay uses
-                # natural language snippets we can scan with simple regexes
-                low = content.lower()
-                snippet = content[:600]
-
-                # Injuries / suspensions
-                inj_lines = []
-                for line in content.splitlines():
-                    if any(kw in line.lower() for kw in
-                           ("injured", "injury", "doubt", "suspended", "suspension",
-                            "missing", "unavailable", "out ")):
-                        l = line.strip()
-                        if 5 < len(l) < 150:
-                            inj_lines.append(l)
-                if inj_lines:
-                    result["injuries"] = inj_lines[:6]
-
-                # Weather
-                for pat in (r"weather[:\s]+([^\n]{3,60})",
-                            r"(sunny|cloudy|rain|wind|snow|clear|overcast)[^\n]{0,40}"):
-                    m = re.search(pat, content, re.IGNORECASE)
-                    if m:
-                        result["weather"] = m.group(0).strip()[:80]
-                        break
-
-                # Venue
-                for pat in (r"venue[:\s]+([^\n]{3,60})",
-                            r"stadium[:\s]+([^\n]{3,60})"):
-                    m = re.search(pat, content, re.IGNORECASE)
-                    if m:
-                        result["venue"] = m.group(1).strip()[:60]
-                        break
-
-                # Referee
-                m = re.search(r"referee[:\s]+([^\n]{3,50})", content, re.IGNORECASE)
-                if m:
-                    result["referee"] = m.group(1).strip()[:50]
-
-                result["raw_snippet"] = snippet
+                result = self._parse_enrichment_from_text(content)
+                # Same form parse as _open_stats_then_close — one stats click
+                # feeds both the enrichment cache and the form cache.
+                if home and away:
+                    try:
+                        parsed = self._parse_h2h_form(content, home, away) or {}
+                        e_home = parsed.get("home") or {}
+                        e_away = parsed.get("away") or {}
+                        if (e_home.get("n") or 0) >= 3:
+                            self._cache_form_entry(home, e_home)
+                        if (e_away.get("n") or 0) >= 3:
+                            self._cache_form_entry(away, e_away)
+                    except Exception:
+                        pass
 
             self._close_analysis_pages(driver, gui_callback=gui_callback)
+            if result.get("injuries") or result.get("weather"):
+                self._set_enrichment(str(game_id), result)
         except Exception:
             try:
                 self._close_analysis_pages(driver, gui_callback=gui_callback)
             except Exception:
                 pass
         return result
-        """Per-leg Statistics routine (what the user asked for on EVERY bet):
-        find the game row, open its H2H/Stats overlay, then close it and return
-        to the market list. Fully guarded — a failure just skips stats and never
-        blocks the market click. Returns True when stats were opened+closed."""
-        try:
-            before = len(driver.window_handles)
-            clicked = driver.execute_script(r"""
-var gid = arguments[0];
-var rows = document.querySelectorAll('.event-row:not(.event-row-header)');
-var row = null;
-for (var r = 0; r < rows.length; r++) {
-    if ((rows[r].innerText || '').indexOf('ID: ' + gid) >= 0 && rows[r].offsetParent !== null) {
-        row = rows[r]; break;
-    }
-}
-if (!row) return 'norow';
-var cands = row.querySelectorAll('button, a, span, i, div, [ng-click]');
-for (var i = 0; i < cands.length; i++) {
-    var el = cands[i];
-    var hay = (((el.getAttribute('ng-click') || '') + ' ' + (el.getAttribute('class') || '') + ' ' +
-                (el.getAttribute('title') || '')).toLowerCase());
-    if (/openbetradarh2h|stats|h2h|preview|analysis/.test(hay)) {
-        try {
-            if (el.offsetParent === null) continue;
-            el.scrollIntoView({block: 'center'});
-            el.click();
-            return 'clicked';
-        } catch (e) { continue; }
-    }
-}
-return 'noicon';
-""", str(game_id))
-            if clicked != "clicked":
-                return False
-            # give the overlay a beat to load (its own tab), then read nothing
-            # more — we just want the stats page to be genuinely opened.
-            deadline = time.time() + read_timeout
-            while time.time() < deadline:
-                try:
-                    handles = driver.window_handles
-                    if len(handles) > before:
-                        driver.switch_to.window(handles[-1])
-                        break
-                    txt = driver.execute_script(
-                        "return (document.body && document.body.innerText) || '';") or ""
-                    if "Overall Form" in txt or re.search(r"\bForm\b", txt):
-                        break
-                except Exception:
-                    break
-                time.sleep(0.8)
-            self._close_analysis_pages(driver, gui_callback=gui_callback)
-            return True
-        except Exception:
-            try:
-                self._close_analysis_pages(driver, gui_callback=gui_callback)
-            except Exception:
-                pass
-            return False
 
     def _stats_per_leg(self, driver, legs, gui_callback=None):
-        """Open stats + close for every leg before selecting its market (guarded)."""
+        """Due-diligence for every chosen leg: open the H2H/Stats overlay, READ
+        the page, cache both teams' recent form + injury/weather enrichment, then
+        close. This is the owner's "are we actually reading the stats page" check
+        — it fires on EVERY slip before placement so the machine never bets a leg
+        it has not studied."""
         reviewed = 0
         missing = []
+        hazards = []
         for _o, name, gid, _mkt, _pr in (legs or []):
+            home = away = ""
+            if name and " vs " in name:
+                _parts = name.split(" vs ", 1)
+                home, away = _parts[0].strip(), (_parts[1].strip().split(" ")[0] if len(_parts) > 1 else "").strip()
             try:
-                if self._open_stats_then_close(driver, str(gid),
+                if self._open_stats_then_close(driver, str(gid), home=home, away=away,
                                                gui_callback=gui_callback):
                     reviewed += 1
+                    enr = self._enrichment_for(str(gid))
+                    if enr and (enr.get("injuries") or enr.get("suspensions")):
+                        hazards.append(f"{name}: "
+                                       + " ".join((enr.get("injuries") or [])[:1])
+                                       + (" " + " ".join((enr.get("suspensions") or [])[:1])).strip())
                 else:
                     missing.append(name)
             except Exception:
                 continue
+        if hazards:
+            self._emit_direct(gui_callback,
+                              "🩺 Due diligence (stats read per leg): " + " ⚠️ ".join(hazards[:3]))
         self._emit_direct(gui_callback,
-                          f"📊 Cross-checked form for {reviewed}/{len(legs or [])} legs"
+                          f"📊 Read stats for {reviewed}/{len(legs or [])} legs"
                           + (f" — no stats icon for {len(missing)}" if missing else ""))
+
+    def _preflight_diligence(self, driver, games, gui_callback=None,
+                             budget: int = 5, timeout: float = 40.0):
+        """BEFORE selection: open the stats/H2H overlay for the most promising
+        candidate games and truly READ the page — caching both teams' recent
+        form, injuries, suspensions & weather. The selector then has fresh
+        research (not just raw odds) to judge whether each game's pick actually
+        has a chance to win. This is the "take your time, make sure every game
+        has a real shot" pass the owner asked for. Bounded by budget + timeout;
+        never blocks — a dead browser just ends the window early."""
+        emit = self._emit_direct
+        if games is None or not (driver is not None and self._driver_is_usable(driver)):
+            return
+        t0 = time.time()
+        # Rank candidates by their single best margin-corrected win probability
+        # (pure odds maths, no browser) so we study the most likely legs first.
+        scored = []
+        for g in (games or []):
+            gid = str(g.get("id") or "")
+            nm = str(g.get("name") or "")
+            if not gid or " vs " not in nm:
+                continue
+            try:
+                used = self._used_games or {}
+                if gid in used and (used.get(gid) or {}):
+                    continue
+            except Exception:
+                pass
+            best = 0.0
+            for odds_list in (g.get("h3"), g.get("btts"), g.get("ou"), g.get("ou15")):
+                ps = self._fair_win_probs(odds_list) or []
+                if ps:
+                    best = max(best, max(ps))
+            scored.append((best, gid, nm, g))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        studied = 0
+        studied_with_hazard = 0
+        vetoed = 0
+        for _p, gid, nm, g in scored:
+            if time.time() - t0 > timeout:
+                break
+            if studied >= int(budget):
+                break
+            # Skip games already researched fresh this session — don't re-read the
+            # same overlay every round; spend the budget on games not yet studied.
+            if self._enrichment_for(gid) is not None:
+                studied += 1  # already covered (counts as studied, no re-read)
+                continue
+            home = (g.get("home") or "").strip() or (nm.split(" vs ")[0].strip() if " vs " in nm else "")
+            away = (g.get("away") or "").strip() or (nm.split(" vs ")[1].strip() if " vs " in nm else "")
+            try:
+                enr = self._scrape_game_enrichment(
+                    driver, gid, home=home, away=away, gui_callback=gui_callback)
+                if enr:
+                    # Record "studied, no hazards" too — so an already-checked game
+                    # with a clean sheet stays cached (and the selector's veto trusts
+                    # that it was genuinely read, not silently skipped).
+                    if not (enr.get("injuries") or enr.get("suspensions")):
+                        self._set_enrichment(str(gid),
+                                             {"injuries": [], "suspensions": [],
+                                              "raw_snippet": (enr.get("raw_snippet") or "")[:120],
+                                              "checked_clean": True})
+                    _veto = self._enrichment_veto(enr)
+                    if _veto:
+                        vetoed += 1
+                        emit(gui_callback, f"⛔ {nm}: pre-flight veto — {_veto}")
+                    else:
+                        studied_with_hazard += (1 if (enr.get("injuries") or enr.get("suspensions")) else 0)
+                    studied += 1
+            except Exception:
+                continue
+        if studied:
+            emit(gui_callback,
+                 f"🔎 Pre-flight researched {studied} candidate game(s) — form + injuries "
+                 f"cached before pick-building"
+                 + (f" | {studied_with_hazard} with hazard flags | {vetoed} vetoed"
+                    if (studied_with_hazard or vetoed) else " — no injury flags."))
+
 
     def _research_between_bets(self, driver, gui_callback=None, timeout: float = 45.0,
                                max_lookups: int = 2):
@@ -8395,42 +10589,103 @@ return JSON.stringify(out);
                 url = driver.current_url
             except Exception:
                 url = ""
+            # Already on a /markets page — still wait for REAL (non-placeholder)
+            # selections to hydrate before parsing (placeholder shells appear
+            # instantly, real odds take ~8-15s; parsing early yields no markets).
+            deadline = time.time() + float(timeout)
+            while time.time() < deadline:
+                try:
+                    real = driver.execute_script(
+                        "return document.querySelectorAll('.event-selection:not(.placeholder)').length;") or 0
+                    if real >= 2:
+                        break
+                except Exception:
+                    break
+                time.sleep(1)
         else:
-            try:
-                clicked = driver.execute_script(r"""
+            # The /en/games/{gid}/markets direct-URL guess is DISABLED: the display
+            # gid (e.g. 2422) is NOT the real event id (e.g. 9286411) and the real
+            # route omits the /en/ prefix, so direct navigation always lands on a
+            # broken/blank page (0 boxes — seen 100+ times in the log, ~34s wasted
+            # per leg). The only reliable entry to a game's full markets is the
+            # row's .event-more-markets arrow — go straight there. Keep gid-based
+            # arrow hunting (row id via data-id/href/`ID: <gid>` text) and NEVER
+            # parse whichever game happens to be on screen (wrong-game slips).
+            clicked = ""
+            _tried = []
+            _src_cands = [self.TODAY_GAMES_PAGE_URL]
+            if gid:
+                _src = self._gid_src.get(str(gid))
+                if _src and _src not in _src_cands:
+                    _src_cands.insert(0, _src)
+                for _u in (self.POPULAR_GAMES_URL, self.UPCOMING_GAMES_PAGE_URL,
+                           self.FOOTBALL_HOME_URL):
+                    if _u not in _src_cands:
+                        _src_cands.append(_u)
+            for _page in _src_cands:
+                if not getattr(self, "running", True):
+                    break
+                if _page == (driver.current_url or ""):
+                    pass  # already there — run the search on this page
+                elif _page not in _tried:
+                    _tried.append(_page)
+                    try:
+                        self._safe_get(driver, _page)
+                        time.sleep(1.3)
+                        if gid:
+                            self._scroll_to_load_more_games(driver, max_scrolls=2,
+                                                            gui_callback=gui_callback)
+                    except Exception:
+                        pass
+                try:
+                    clicked = driver.execute_script(r"""
 var gid = arguments[0] || null;
 var rows = document.querySelectorAll('.event-row:not(.event-row-header)');
 var target = null;
-if (gid) {
-    for (var r = 0; r < rows.length; r++) {
-        if ((rows[r].innerText || '').indexOf('ID: ' + gid) >= 0) { target = rows[r]; break; }
+function hits(r) {
+    var t = (r.innerText || '').replace(/\s+/g, ' ');
+    if (gid) {
+        if (t.indexOf('ID: ' + gid) >= 0) return true;
+        if (r.querySelector('[data-id="' + gid + '"], [data-event-id="' + gid + '"], [data-game-id="' + gid + '"], [data-gid="' + gid + '"]')) return true;
+        if (r.querySelector('a[href*="/games/' + gid + '"], a[href*="games/' + gid + '"]')) return true;
+        return false;
     }
+    return r.offsetHeight > 0;
 }
-if (!target) {
-    for (var r = 0; r < rows.length; r++) {
-        if (rows[r].offsetHeight > 0) { target = rows[r]; break; }
-    }
-}
+for (var r = 0; r < rows.length; r++) { if (hits(rows[r])) { target = rows[r]; break; } }
 if (!target) return 'norow';
 var el = target.querySelector('.event-more-markets');
 if (!el) return 'noarrow';
 el.click();
 return 'clicked';
 """, gid)
-                self._emit_direct(gui_callback,
-                                  f"↗ Full-markets opener: {clicked}"
-                                  if clicked != "clicked" else "")
-            except Exception:
-                pass
-            # wait for the /markets route + market panels to render (renderer-safe)
+                except Exception:
+                    clicked = ""
+                if clicked == "clicked":
+                    break
+            self._emit_direct(gui_callback,
+                              f"↗ Full-markets opener: {clicked}"
+                              if clicked != "clicked" else "")
+            if clicked != "clicked":
+                # The game's arrow could not be clicked on any listing. NEVER fall
+                # through to parse whichever game happens to be on screen — that is
+                # how wrong-game selections made it onto slips. Ask the caller to
+                # skip/fallback instead.
+                return {"status": "notfound", "url": "", "markets": []}
+            # wait for the /markets route + REAL selections to render. The 89
+            # .event-market shells appear instantly but are empty placeholders
+            # for ~8-15s; trusting them starts the matcher on empty DOM every
+            # time. Wait instead for hydrated non-placeholder selections.
             deadline = time.time() + float(timeout)
             while time.time() < deadline:
                 try:
                     url = driver.current_url
                     if "/games/" in url and "/markets" in url:
                         n = driver.execute_script(
-                            "return document.querySelectorAll('.event-market').length;")
-                        if n and n >= 3:
+                            "return document.querySelectorAll('.event-market').length;") or 0
+                        real = driver.execute_script(
+                            "return document.querySelectorAll('.event-selection:not(.placeholder)').length;") or 0
+                        if n and n >= 3 and real >= 2:
                             break
                 except Exception:
                     pass
@@ -8440,6 +10695,84 @@ return 'clicked';
         markets = self._extract_full_markets(driver)
         return {"status": "ok", "url": url, "markets": markets}
 
+    def _read_dc_odds_from_markets(self, markets) -> dict:
+        """Pull the DOUBLE CHANCE panel (1X / X2 / 12) off a parsed full-market
+        list. Returns {"dc_1x": float, "dc_x2": float, "dc_12": float} or {}.
+        The full-market page's DC selections always appear in the order
+        1X (idx 0), X2 (idx 1), 12 (idx 2)."""
+        try:
+            for m in (markets or []):
+                nm = (m.get("name") or "").upper()
+                if "DOUBLE CHANCE" not in nm:
+                    continue
+                dc = {}
+                sels = m.get("selections") or []
+                for key, idx in (("dc_1x", 0), ("dc_x2", 1), ("dc_12", 2)):
+                    if len(sels) > idx and sels[idx].get("odds"):
+                        dc[key] = float(sels[idx]["odds"])
+                return dc
+        except Exception:
+            pass
+        return {}
+
+    def _scrape_dc_odds(self, driver, games, gui_callback=None, max_open: int = 4):
+        """Open the full-market page of near-kickoff eligible games and read the
+        DOUBLE CHANCE odds into the game dicts (dc_1x_odds / dc_x2_odds /
+        dc_12_odds) so DC legs become selecatable from the main crawl — no
+        opportunity scout required. Rate-limited per game (fresh for 15 min)."""
+        try:
+            now = time.time()
+            cands = []
+            for g in (games or []):
+                gid = str(g.get("id") or "")
+                if not gid:
+                    continue
+                # skip already-fresh games and games too far from kickoff
+                if now - (self._dc_scrape_at or {}).get(gid, 0.0) < 900:
+                    continue
+                try:
+                    ko = g.get("start")
+                    mins = (ko - datetime.now()).total_seconds() / 60.0 if ko else 9999.0
+                except Exception:
+                    mins = 9999.0
+                if mins > 12 * 60 or mins < -10:
+                    continue
+                cands.append((mins, g))
+            cands.sort(key=lambda x: x[0])
+            opened = 0
+            deadline = time.time() + 45.0
+            for mins, g in cands:
+                if opened >= int(max_open) or time.time() > deadline \
+                        or not getattr(self, "running", True):
+                    break
+                gid = str(g.get("id") or "")
+                try:
+                    res = self._open_game_full_markets(driver, gid=gid, timeout=20,
+                                                       gui_callback=gui_callback)
+                    dc = self._read_dc_odds_from_markets(res.get("markets") or [])
+                    if dc and any(v for v in dc.values()):
+                        for k, v in dc.items():
+                            g[k + "_odds"] = v
+                        g["dc_odds_present"] = True
+                        self._emit_direct(
+                            gui_callback,
+                            f"↖ DC: {g.get('name', '')} 1X {dc.get('dc_1x')} | "
+                            f"X2 {dc.get('dc_x2')} | 12 {dc.get('dc_12')}")
+                    else:
+                        g["dc_odds_present"] = False
+                    self._dc_scrape_at[gid] = now
+                    opened += 1
+                except Exception:
+                    pass
+                # come back to the listing so the next expander click is correct
+                try:
+                    self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                    time.sleep(0.8)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _dump_full_markets_text(self, markets, max_markets: int = 40) -> list[str]:
         """Human-readable lines for the GUI log: 'MARKET — selection @ odds'."""
         lines = []
@@ -8448,6 +10781,126 @@ return 'clicked';
                 f"{s.get('name', '')} @ {s.get('odds', '')}" for s in m.get("selections") or [])
             lines.append(f"▸ {m.get('name', '').upper()}: {parts}")
         return lines
+
+    def _parse_full_market_legs(self, markets) -> list:
+        """Convert a parsed full-market list into extra selector option tuples
+        (odds, prob, market_key, suffix) for markets the listing page does NOT
+        expose: Draw No Bet, First Team To Score, and every Over/Under line.
+        Every leg is margin-corrected via _fair_win_probs so a short price never
+        sneaks in as a "safe" pick — it is judged on honest probability."""
+        extras = []
+        for m in (markets or []):
+            nm = (m.get("name") or "").upper()
+            sels = m.get("selections") or []
+            pairs = []
+            for s in sels:
+                o = s.get("odds")
+                if isinstance(o, (int, float)) and o > 1.0:
+                    pairs.append((str(s.get("name") or "").strip(), float(o)))
+            if len(pairs) < 2:
+                continue
+            # ── Draw No Bet (2-way: home / away) ──
+            if "DRAW NO BET" in nm or "DNB" in nm or "DRAW-NO-BET" in nm.replace(" ", ""):
+                ps = self._fair_win_probs([p[1] for p in pairs[:2]]) or []
+                if len(ps) >= 2:
+                    extras.append((pairs[0][1], ps[0], "dnb_home", " DNB:HOME"))
+                    extras.append((pairs[1][1], ps[1], "dnb_away", " DNB:AWAY"))
+                continue
+            # ── First Team To Score (home / away / no goal) ──
+            if "FIRST TEAM TO SCORE" in nm or "1ST TEAM TO SCORE" in nm or "FIRST GOAL" in nm:
+                ps = self._fair_win_probs([p[1] for p in pairs[:3]]) or []
+                if len(ps) >= 3:
+                    extras.append((pairs[0][1], ps[0], "ftts_home", " FTTS:HOME"))
+                    extras.append((pairs[1][1], ps[1], "ftts_away", " FTTS:AWAY"))
+                    extras.append((pairs[2][1], ps[2], "ftts_no", " FTTS:NO GOAL"))
+                continue
+            # ── Over/Under lines (any line except the 1.5/2.5 already covered) ──
+            if "OVER" in nm or "UNDER" in nm or "TOTAL" in nm or "GOALS" in nm:
+                line = None
+                lm = re.search(r"(\d+(?:\.\d+)?)", nm)
+                if lm:
+                    line = lm.group(1)
+                else:
+                    for pn, _po in pairs:
+                        lm = re.search(r"(\d+(?:\.\d+)?)", pn)
+                        if lm:
+                            line = lm.group(1)
+                            break
+                if line in (None, "1.5", "2.5"):
+                    continue  # already covered by listing (over/under/over15)
+                over_sel = under_sel = None
+                for pn, po in pairs:
+                    up = pn.upper()
+                    if "OVER" in up and over_sel is None:
+                        over_sel = po
+                    elif "UNDER" in up and under_sel is None:
+                        under_sel = po
+                if over_sel and under_sel:
+                    ps = self._fair_win_probs([over_sel, under_sel]) or []
+                    keyline = line.replace(".", "")
+                    if len(ps) >= 2:
+                        extras.append((over_sel, ps[0], f"over{keyline}",
+                                       f" O/U {line} OVER"))
+                        extras.append((under_sel, ps[1], f"under{keyline}",
+                                       f" O/U {line} UNDER"))
+                continue
+        return extras
+
+    def _scrape_full_markets_all(self, driver, games, gui_callback=None,
+                                 max_open: int = 15):
+        """Open the full-market page for the most imminent playable games and read
+        EVERY market type (Draw No Bet, First Team To Score, all O/U lines, …) into
+        each game's `_fm` extra-legs list. This gives the selector a huge range of
+        markets to exploit instead of just the 4 listing-row markets. Rate-limited
+        per game (fresh for 15 min) and bounded by max_open + a running deadline."""
+        try:
+            now = time.time()
+            deadline = time.time() + 90.0
+            cands = []
+            for g in (games or []):
+                gid = str(g.get("id") or "")
+                if not gid:
+                    continue
+                if now - (getattr(self, "_fm_scrape_at", {}) or {}).get(gid, 0.0) < 900:
+                    continue
+                try:
+                    ko = g.get("start")
+                    mins = (ko - datetime.now()).total_seconds() / 60.0 if ko else 9999.0
+                except Exception:
+                    mins = 9999.0
+                if mins > 12 * 60 or mins < -10:
+                    continue
+                cands.append((mins, g))
+            cands.sort(key=lambda x: x[0])
+            opened = 0
+            for _mins, g in cands:
+                if opened >= int(max_open) or time.time() > deadline \
+                        or not getattr(self, "running", True):
+                    break
+                gid = str(g.get("id") or "")
+                try:
+                    res = self._open_game_full_markets(driver, gid=gid, timeout=20,
+                                                       gui_callback=gui_callback)
+                    extras = self._parse_full_market_legs(res.get("markets") or [])
+                    if extras:
+                        g["_fm"] = extras
+                        self._emit_direct(
+                            gui_callback,
+                            f"🧮 {g.get('name','')}: +{len(extras)} extra markets "
+                            f"(DNB/FTTS/O-U lines) exploitable")
+                    (getattr(self, "_fm_scrape_at", {}) or {})[gid] = now
+                    if not getattr(self, "_fm_scrape_at", None):
+                        self._fm_scrape_at = {}
+                    opened += 1
+                except Exception:
+                    pass
+                try:
+                    self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                    time.sleep(0.6)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     @staticmethod
     def _fair_win_probs(odds_list) -> list | None:
@@ -8470,8 +10923,220 @@ return 'clicked';
         s = sum(ps)
         return [p / s for p in ps]
 
+    # ── Odds drift + kickoff-time awareness ──────────────────────────────
+    _MARK_ODDS_FIELD = {
+        "home": "home_odds", "away": "away_odds", "draw": "draw_odds",
+        "btts": "btts_yes", "btts_no": "btts_no",
+        "over": "over_25", "over15": "over_15", "under": "under_25",
+        "dc_1x": "home_odds", "dc_12": "home_odds", "dc_x2": "away_odds",
+        "dnb_home": "home_odds", "dnb_away": "away_odds",
+        "ftts_home": "home_odds", "ftts_away": "away_odds", "ftts_no": "home_odds",
+    }
+
+    def _load_odds_history(self) -> dict:
+        try:
+            if self.ODDS_HISTORY_PATH.exists():
+                return json.loads(self.ODDS_HISTORY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_odds_history(self):
+        try:
+            self.ODDS_HISTORY_PATH.write_text(json.dumps(self._odds_history, indent=2),
+                                              encoding="utf-8")
+        except Exception:
+            pass
+
+    def _record_odds_ticks(self, games: list):
+        """Snapshot every market's odds per game on each crawl so we can detect
+        odds drift (early price vs current price) — a strong value signal once a
+        kick-off approaches."""
+        try:
+            if self._odds_history is None:
+                self._odds_history = self._load_odds_history()
+            now = time.time()
+            changed = False
+            for g in games or []:
+                gid = str(g.get("id") or "")
+                if not gid:
+                    continue
+                rec = self._odds_history.get(gid)
+                if rec is None:
+                    rec = {"first": {}, "last": {}, "first_ts": now, "last_ts": now}
+                    self._odds_history[gid] = rec
+                kf = g.get("ko_epoch")
+                if kf is not None:
+                    rec["kickoff"] = int(kf)
+                fields = ("home_odds", "btts_yes", "over_25", "over_15",
+                          "draw_odds", "away_odds", "btts_no", "under_25")
+                if not rec.get("first"):
+                    for f in fields:
+                        v = g.get(f)
+                        if isinstance(v, (int, float)) and v > 1.0:
+                            rec["first"][f] = round(float(v), 2)
+                for f in fields:
+                    v = g.get(f)
+                    if isinstance(v, (int, float)) and v > 1.0:
+                        v = round(float(v), 2)
+                        prev = rec["last"].get(f)
+                        if prev is None or abs(prev - v) >= 0.005:
+                            rec["last"][f] = v
+                            changed = True
+                rec["last_ts"] = now
+                # Prune: drop history for games that kicked off long ago
+                try:
+                    if rec.get("kickoff") and rec["kickoff"] < now - 4 * 3600:
+                        self._odds_history.pop(gid, None)
+                except Exception:
+                    pass
+            if changed:
+                self._save_odds_history()
+        except Exception:
+            pass
+        self._sb_push_observed_games(games)
+
+    def _fishnet_pool_today(self) -> list:
+        """Collect every (game_id, market, prob) the machine bet TODAY across ALL
+        accounts — the 'fishnet': the union of every game the machine already liked,
+        ready to be bundled into one long multi-leg lottery slip per account."""
+        pool = []
+        seen = set()
+        today = datetime.now().strftime("%Y-%m-%d")
+        for b in (getattr(self, "_bets", None) or []):
+            if str(b.get("status") or "").startswith("shadow"):
+                continue
+            if float(b.get("stake") or 0) <= 0:
+                continue
+            if not str(b.get("placed_at") or "").startswith(today):
+                continue
+            gids = b.get("game_ids") or []
+            mks = b.get("markets") or []
+            probs = b.get("probs") or []
+            for i, gid in enumerate(gids):
+                gid = str(gid or "")
+                if not gid:
+                    continue
+                mk = mks[i] if i < len(mks) else ""
+                if (gid, mk) in seen:
+                    continue
+                seen.add((gid, mk))
+                prob = float(probs[i]) if i < len(probs) else 0.5
+                pool.append({"gid": gid, "market": mk, "prob": prob})
+        return pool
+
+    def _place_fishnet_bet(self, driver, phone: str, password: str, stake: float = 10,
+                           gui_callback=None, max_legs: int = 14) -> dict:
+        """Bundle every game the machine bet today (across all accounts) into ONE
+        long multi-leg lottery slip for this account. This is the 'fishnet' — it
+        catches a big payout on days when the individually-picked legs mostly land.
+
+        Re-crawls the board, matches pooled (game_id, market) pairs to still-live
+        games, clicks those exact legs, and places the long slip. Games already
+        kicked off / gone are skipped so the slip only ever contains placeable legs.
+        """
+        try:
+            pool = self._fishnet_pool_today()
+            if len(pool) < 2:
+                return {"status": "aborted", "message": "Fishnet pool too small (need 2+ games bet today)"}
+            self._ensure_bet_login(driver, phone, password, gui_callback=gui_callback)
+            self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+            time.sleep(0.8)
+            games = self._extract_dom_games(driver) or []
+            by_gid = {str(g.get("id")): g for g in games if str(g.get("id"))}
+            legs = []
+            for p in pool:
+                g = by_gid.get(p["gid"])
+                if not g:
+                    continue
+                mk = p["market"]
+                field = self._MARK_ODDS_FIELD.get(mk)
+                odds = g.get(field) if field else None
+                if not isinstance(odds, (int, float)) or odds <= 1.0:
+                    continue
+                start = g.get("start")
+                if start and (start - datetime.now()).total_seconds() < 90:
+                    continue  # about to kick off / in-play — skip
+                legs.append((float(odds), str(g.get("name") or ""), p["gid"], mk, p["prob"]))
+            if len(legs) < 3:
+                return {"status": "aborted", "message": f"Only {len(legs)} pooled games still placeable"}
+            legs = legs[:max_legs]
+            self._emit_direct(gui_callback,
+                              f"🐟 {phone} FISHNET LOTTERY: {len(legs)} pooled games → one long slip")
+            picked = self._click_selected_legs(driver, legs, gui_callback=gui_callback)
+            if picked < 2:
+                return {"status": "error", "message": f"Only {picked} fishnet legs clicked"}
+            product = 1.0
+            for o, _, _, _, _ in legs:
+                product *= o
+            res = self._open_betslip_and_place(driver, stake, phone, password,
+                                               gui_callback=gui_callback,
+                                               before_balance=0.0)
+            placed = isinstance(res, bool) and res
+            if not placed:
+                self._clear_betslip(driver, gui_callback=gui_callback)
+                return {"status": "error", "message": "Fishnet slip did not place"}
+            self._mark_legs_used(legs)
+            return {"status": "success", "message": "Fishnet placed",
+                    "legs": len(legs), "stake": stake,
+                    "odds": round(product, 2),
+                    "possible_win": round(float(stake) * product, 2),
+                    "markets": [l[3] for l in legs],
+                    "probs": [round(l[4], 4) for l in legs],
+                    "game_ids": [str(l[2]) for l in legs],
+                    "fishnet": True,
+                    "placed_at": datetime.now().isoformat(timespec="seconds")}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)[:150]}
+
+    def _drift_k(self, gid: str, mk: str, cur) -> float:
+        """Tick multiplier based on how the market actually moved since we first
+        saw the game: odds shortened (ratio > 1) = money/confidence coming in,
+        odds drifted out (ratio < 1) = backing away. Capped so it never becomes
+        the whole story — it nudges, it does not override."""
+        try:
+            rec = (self._odds_history or {}).get(str(gid))
+            if not rec:
+                return 1.0
+            start = (rec.get("first") or {}).get(self._MARK_ODDS_FIELD.get(mk, ""))
+            if not start or not cur or float(start) <= 1.0 or float(cur) <= 1.0:
+                return 1.0
+            ratio = float(start) / float(cur)
+            return max(0.92, min(1.20, ratio))
+        except Exception:
+            return 1.0
+
+    def _time_k(self, g) -> float:
+        """Momentum multiplier for games near / at kick-off. Closer to start =
+        more informed current prices (team news + weather are priced in). No
+        minimum lead is required — an imminent game is fully eligible.
+
+        2026-09-24: a match that has ALREADY kicked off is excluded outright
+        (returns 0.0). A live/started leg is unsellable junk — the odds will be
+        refused or re-graded before the slip submits, and it drags the rest of
+        the ticket down. Only pre-kick-off games can be drafted."""
+        try:
+            start = g.get("start")
+            if not start:
+                return 1.0
+            mins = (start - datetime.now()).total_seconds() / 60.0
+            if mins < -5:
+                return 0.0       # already underway — never draft a live leg
+            if mins < 0:
+                return 0.0       # kicked off in the last few minutes — equally dead
+            if mins <= 60:
+                return 1.06
+            if mins <= 180:
+                return 1.03
+            if mins <= 360:
+                return 1.01
+            return 1.0
+        except Exception:
+            return 1.0
+
     def _select_football_legs(self, games, target_min: float = 3.0, target_max: float = 6.0,
-                              odds_cap: float = 8.0, max_legs: int = 14, min_legs: int = 2,
+                              odds_cap: float = 8.0, max_legs: int = 14,
+                              min_legs: int = 2,
                               used=(), prefer_more_legs: bool = False, seed: int = 0,
                               conf_floor=None, no_odds_cap=False,
                               researched_only=False, gui_callback=None) -> tuple:
@@ -8505,6 +11170,11 @@ return 'clicked';
         used_set = set(used) if used else set()
         self._load_stats()
         per_game = {}
+        # OWNER RULE (per-SLIP, 2026-09-19): max ONE BTTS/GG leg per slip. The
+        # old engine re-armed this cap inside the per-game loop, so 3-4 GG legs
+        # could still stack (BTTS fair prob ~55-60% got it picked every kick-off).
+        # The slot must live OUTSIDE the games loop so a slip claims it exactly once.
+        btts_used_in_slip = False
         for g in games:
             gid = g.get("id", "")
             h3 = self._fair_win_probs(g.get("h3")) or []
@@ -8516,6 +11186,8 @@ return 'clicked';
             # probability itself is left untouched so calibration stays honest.
             tilt = 0.0
             nm = str(g.get("name") or "")
+            home_n = ""
+            away_n = ""
             if " vs " in nm:
                 home_n = nm.split(" vs ")[0].strip()
                 away_n = nm.split(" vs ")[1].strip()
@@ -8526,21 +11198,59 @@ return 'clicked';
                         _t = self._form_tilt_from_entries(hf, af)
                         if _t.get("weight", 0.0) > 0:
                             tilt = _t.get("home_adv", 0.0) * _t.get("weight", 0.0)
+            _enr = None
+            try:
+                _enr = self._enrichment_for(gid)
+            except Exception:
+                _enr = None
+            # Hard veto: a game with multiple injury/suspension flags or a stated
+            # key absence is dropped ENTIRELY — never bet, never even considered.
+            _veto = self._enrichment_veto(_enr or {})
+            if _veto:
+                self._emit_direct(gui_callback,
+                                  f"⛔ {g.get('name','')}: skipped — {_veto}")
+                continue
+            # Owner rule: no match repeats today, period. A game already bet in an
+            # earlier slip — on this number or any other — is dropped ENTIRELY here,
+            # before any market for it is even considered.
+            if str(gid) in used_set:
+                self._emit_direct(gui_callback,
+                                  f"⏭ {g.get('name', '')}: already bet today — "
+                                  "no match repeats across numbers")
+                continue
+            # Owner rule (2026-09-22): today+tomorrow only. Past that the book
+            # suspends/voids the line before kick-off, so far-future legs just
+            # burn the round with 'Not valid (selection suspended/removed)'.
+            if not self._is_recent_enough(g):
+                continue
+            e_k = self._enrichment_k(_enr or {}, home_n, away_n)
             options = []
             if h3 and isinstance(g.get("home_odds"), (int, float)):
                 options.append((g["home_odds"], h3[0], "home", "", 1.0 + tilt))
             if btts and isinstance(g.get("btts_yes"), (int, float)):
                 options.append((g["btts_yes"], btts[0], "btts", " BTTS:YES", 1.0 + 0.5 * tilt))
+            # ── Goals markets with Poisson/O-U calibration (#5, 2026-09-24) ──
+            # The over/under probabilities are calibrated against the book's own
+            # real O/U line (plus a Poisson rescale from the 1X2 odds for the 1.5
+            # line) so the goals legs are honest — never a raw price assumed to be
+            # a "free win". Falls back to margin-stripped listing probs.
+            _h3_for_cal = self._fair_win_probs(g.get("h3")) or []
+            _ou_for_cal = (self._fair_win_probs(g.get("ou")) or []) or ou
+            _cal_g = self._calibrated_goals_probs(g, _h3_for_cal, _ou_for_cal)
             if ou and isinstance(g.get("over_25"), (int, float)):
-                options.append((g["over_25"], ou[0], "over", " O/U 2.5 OVER", 1.0 + 0.5 * tilt))
+                p_over = (_cal_g or {}).get("over25") if _cal_g else None
+                options.append((g["over_25"], p_over or ou[0], "over",
+                                " O/U 2.5 OVER", 1.0 + 0.5 * tilt))
             # ── Over 1.5 — higher probability, lower odds ────────────────
             # If the listing page exposed an Over 1.5 line use it.  It has a
             # genuinely higher hit-rate than Over 2.5 and fills the slip when
             # Over 2.5 has too low a prob to clear the confidence floor.
             ou15_probs = self._fair_win_probs(g.get("ou15")) or []
-            if ou15_probs and isinstance(g.get("over_15"), (int, float)):
-                options.append((g["over_15"], ou15_probs[0], "over15",
-                                " O/U 1.5 OVER", 1.0 + 0.5 * tilt))
+            if isinstance(g.get("over_15"), (int, float)):
+                p_over15 = (_cal_g or {}).get("over15") if _cal_g else (ou15_probs[0] if ou15_probs else None)
+                if p_over15:
+                    options.append((g["over_15"], p_over15, "over15",
+                                    " O/U 1.5 OVER", 1.0 + 0.5 * tilt))
             # ── Extended markets: draw, away, under 2.5, BTTS:NO ─────────
             # These use margin-corrected probabilities from the same odds arrays
             # that are already scraped. They are subject to the same conf_floor
@@ -8559,7 +11269,9 @@ return 'clicked';
             if len(btts_probs) > 1 and isinstance(g.get("btts_no"), (int, float)):
                 options.append((g["btts_no"], btts_probs[1], "btts_no", " BTTS:NO", 1.0 - 0.3 * tilt))
             if len(ou_probs) > 1 and isinstance(g.get("under_25"), (int, float)):
-                options.append((g["under_25"], ou_probs[1], "under", " U/O 2.5 UNDER", 1.0 - 0.3 * tilt))
+                p_under = (_cal_g or {}).get("under25") if _cal_g else None
+                options.append((g["under_25"], p_under or ou_probs[1], "under",
+                                " U/O 2.5 UNDER", 1.0 - 0.3 * tilt))
             # ── Double Chance — 1X / X2 / 12 ────────────────────────────────
             # DC is only available from the full-market page (it's not reliably
             # visible on the listing row).  We compute the probability here for
@@ -8580,19 +11292,37 @@ return 'clicked';
                     except Exception:
                         scout_evs = {}
                 # Check if scout confirmed a DC option exists for this game
+                # Owner rule (2026-09-18, ENFORCED): when the head-to-head winner
+                # is genuinely a coin-flip (home vs away fair-prob gap is tiny),
+                # betting that raw 1X2 toss is donating edge. In that case the
+                # engine prefers the DOUBLE-CHANCE leg (1X / X2 / 12) — same
+                # kick-off, ~2/3 of all outcomes win, and the combined slip still
+                # clears the x2.50 owner floor. The boost scales smoothly with how
+                # close the toss is: the tighter the gap, the harder DC wins the
+                # selection vs the now-near-50/50 single-market bet.
+                _gap = abs(_ph - _pa) if len(h3_probs) >= 3 else 1.0
+                _dc_boost = 0.20 * max(0.0, 1.0 - min(1.0, _gap / 0.12))
                 for dc_mk, dc_p, dc_suf in (
                     ("dc_1x", dc_1x_p, " DC: 1X (Home/Draw)"),
                     ("dc_x2", dc_x2_p, " DC: X2 (Draw/Away)"),
                     ("dc_12", dc_12_p, " DC: 12 (Home/Away)"),
                 ):
-                    if dc_p < 0.58:
+                    if dc_p < 0.55:
                         continue
                     # Only include if scout has seen this game OR if real DC odds
                     # were provided directly (from full-market cache)
                     cached_odds = g.get(f"{dc_mk}_odds")
                     if cached_odds and isinstance(cached_odds, (int, float)):
                         options.append((float(cached_odds), dc_p, dc_mk,
-                                        dc_suf, 1.0))
+                                        dc_suf, 1.0 + _dc_boost))
+            # ── Full-market expansion (DNB / FTTS / extra O-U lines) ──────
+            # Every extra market the full-market scrape read off the game's
+            # /markets page. Each already carries its margin-corrected probability,
+            # so a low price is judged honestly — not treated as a free win.
+            for _o, _p, _mk, _suf in (g.get("_fm") or []):
+                if _mk in [o2[2] for o2 in options]:
+                    continue
+                options.append((_o, _p, _mk, _suf, 1.0))
             # ── Agent research injection ──
             pick_ok = False
             if hub is not None:
@@ -8639,13 +11369,29 @@ return 'clicked';
                 "over":    "goals",
                 "over15":  "goals",
                 "under":   "goals",
+                "dnb_home": "dnb",
+                "dnb_away": "dnb",
+                "ftts_home": "ftts",
+                "ftts_away": "ftts",
+                "ftts_no":  "ftts",
+                "dc_1x":   "dc",
+                "dc_x2":   "dc",
+                "dc_12":   "dc",
             }
+
+            def _mk_group(mk: str):
+                if mk in _MK_GROUPS:
+                    return _MK_GROUPS[mk]
+                if str(mk).startswith(("over", "under")):
+                    return "goals"
+                return str(mk)
+
             # Build the set of market groups already used for this game
             _used_groups_for_game = set()
             for _combo in used_set:
                 if _combo.startswith(f"{gid}|"):
                     _used_mk = _combo.split("|", 1)[1]
-                    _grp = _MK_GROUPS.get(_used_mk)
+                    _grp = _mk_group(_used_mk)
                     if _grp:
                         _used_groups_for_game.add(_grp)
 
@@ -8658,54 +11404,121 @@ return 'clicked';
                     continue
                 if not no_odds_cap and o > odds_cap:
                     continue
-                if float(p) < floor:
+                # Hard raw veto — never bet a leg the model rates below the veto, no matter
+                # how much a market weight or drift factor would pad it. In explicit
+                # long-shot mode the veto relaxes slightly (0.40) so big-odds owner
+                # tickets stay buildable, but 0.136/0.21 garbage never enters.
+                raw_veto = 0.40 if prefer_more_legs else self.RAW_LEG_VETO
+                if float(p) < raw_veto:
                     continue
                 # Block if this market's GROUP was already used for this game
-                _mk_group = _MK_GROUPS.get(mk, mk)  # fallback: treat as own group
-                if _mk_group in _used_groups_for_game:
+                _grp_here = _mk_group(mk)
+                if _grp_here in _used_groups_for_game:
                     continue
                 # Also block exact combo (legacy safety net)
                 if f"{gid}|{mk}" in used_set:
                     continue
                 if self.is_market_retired(mk):
                     continue
+                # v4+ OWNER RULE (ENFORCED 2026-09-19): max ONE BTTS/GG leg per
+                # slip. GG sits at ~55-60% fair prob so raw probability picks it
+                # for every game every kick-off, and the old engine let 3-4 GG
+                # legs stack into a single slip — then GG killed the slip far more
+                # often than it won it. This cap makes the machine diversify ON
+                # PURPOSE: a second GG leg physically cannot join the same slip.
+                if str(mk) in ("btts", "btts_no"):
+                    # OWNER RULE (2026-09-19): BTTS stays legal but only a
+                    # STRONGLY-BACKED BTTS ever gets drafted. BTTS fair prob sits
+                    # at ~55-60% (a coin-flip), so a slip that rides a bare BTTS
+                    # is a donation waiting to happen. The slip therefore only
+                    # accepts a BTTS leg when the engine's weighted confidence
+                    # clears a hard strong-support floor — anything below it is
+                    # treated as "the data does NOT highly support this" and the
+                    # leg is skipped (never a bare-dice BTTS). One BTTS max/slip.
+                    if btts_used_in_slip or float(p or 0.0) < self.BTTS_STRONG_FLOOR:
+                        continue
                 # value weighting from the Opportunity Scout
                 v_k = 1.0
                 if hub is not None:
                     v_k = hub.value_k(gid, mk)
-                # Per-account spread factor — deterministic (no Python hash salt)
+# Due-diligence weight now drives selection: market hit-rate from
+                # learning, form tilt, injury/weather, scout EV, and live odds drift
+                # all scale the probability that actually ranks legs and slips.
+                base_w = (float(p) * self._market_type_weight(mk) * form_k *
+                          v_k * e_k * self._drift_k(gid, mk, o) * self._time_k(g) *
+                          self._league_k(mk, nm))
+                if base_w < float(floor):
+                    continue
+                # Per-account spread factor — deterministic (no Python hash salt).
+                # Used ONLY as a tiebreak so parallel accounts don't all bet the
+                # identical slip when two options are truly equal.
                 jitter_mult = 1.0
                 if seed:
                     h = (int(hashlib.sha256(
                         f"{seed}|{gid}|{mk}".encode("utf-8")).hexdigest(), 16) % 1000)
                     jitter_mult = 1.0 + ((h / 1000.0) - 0.5) * 0.06
-                valid.append((o, p * self._market_type_weight(mk) * form_k * jitter_mult * v_k,
-                              p, mk, suf))
+                valid.append((o, base_w * jitter_mult, min(base_w, 0.98), mk, suf))
             if not valid:
                 continue
-            # most likely to win among the still-free markets (weighted by what we've learned)
-            valid.sort(key=lambda c: c[1], reverse=True)
+            # Pick the market with the best DILIGENCE-WEIGHTED EDGE per game —
+            # form, injuries, market hit-rate, scout EV and odds drift decide the
+            # winner, not raw price alone. We score each candidate by its
+            # expected value (p*odds - 1) and Kelly fraction (edge/(odds-1)):
+            # EV-only ranking loves low-probability long shots that meet the
+            # floor, while Kelly keeps the ranking honest about how much of the
+            # bankroll a given edge really deserves. Raw probability and account
+            # jitter are only tiebreaks.
+            def _ev_kelly(c):
+                o = c[0]
+                p = c[2]
+                ev = p * o - 1.0
+                kelly = ev / (o - 1.0) if o > 1.01 else 0.0
+                return (kelly, ev, c[2], c[1], c[0])
+            valid.sort(key=_ev_kelly, reverse=True)
             o, _w, p, mk, suf = valid[0]
+            # Claim the slip's single BTTS slot only when a BTTS leg is actually
+            # drafted for this game (walks the per-slip cap across games).
+            if str(mk) in ("btts", "btts_no"):
+                btts_used_in_slip = True
             per_game[gid] = (o, f"{g.get('name', '')}{suf}", gid, mk, p)
 
         cands = list(per_game.values())
         if len(cands) < min_legs:
-            # Not enough candidates at conf_floor — try with floor dropped to 0
-            # so the machine always has something to bet rather than skipping.
-            if conf_floor is not None and float(conf_floor) > 0:
-                return self._select_football_legs(
-                    games, target_min=target_min, target_max=target_max,
-                    odds_cap=odds_cap, max_legs=max_legs, min_legs=min_legs,
-                    used=used, prefer_more_legs=prefer_more_legs, seed=seed,
-                    conf_floor=0.0, no_odds_cap=no_odds_cap,
-                    researched_only=False, gui_callback=gui_callback)
+            # Never sacrifice quality for quantity: a half-decent product of a
+            # weak board is a donation. Skip the round instead of dropping the
+            # confidence floor to include garbage legs.
             return None, 0.0
+        # ── JEV second opinion ────────────────────────────────────────────
+        # When a JEV key is present, ask the typed-decision model one batched
+        # noul question per candidate leg and blend its probability into the
+        # win-probability used for slip ranking.  Fail-open: any error keeps
+        # the engine's own DU/PTN probabilities untouched.
+        if self._jev is not None and self._jev.enabled():
+            try:
+                _nm = {c[2]: (c[1].split(" vs ")[0] if " vs " in (c[1] or "") else c[1])
+                       for c in cands}
+                _bl = self._jev.blend_legs(
+                    [(c[2], c[3], c[0], c[4]) for c in cands], name_map=_nm)
+                if _bl:
+                    cands = [(_c[0], _c[1], _c[2], _c[3], _bl.get(f"{_c[2]}|{_c[3]}", _c[4]))
+                             for _c in cands]
+                    self._emit_direct(
+                        gui_callback,
+                        f"🧠 JEV: blended {len(_bl)} candidate leg(s) with "
+                        "second-opinion probabilities")
+                else:
+                    self._emit_direct(gui_callback,
+                                      f"🧠 JEV: no second opinions returned "
+                                      f"({self._jev.last_error or 'empty responses'})")
+            except Exception as _je:
+                self._emit_direct(gui_callback,
+                                  f"🧠 JEV blend error (ignored): {str(_je)[:70]}")
         cands.sort(key=lambda c: c[0])
         pool = cands[: min(len(cands), max_legs + 5)]
         mid = (target_min + target_max) / 2.0
         # Use exactly the target window — no hard x3 floor since the window
         # itself is now x5-x15 which is always a decent payout.
-        lo = float(target_min)
+        lo = max(self.MIN_COMBINED_ODDS, float(target_min))
         hi = target_max * 1.10
 
         import itertools
@@ -8739,8 +11552,9 @@ return 'clicked';
         if best is None and pool:
             tightest = None
             tightest_rank = None
-            # Near-miss fallback: find the closest combo to the target window.
-            floor = float(target_min) * 0.7  # allow up to 30% below target min
+            # Near-miss fallback: find the closest combo to the target window,
+            # but never below the owner's combined-odds floor (MIN_COMBINED_ODDS).
+            floor = max(self.MIN_COMBINED_ODDS, float(target_min) * 0.85)
             for size in range(min_legs, max_legs + 1):
                 if len(pool) < size:
                     break
@@ -8763,10 +11577,8 @@ return 'clicked';
 
         # ── 2-leg high-confidence shortcut ────────────────────────────────
         # When the normal window finds nothing, check if we have at least 2
-        # legs with ≥72% probability each.  A 2-leg slip at (0.72)² = 52%
-        # win rate is genuinely profitable at x3.5+ combined odds.
-        # This prevents the machine from skipping rounds when the game list
-        # has high-quality individual legs but they don't stack to x5+.
+        # legs with ≥72% weighted probability each.  A 2-leg slip at (0.72)² = 52%
+        # win rate is genuinely profitable — kept above the combined-odds floor.
         if not prefer_more_legs and len(pool) >= 2:
             best_2 = None
             best_2_rank = None
@@ -8775,7 +11587,7 @@ return 'clicked';
                 # Both legs must be high-confidence and combined odds worthwhile
                 if min(c[4] for c in combo) < 0.72:
                     continue
-                if prod_o < 3.0 or prod_o > 8.0:
+                if prod_o < self.MIN_COMBINED_ODDS or prod_o > 8.0:
                     continue
                 rank = (prod_p, prod_o)
                 if best_2_rank is None or rank > best_2_rank:
@@ -8784,22 +11596,385 @@ return 'clicked';
             if best_2:
                 return best_2
 
+        # ── Greedy minimum-odds build (owner rule 2026-09): a round must never
+        # be skipped with a solid >= x2 pickable on the table. When every window
+        # and fallback above finds nothing, ADD more games — the strongest
+        # available legs — until the slip clears the combined-odds floor
+        # (MIN_COMBINED_ODDS, which is >= x2.00). Order-agnostic so the added
+        # games are simply the best-probability picks left; the confidence floor
+        # is never lowered to include a weak leg.
+        gsorted = sorted(cands, key=lambda c: (c[4], c[0]), reverse=True)
+        g_chosen = []
+        g_prod = 1.0
+        for c in gsorted:
+            g_chosen.append(c)
+            g_prod *= c[0]
+            if len(g_chosen) >= min_legs and g_prod >= self.MIN_COMBINED_ODDS:
+                return g_chosen, g_prod
+            if len(g_chosen) >= max_legs:
+                break
+        if len(g_chosen) >= min_legs and g_prod >= self.MIN_COMBINED_ODDS:
+            return g_chosen, g_prod
+
         return None, 0.0
 
     def _click_selected_legs(self, driver, legs, gui_callback=None) -> int:
-        """Click the right per-market odd for each leg (by event ID, then market name).
+        """Click the chosen odd for every leg straight off the HYDRATED listing
+        rows (the main pages — where the prices we priced the slip from actually
+        live), then use the FULL-MARKET page only as a last-resort fallback.
 
-        If a market is NOT visible on the listing row (e.g. Over 1.5 only exists
-        on the game's full market sheet), the leg is retried by opening that
-        game's full-markets page and clicking the tool-chosen selection there,
-        then returning to the listing for the remaining legs."""
+        The betslip panel is persistent across navigation, so selections
+        accumulate into one accumulator as the tool tours the games."""
         if not getattr(self, "running", True):
             return 0
-        count = 0
-        failed = []
+        market_selected = 0
+        listing_selected = 0
+        skipped = 0
+        # ── Slip-guard: the listing tour costs a full page load per page and is
+        # exactly what wakes the SPA's silent ~7min empty re-mount. Once we already
+        # have a payable slip (>=2 live selections), STOP touring other listing
+        # pages and skip the market-page fallback — only the CURRENT page may top
+        # up remaining stragglers, and a miss is a cheap skip, not a 4-page crawl.
+        def _living(drv):
+            try:
+                return max(0, int(self._read_betslip_count(drv) or 0))
+            except Exception:
+                return -1
         for odds, name, gid, market, prob in legs:
+            if not getattr(self, "running", True):
+                break
             home = name.split(" vs ")[0].strip() if " vs " in name else str(name).strip()
-            ok = driver.execute_script(r"""
+            live_now = _living(driver)
+            enough = isinstance(live_now, int) and live_now >= 2
+            # ── Primary path: click the odd on a LISTING row (main page) ──
+            # The board's own prices came off those hydrated rows, so the same
+            # DOM has the click. Open the market page only if the row can't.
+            _ls_cands = []
+            _cur = ""
+            try:
+                _cur = driver.current_url or ""
+            except Exception:
+                _cur = ""
+            if _cur and _cur not in _ls_cands:
+                _ls_cands.append(_cur)
+            _src = self._gid_src.get(str(gid))
+            if _src and _src not in _ls_cands:
+                _ls_cands.append(_src)
+            for _u in (self.POPULAR_GAMES_URL, self.UPCOMING_GAMES_PAGE_URL,
+                       self.FOOTBALL_HOME_URL, self.TODAY_GAMES_PAGE_URL):
+                if _u not in _ls_cands:
+                    _ls_cands.append(_u)
+            if enough:
+                _ls_cands = [_cur] if _cur else _ls_cands[:1]
+            ok = False
+            for _lpage in _ls_cands:
+                if not getattr(self, "running", True):
+                    break
+                if _lpage != _cur:
+                    try:
+                        self._safe_get(driver, _lpage)
+                        # Hydration wait: listing pages sit behind "Challenge
+                        # Validation" walls / Angular hydration that render 0
+                        # event-rows for 15-30s. Running the row matcher after a
+                        # fixed 1.2s sleep only ever saw an empty DOM. Poll until
+                        # real rows appear (or timeout).
+                        _rw_deadline = time.time() + 15
+                        while time.time() < _rw_deadline:
+                            try:
+                                _rows = driver.execute_script(
+                                    "return document.querySelectorAll('.event-row:not(.event-row-header)').length;") or 0
+                                if _rows > 0:
+                                    break
+                            except Exception:
+                                pass
+                            time.sleep(0.75)
+                        self._scroll_to_load_more_games(driver, max_scrolls=2,
+                                                        gui_callback=gui_callback)
+                    except Exception:
+                        pass
+                ok = self._click_leg_on_listing_row(driver, home, gid, market)
+                if ok:
+                    listing_selected += 1
+                    self._emit_direct(gui_callback,
+                                      f"   ✅ {name} [{market}] @{odds:.2f} selected "
+                                      "(listing row)")
+                    break
+            # ── Fallback: the FULL-MARKET page (only when the row had nothing) ──
+            if not ok:
+                if enough:
+                    skipped += 1
+                    self._emit_direct(gui_callback,
+                                      f"   ⏭ {name} [{market}] not on current page — "
+                                      "skipped (slip already payable)")
+                else:
+                    time.sleep(0.5)
+                    ok = self._click_leg_on_market_page(driver, gid, home, market,
+                                                        odds, name, gui_callback=gui_callback)
+                    if not ok:
+                        time.sleep(0.8)
+                        ok = self._click_leg_on_market_page(driver, gid, home, market,
+                                                            odds, name, gui_callback=gui_callback)
+                    if ok:
+                        market_selected += 1
+                    else:
+                        skipped += 1
+                        self._emit_direct(gui_callback,
+                                          f"   ❌ {name} [{market}] not clickable "
+                                          f"(gid {gid})")
+        total = market_selected + listing_selected
+        # ── Owner rule: a "selected" click that never registered in the Angular
+        # BetslipService is a phantom — the slip looks full to us but is empty or
+        # short, which is exactly how a place step dies on "Total odds: None".
+        # Cross-check against the live slip count; a mismatch re-sweeps the same
+        # legs (the clickers skip 'picked' cells, so this only tops up the ones
+        # the SPA never counted) and re-verifies before we ever call it done.
+        real_count = self._read_betslip_count(driver)
+        if isinstance(real_count, (int, float)) and 0 <= real_count < total and \
+                getattr(self, "running", True):
+            self._emit_direct(gui_callback,
+                              f"   🧮 BetslipService shows {real_count} of {total} selections — "
+                              "topping up the ones the SPA did not register...")
+            for odds, name, gid, market, prob in legs:
+                if not getattr(self, "running", True):
+                    break
+                rc = self._read_betslip_count(driver)
+                if isinstance(rc, (int, float)) and rc >= len(legs):
+                    break
+                home = name.split(" vs ")[0].strip() if " vs " in name else str(name).strip()
+                if self._click_leg_on_listing_row(driver, home, gid, market):
+                    time.sleep(0.4)
+            time.sleep(1.0)
+            real_count = self._read_betslip_count(driver)
+        if isinstance(real_count, (int, float)) and real_count >= 0 and total != real_count:
+            total = real_count
+            skipped = max(skipped, len(legs) - total)
+        if isinstance(real_count, (int, float)) and real_count >= 0:
+            self._emit_direct(gui_callback,
+                              f"   🧮 BetslipService verified: {real_count} selection(s) live on the slip")
+        if total:
+            parts = []
+            if listing_selected:
+                parts.append(f"{listing_selected} on listing row")
+            if market_selected:
+                parts.append(f"{market_selected} on market page")
+            self._emit_direct(gui_callback,
+                f"   ✅ {total} leg(s) selected: {', '.join(parts)}"
+                + (f" | {skipped} skipped" if skipped else ""))
+        else:
+            self._emit_direct(gui_callback,
+                f"   ⚠️ No legs selected — {skipped} skipped, re-crawling in 300s")
+        return total
+
+    def _click_leg_on_market_page(self, driver, gid, home, market, odds, name,
+                                  gui_callback=None) -> bool:
+        """Open the game's FULL-MARKET page, click the tool-chosen odd there,
+        then return to Today's Games (slip survives the navigation — that is how
+        selections accumulate). Returns True when the odd was clicked."""
+        try:
+            # If we are still on a previous game's /markets page, come back to
+            # the listing first so the right game's expander gets clicked.
+            cur = ""
+            try:
+                cur = driver.current_url or ""
+            except Exception:
+                cur = ""
+            if "/markets" in cur:
+                try:
+                    self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                    time.sleep(0.8)
+                except Exception:
+                    pass
+            res = self._open_game_full_markets(driver, gid=gid, timeout=25,
+                                               gui_callback=gui_callback)
+            if res.get("status") != "ok" or not res.get("url"):
+                self._emit_direct(gui_callback,
+                                  f"   ❌ market page unavailable for {name} "
+                                  f"[{market}] (gid {gid}) — status={res.get('status')!r}")
+                return False
+            # Page-settle wait: let the full-market DOM render before
+            # attempting the execute_script click (prevents stale-element aborts).
+            time.sleep(1.2)
+            try:
+                for _ in range(12):
+                    if driver.execute_script("return document.readyState") == "complete":
+                        break
+                    time.sleep(0.15)
+            except Exception:
+                pass
+            clicked = driver.execute_script(r"""
+var market = arguments[0];
+var boxes = document.querySelectorAll('.event-market');
+function nmText(i) {
+    var el = boxes[i].querySelector('.event-market-name');
+    return el ? (el.innerText || '').trim().toUpperCase() : '';
+}
+var best = null;
+for (var i = 0; i < boxes.length; i++) {
+    if (!best) {
+        var nm = nmText(i);
+        var sels = boxes[i].querySelectorAll('.event-selection:not(.placeholder):not(.event-selection-disabled)');
+        var selTxt = '';
+        for (var s = 0; s < sels.length; s++) selTxt += ' ' + ((sels[s].innerText || '').replace(/\s+/g, ' ').trim());
+        var U = (nm + ' ' + selTxt).toUpperCase();
+        var isOver = market.indexOf('over') === 0;
+        var isUnder = market.indexOf('under') === 0;
+        var isFtts = market.indexOf('ftts_') === 0;
+        var isDnb = market.indexOf('dnb_') === 0;
+        if (market === 'home' || market === 'draw' || market === 'away') {
+            if (U.indexOf('3 WAY') < 0 && U.indexOf('1X2') < 0 && U.indexOf('MATCH WINNER') < 0) continue;
+        } else if (market === 'btts' || market === 'btts_no') {
+            if (U.indexOf('BOTH TEAMS') < 0 && U.indexOf('BTTS') < 0) continue;
+        } else if (market === 'dc_1x' || market === 'dc_x2' || market === 'dc_12') {
+            if (U.indexOf('DOUBLE CHANCE') < 0) continue;
+        } else if (isDnb) {
+            if (U.indexOf('DRAW NO BET') < 0 && U.indexOf('DNB') < 0) continue;
+        } else if (isFtts) {
+            if (U.indexOf('FIRST TEAM TO SCORE') < 0 && U.indexOf('1ST TEAM') < 0 && U.indexOf('FIRST GOAL') < 0) continue;
+        } else if (isOver || isUnder) {
+            // line is encoded in the market key: over15 -> 1.5, over35 -> 3.5.
+            // A bare 'over'/'under' means the 2.5 line (the tool default).
+            // NOTE: for a bare key lineKey is '' — do NOT let that produce
+            // "undefined." (old bug: always -1, so the box was never clicked).
+            var lineKey = market.replace(/^(over|under)/, '');
+            var lineDot = lineKey === '' ? '2.5' : (lineKey.length === 1 ? lineKey + '.0' : lineKey[0] + '.' + lineKey.slice(1));
+            if (U.indexOf('OVER') < 0 && U.indexOf('UNDER') < 0 && U.indexOf('TOTAL') < 0) continue;
+            if ((nm + ' ' + selTxt).indexOf(lineDot) < 0) continue;
+        } else {
+            if (U.indexOf('OVER') < 0 && U.indexOf('UNDER') < 0) continue;
+            var has15 = (nm + ' ' + selTxt).indexOf('1.5') >= 0;
+            var has25 = (nm + ' ' + selTxt).indexOf('2.5') >= 0;
+            if (market === 'over15') {
+                if (!has15 || has25) continue;
+            } else {
+                if (!has25) continue;
+            }
+        }
+        best = boxes[i];
+        break;
+    }
+}
+if (!best) return false;
+var sels = best.querySelectorAll('.event-selection:not(.placeholder):not(.event-selection-disabled)');
+var idx = 0;
+if (market === 'draw' || market === 'away') idx = market === 'draw' ? 1 : 2;
+else if (market === 'btts_no' || market === 'under') idx = 1;
+else if (market.indexOf('under') === 0) idx = 1;
+else if (market === 'dc_x2') idx = 1;
+else if (market === 'dc_12') idx = 2;
+else if (market === 'dnb_away') idx = 1;
+else if (market === 'ftts_away') idx = 1;
+else if (market === 'ftts_no') idx = 2;
+if (sels.length > idx) {
+    if (!sels[idx].classList.contains('event-selection-picked')) {
+        try { sels[idx].click(); } catch (e) { return false; }
+    }
+    return true;
+}
+return false;
+""", market)
+            if clicked:
+                self._emit_direct(gui_callback,
+                                  f"   ✅ {name} [{market}] @{odds:.2f} selected "
+                                  "(full-market page)")
+                try:
+                    self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                    time.sleep(0.8)
+                except Exception:
+                    pass
+                return True
+            # "We have other options too" (owner rule): the exact market box was
+            # not found on the game's full-market page. Retry the same market
+            # FAMILY by alias (3 WAY / BOTH TEAMS / OVER·UNDER / DOUBLE CHANCE /
+            # DNB / FIRST TEAM) so a renamed or recalibrated box still yields a
+            # selection instead of the round losing a leg.
+            clicked = driver.execute_script(r"""
+var market = arguments[0];
+var boxes = document.querySelectorAll('.event-market');
+function nmText(i) {
+    var el = boxes[i].querySelector('.event-market-name');
+    return el ? (el.innerText || '').trim() : '';
+}
+var isOver = market.indexOf('over') === 0;
+var isUnder = market.indexOf('under') === 0;
+var want = null;
+if (market === 'home' || market === 'draw' || market === 'away') want = ['3 WAY', '1X2', 'MATCH WINNER'];
+else if (market === 'btts' || market === 'btts_no') want = ['BOTH TEAMS', 'BTTS'];
+else if (market === 'over' || market === 'under') want = ['OVER', 'UNDER', 'TOTAL'];
+else if (market === 'over15') want = ['OVER', 'UNDER', 'TOTAL'];
+else if (market.indexOf('dc_') === 0) want = ['DOUBLE CHANCE'];
+else if (market.indexOf('dnb_') === 0) want = ['DRAW NO BET', 'DNB'];
+else if (market.indexOf('ftts_') === 0) want = ['FIRST TEAM TO SCORE', '1ST TEAM', 'FIRST GOAL'];
+if (!want) return false;
+var best = null;
+var bestText = '';
+for (var i = 0; i < boxes.length; i++) {
+    var nm = nmText(i);
+    var U = nm.toUpperCase();
+    var okName = false;
+    for (var w = 0; w < want.length; w++) {
+        if (U.indexOf(want[w]) >= 0) { okName = true; break; }
+    }
+    if (!okName) continue;
+    var sels = boxes[i].querySelectorAll('.event-selection:not(.placeholder):not(.event-selection-disabled)');
+    if (sels.length === 0) continue;
+    var selTxt = '';
+    for (var s = 0; s < sels.length; s++) selTxt += ' ' + ((sels[s].innerText || '').replace(/\s+/g, ' ').trim());
+    // CRITICAL for over/under: the aliased box MUST still be the SAME LINE the
+    // selector priced. An unverified 'OVER' match can be Over 0.5 / Over 1.5 at
+    // ~1.01 — a donation slip. Verify the line (and for over15, that it is NOT
+    // the 2.5 line) exactly like the precise matcher does.
+    if (isOver || isUnder) {
+        var lineKey = market.replace(/^(over|under)/, '');
+        var lineDot = lineKey === '' ? '2.5' : (lineKey.length === 1 ? lineKey + '.0' : lineKey[0] + '.' + lineKey.slice(1));
+        var boxTxt = (nm + ' ' + selTxt).toUpperCase();
+        if (market === 'over15') {
+            if (boxTxt.indexOf('1.5') < 0 || boxTxt.indexOf('2.5') >= 0) continue;
+        } else {
+            if (boxTxt.indexOf(lineDot) < 0) continue;
+        }
+    }
+    var idx = 0;
+    if (market === 'draw' || market === 'away') idx = market === 'draw' ? 1 : 2;
+    else if (market === 'btts_no' || market === 'under') idx = 1;
+    else if (market.indexOf('under') === 0) idx = 1;
+    else if (market === 'dc_x2') idx = 1;
+    else if (market === 'dc_12') idx = 2;
+    else if (market === 'dnb_away') idx = 1;
+    else if (market === 'ftts_away') idx = 1;
+    else if (market === 'ftts_no') idx = 2;
+    if (sels.length > idx) { best = sels[idx]; break; }
+}
+if (best) {
+    if (!best.classList.contains('event-selection-picked')) {
+        try { best.click(); } catch (e) { return false; }
+    }
+    return true;
+}
+return false;
+""", market)
+            if clicked:
+                self._emit_direct(gui_callback,
+                                  f"   ✅ {name} [{market}] @{odds:.2f} selected "
+                                  "(full-market page, aliased box)")
+                try:
+                    self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                    time.sleep(0.8)
+                except Exception:
+                    pass
+                return True
+            self._emit_direct(gui_callback,
+                              f"   ⚠️ {name} [{market}] not found on its market page.")
+            return False
+        except Exception as e:
+            self._emit_direct(gui_callback,
+                              f"   ⚠️ Market-page pick failed for {name}: {str(e)[:80]}")
+            return False
+
+    def _click_leg_on_listing_row(self, driver, home, gid, market) -> bool:
+        """Fast fallback: click the odd directly on the Today's Games listing row
+        (by event ID, then by home-team name)."""
+        try:
+            return bool(driver.execute_script(r"""
 var home = arguments[0];
 var gid = arguments[1];
 var market = arguments[2];
@@ -8851,9 +12026,17 @@ function pick(row) {
     }
     return true;
 }
+function rowHits(row) {
+    var t = (row.innerText || '').replace(/\s+/g, ' ');
+    if (gid && t.indexOf('ID: ' + gid) >= 0) return true;
+    if (gid && row.querySelector('[data-id="' + gid + '"], [data-event-id="' + gid + '"], [data-game-id="' + gid + '"], [data-gid="' + gid + '"]')) return true;
+    if (gid && row.querySelector('a[href*="/games/' + gid + '"], a[href*="games/' + gid + '"]')) return true;
+    if (!gid) return true;
+    return false;
+}
 for (var r = 0; r < rows.length; r++) {
     var row = rows[r];
-    if (gid && (row.innerText || '').indexOf('ID: ' + gid) >= 0) {
+    if (rowHits(row)) {
         if (pick(row)) return true;
     }
 }
@@ -8866,94 +12049,9 @@ for (var r = 0; r < rows.length; r++) {
     }
 }
 return false;
-""", home, gid, market)
-            if ok:
-                count += 1
-                self._emit_direct(gui_callback, f"   ✅ {name} [{market}] @{odds:.2f} selected")
-            else:
-                failed.append((odds, name, gid, market))
-                self._emit_direct(gui_callback, f"   ⚠️ {name} [{market}] not on the listing row — "
-                                                "checking its full-market page...")
-            time.sleep(0.3)
-        # ── Full-market-page fallback (owner request: use ANY market, open the
-        # market page when the selection isn't visible on the listing). ──
-        for odds, name, gid, market in failed[:4]:
-            if not getattr(self, "running", True):
-                break
-            try:
-                res = self._open_game_full_markets(driver, gid=gid, timeout=45,
-                                                   gui_callback=gui_callback)
-                if res.get("status") != "ok":
-                    continue
-                clicked = driver.execute_script(r"""
-var market = arguments[0];
-var boxes = document.querySelectorAll('.event-market');
-function nmText(i) {
-    var el = boxes[i].querySelector('.event-market-name');
-    return el ? (el.innerText || '').trim().toUpperCase() : '';
-}
-function marketQuery(nm) {
-    var q = '';
-    var line1 = false, line2 = false;
-    if (market === 'home' || market === 'draw' || market === 'away') q = '3 WAY|1X2|MATCH WINNER|MATCH';
-    else if (market === 'btts' || market === 'btts_no') q = 'BOTH TEAMS|BTTS';
-    else {
-        q = 'OVER/UNDER|OVER|UNDER';
-        if (market === 'over15') line1 = true;
-        else { line2 = true; }  // over/under default to the 2.5 line
-    }
-    var okName = false;
-    var qs = q.split('|');
-    for (var a = 0; a < qs.length; a++) {
-        if (qs[a] && nm.indexOf(qs[a]) >= 0) { okName = true; break; }
-    }
-    if (!okName) return null;
-    if (line1) {
-        // Over 1.5 — must reference a 1.5 line but not a 2.5 line
-        if (nm.indexOf('1.5') < 0 || nm.indexOf('2.5') >= 0) return null;
-    } else if (line2) {
-        // Over/Under 2.5 — prefer a 2.5 line
-        if (nm.indexOf('2.5') < 0) return null;
-    }
-    return boxes[i];
-}
-var best = null;
-for (var i = 0; i < boxes.length; i++) {
-    var m = marketQuery(nmText(i));
-    if (m) { best = m; break; }
-}
-if (!best) return false;
-var sels = best.querySelectorAll('.event-selection:not(.placeholder):not(.event-selection-disabled)');
-var idx = 0;
-if (market === 'draw') idx = 1;
-else if (market === 'away') idx = 2;
-else if (market === 'btts_no' || market === 'under') idx = 1;
-if (sels.length > idx) {
-    if (!sels[idx].classList.contains('event-selection-picked')) {
-        try { sels[idx].click(); } catch (e) { return false; }
-    }
-    return true;
-}
-return false;
-""", market)
-                if clicked:
-                    count += 1
-                    self._emit_direct(gui_callback,
-                                      f"   ✅ {name} [{market}] @{odds:.2f} selected "
-                                      "(full-market page)")
-                else:
-                    self._emit_direct(gui_callback,
-                                      f"   ⚠️ {name} [{market}] not found on its market page either")
-            except Exception as e:
-                self._emit_direct(gui_callback,
-                                  f"   ⚠️ Full-market retry failed for {name}: {str(e)[:80]}")
-            finally:
-                try:
-                    self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
-                    time.sleep(1.0)
-                except Exception:
-                    break
-        return count
+""", home, gid, market))
+        except Exception:
+            return False
 
     def _read_balance_text(self, driver) -> float:
         """Read the wallet balance from the page (skip bet figures like POSSIBLE WIN)."""
@@ -8964,9 +12062,9 @@ var ms = [];
 var m;
 while ((m = re.exec(b))) ms.push({ v: m[1].replace(/[, ]/g, ''), i: m.index });
 for (var k = 0; k < ms.length; k++) {
-    var before = b.substring(Math.max(0, ms[k].i - 40), ms[k].i).toUpperCase();
-    if (/(POSSIBLE|TOTAL|STAKE|AMOUNT|WIN|ODDS|SELEC\.?|BONUS|FREE|CASHBACK|PROMO|MINIMUM|MAXIMUM|ESTIMATED|REWARDS?|POINTS?)/.test(before)) continue;
-    return ms[k].v;
+var before = b.substring(Math.max(0, ms[k].i - 50), ms[k].i).toUpperCase();
+if (/(?:POSSIBLE|TOTAL|STAKE|AMOUNT|WIN|ODDS|SELEC.?|BONUS|FREE|CASHBACK|PROMO|MINIMUM|MAXIMUM|ESTIMATED|REWARDS?|POINTS?|CASH\s*OUT|CASEOUT|DEPOSIT|WALLET|BANK|AVAILABLE|WITHDRAW|CASH|PAYOUT|RETURN|PAYBACK|REFUND|ACCOUNT|KES\.?\s*BAL|BALANCE|KES\.\s*KES|REMAINING|SPENDABLE|LIMIT)/i.test(before)) continue;
+return ms[k].v;
 }
 return '';
 """)
@@ -9091,6 +12189,16 @@ return '';
             if ent and ent.get("confirmed"):
                 base = float(ent.get("balance") or 0)
                 source = "cached"
+        # Last resort: ANY confirmed cache entry, no matter how old, is better
+        # than shadow picks.  Only used when every live read has failed.
+        if base is None:
+            try:
+                _raw = self._load_balance_cache().get(str(phone or ""))
+                if _raw and _raw.get("confirmed"):
+                    base = float(_raw.get("balance") or 0)
+                    source = "old cache"
+            except Exception:
+                pass
         if base is None:
             return 0.0, "none"
         active_staked = sum(
@@ -9285,15 +12393,27 @@ return '';
             return {"success": False, "response": None}
         body_str = json.dumps(payload) if payload else "null"
         result = driver.execute_async_script(
-            """
+            r"""
             var done = arguments[arguments.length - 1];
+            var controller = new AbortController();
+            var fired = false;
+            function finish(payload) {
+                if (fired) return;
+                fired = true;
+                clearTimeout(watchdog);
+                done(payload);
+            }
+            // Self-abort far below the WebDriver script-timeout budget so a slow
+            // wallet route can never surface as a raw "script timeout" error.
+            var watchdog = setTimeout(function(){ finish({ok:false, status:0, data:null, error:'timeout'}); }, 9000);
             fetch(ROUTE_URL, {
                 method: METHOD, credentials: 'include',
                 headers: {'Content-Type': 'application/json'},
-                body: BODY_STR
-            }).then(function(r){ return r.json().then(function(d){ done({ok:r.ok, status:r.status, data:d}); },
-                            function(){ done({ok:r.ok, status:r.status, data:null}); }); })
-              .catch(function(e){ done({ok:false, status:0, data:null, error:e.toString()}); });
+                body: BODY_STR,
+                signal: controller.signal
+            }).then(function(r){ return r.json().then(function(d){ finish({ok:r.ok, status:r.status, data:d}); },
+                            function(){ finish({ok:r.ok, status:r.status, data:null}); }); })
+              .catch(function(e){ finish({ok:false, status:0, data:null, error:(e && e.toString()) || 'fetch-error'}); });
             """.replace("ROUTE_URL", json.dumps(routes["url"]))
                .replace("METHOD", json.dumps(routes.get("method", "POST")))
                .replace("BODY_STR", body_str)
@@ -9403,7 +12523,7 @@ return false;
         into the field first, else steer the +/- stepper reading the field itself.
         Returns the verified REAL on-slip stake (float) when good, else False.
         """
-        stake = max(10.0, round(float(stake), 2))
+        stake = max(self.MIN_STAKE, round(float(stake), 2))
         SANCTIONED = (10.0, 15.0, 20.0)
 
         # 1) type the exact amount into the real field (precise path)
@@ -9444,12 +12564,12 @@ return false;
 
         cur = self._read_stake_input(driver) or self._read_betslip_stake_derived(driver)
         ok = cur is not None and abs(cur - stake) < 1.0
-        if not ok and cur is not None and round(cur, 2) in SANCTIONED:
+        if not ok and cur is not None and round(cur, 2) >= self.MIN_STAKE:
             # The site only steps in fixed units (10/15/20). Any sanctioned
             # amount is a safe on-slip stake >= the base minimum — including
             # a boost that the site snapped BACK to 10. The boost is optional,
             # so place the real amount rather than aborting (min-10 forever).
-            ok = round(cur, 2) >= SANCTIONED[0]
+            ok = round(cur, 2) >= self.MIN_STAKE
             if ok:
                 if round(cur, 2) < round(stake, 2) - 0.5:
                     self._emit_direct(gui_callback,
@@ -9646,6 +12766,14 @@ return false;
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
+            # If the SPA bounced us to /login (auth token lapsed during the long
+            # listing tour), the bet POST died before any modal could appear.
+            # Fast-detect instead of waiting the full timeout on a dead page.
+            try:
+                if "/login" in (driver.current_url or ""):
+                    return "logged_out"
+            except Exception:
+                pass
             st = self._read_confirm_prompt(driver)
             if st.get("visible") and st.get("text"):
                 f = st.get("flags", {})
@@ -9662,6 +12790,128 @@ return false;
                 return "accepted"
             time.sleep(1)
         return "none"
+
+    def _place_step_diagnostics(self, driver) -> str:
+        """Snapshot the page the instant a placement step looks wrong, so the
+        terminal shows whether PLACE BET took us to a logged-out page, a blank
+        state, a modal we could not see, or a healthy-but-ignored slip."""
+        try:
+            snap = driver.execute_script(r"""
+var out = { href: (location.href || '').slice(0, 120),
+            title: (document.title || '').slice(0, 60) };
+out.slip_form = !!document.querySelector('form.live-betslip');
+out.amount_input = !!document.querySelector('#amount-prematch');
+out.login_form = !!document.querySelector('input[type="password"], #userName, [name="username"], [name="password"]');
+out.swal = (function(){ var s = document.querySelector('.sweet-alert, [class*="swal"]'); return s ? ((s.innerText||'').replace(/\s+/g,' ').trim().slice(0,120)) : ''; })();
+var pc = 0, els = document.querySelectorAll('a, button, div, span');
+for (var i = 0; i < els.length; i++) {
+    if (els[i].offsetHeight <= 0) continue;
+    if ((els[i].innerText || '').trim().toLowerCase() === 'place bet') pc++;
+}
+out.place_btns = pc;
+out.body_len = (document.body && document.body.innerText) ? document.body.innerText.length : -1;
+out.betslip_count = -2;
+try { var app = document.querySelector('body');
+      out.betslip_count = window.angular.element(app).injector().get('BetslipService').count() || 0; } catch (e) {}
+var bt = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+out.login_tail = bt.includes('login') || bt.includes('sign in') || bt.includes('password') ? 1 : 0;
+out.tail = bt.slice(-220);
+var ph = document.querySelector('form.live-betslip');
+out.slip_text = ph ? (ph.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 260) : '';
+return out;
+""")
+            if not snap:
+                return "diagnostics failed"
+            return ("href='%s' title='%s' slip=%s amount=%s login_form=%s "
+                    "place_btns=%s count=%s swal='%s' body=%s tail='%s' "
+                    "SLIP_TXT='%s'" % (
+                        snap.get("href"), snap.get("title"),
+                        snap.get("slip_form"), snap.get("amount_input"),
+                        snap.get("login_form"), snap.get("place_btns"),
+                        snap.get("betslip_count"), snap.get("swal"),
+                        snap.get("body_len"), snap.get("tail"),
+                        snap.get("slip_text")))
+        except Exception as e:
+            return f"diagnostics error: {str(e)[:80]}"
+
+    def _place_via_spa_service(self, driver, gui_callback=None, timeout: int = 40) -> dict:
+        """PRIMARY placement: call the SPA's own BetslipService.placeBet() in-page.
+
+        This is the exact call the human PLACE button runs and it is the ONLY path
+        observed to clear a real bet on SportPesa (verified live: slip emptied and
+        KES 10 left the balance). It uses the SPA's restrictions/CSRF/session layer,
+        so it also avoids the fragile DOM confirm dialog entirely.
+
+        Returns {"placed": bool, "detail": str}. On success the prematch betslip is
+        emptied (removeAllSelections by the SPA after a 2xx), which is how we verify."""
+        result = {"placed": False, "detail": "not attempted"}
+        try:
+            before = self._read_betslip_count(driver)
+            if not isinstance(before, (int, float)) or before < 1:
+                result["detail"] = f"slip count {before} — nothing to place"
+                return result
+            try:
+                driver.execute_script(r"""
+var app = document.querySelector('body');
+window.__spaPlace = window.__spaPlace || {state:'idle', detail:''};
+window.__spaPlace.state = 'pending';
+window.__spaPlace.detail = '';
+try {
+  var svc = window.angular.element(app).injector().get('BetslipService');
+  var p = svc.placeBet();
+  if (p && p.then) {
+    p.then(function(ok){
+        window.__spaPlace.state = 'resolved';
+        window.__spaPlace.detail = JSON.stringify(ok).slice(0,500);
+      }, function(err){
+        var d = '';
+        try { d = (err && err.data ? JSON.stringify(err.data) : '')
+                    || (err && err.message ? err.message : '') || String(err); } catch(x){ d = String(err); }
+        window.__spaPlace.state = 'rejected';
+        window.__spaPlace.detail = d.slice(0,500);
+      });
+  } else {
+    window.__spaPlace.state = 'sync';
+    window.__spaPlace.detail = String(p).slice(0,300);
+  }
+} catch(e){
+  window.__spaPlace.state = 'threw';
+  window.__spaPlace.detail = String(e).slice(0,300);
+}
+""")
+            except Exception as exc:
+                result["detail"] = f"inject error: {str(exc)[:120]}"
+                return result
+            deadline = time.time() + timeout
+            state = "pending"
+            detail = ""
+            count_now = before
+            while time.time() < deadline:
+                time.sleep(2)
+                try:
+                    cur = driver.execute_script("return window.__spaPlace || {state:'pending', detail:''};")
+                    if isinstance(cur, dict):
+                        state = cur.get("state") or state
+                        detail = cur.get("detail") or detail
+                except Exception:
+                    pass
+                try:
+                    count_now = self._read_betslip_count(driver)
+                except Exception:
+                    pass
+                if count_now == 0 or state in ("resolved", "rejected", "threw", "sync"):
+                    break
+            if count_now == 0:
+                result = {"placed": True,
+                          "detail": f"slip emptied (was {before}); spa={state}".
+                          replace("\n", " ")[:200]}
+            else:
+                result = {"placed": False,
+                          "detail": f"count still {count_now}/{before}; spa={state} {detail}".
+                          replace("\n", " ")[:220]}
+        except Exception as exc:
+            result = {"placed": False, "detail": f"place-via-spa error: {str(exc)[:140]}"}
+        return result
 
     def _click_place_bet_button(self, driver) -> bool:
         """Click the REAL PLACE BET button (the one with ng-click, not the inert wrapper)."""
@@ -9753,7 +13003,8 @@ return b.indexOf('bet successfully placed') >= 0 ||
     def _open_betslip_and_place(self, driver, stake: float, phone: str = "",
                                 password: str = "", gui_callback=None,
                                 before_balance: float = 0.0,
-                                max_attempts: int = 6) -> object:
+                                max_attempts: int = 6,
+                                legs: list = None) -> object:
         """Open the betslip, set the stake, and PLACE + CONFIRM with automatic retries.
 
         Bets sometimes fail to go through because odds change or games start while we bet.
@@ -9808,8 +13059,88 @@ return p ? p.offsetHeight : 0;
         slip_count_at_open = self._read_betslip_count(driver)
 
         consec_invalid = 0
+        minted = False
         for attempt in range(1, max_attempts + 1):
+            # If the SPA is on /login (token lapse is invisible to slip counting),
+            # re-login produces an empty betslip — hand back so the caller rebuilds.
+            try:
+                on_login = "/login" in (driver.current_url or "")
+            except Exception:
+                on_login = False
+            if on_login:
+                self._emit_direct(gui_callback,
+                                  "  🔁 On /login before placing — returning slip for fresh "
+                                  "re-login + quick rebuild (minted token).")
+                if self._clear_betslip(driver, gui_callback=gui_callback):
+                    return {"needs_legs": True, "count": 0}
+                return False
+            # ── Session-mint gate: the SPA drops a lapsed token into a silent
+            # logged-out shell on the listing URL (no /login redirect) — slip
+            # reads empty AND the page body shrinks to a bare shell (no rows).
+            # Probe those two together (a live-slip or a full listing never
+            # triggers); only then mint a fresh token, re-click the legs, and
+            # re-enter the attempt (bounded to ONE mint per call).
+            if phone and password and not minted and legs:
+                mint_now = False
+                try:
+                    mint_now = bool(driver.execute_script(r"""
+var c = -1;
+try { var app = document.querySelector('body');
+      c = window.angular.element(app).injector().get('BetslipService').count() || 0; } catch (e) {}
+var bodyLen = (document.body && document.body.innerText || '').length;
+return c === 0 && bodyLen < 40000;
+"""))
+                except Exception:
+                    mint_now = False
+                if mint_now:
+                    self._emit_direct(gui_callback,
+                                      "  🔒 Session shell (empty slip on a bare page) — "
+                                      "forcing a fresh real-login POST before PLACE.")
+                    # The shell still renders logged=\"1\" (wallet API is live, the SPA
+                    # merely lost its hydrated slip after ~7min of idle). The account
+                    # session check below short-circuits on that stale attr, so we call
+                    # the REAL login submit directly with force=True — its own page-loads
+                    # re-render every future check as genuinely authenticated.
+                    if not self._hard_spa_login(driver, phone, password,
+                                                gui_callback=gui_callback, force=True):
+                        self._emit_direct(gui_callback,
+                                          "  🔒 Forced re-login did not confirm the session — aborting.")
+                        return False
+                    minted = True
+                    re_clicked = 0
+                    for odds, name, gid, market, prob in legs:
+                        if self._read_betslip_count(driver) >= len(legs):
+                            break
+                        home = name.split(" vs ")[0].strip() if " vs " in name else str(name).strip()
+                        if self._click_leg_on_listing_row(driver, home, gid, market):
+                            re_clicked += 1
+                            time.sleep(0.3)
+                    time.sleep(0.8)
+                    self._emit_direct(gui_callback,
+                                      f"  🔒 Slip re-clicked {re_clicked} leg(s) on the fresh session")
+                    continue
             slip_count = self._read_betslip_count(driver)
+            # ── Owner rule: the site's periodic slip refresh silently strips
+            # selections whose odds it no longer holds. Instead of handing back
+            # for a costly 2-4 min board re-crawl, RE-CLICK any missing legs
+            # straight off the page we're already on (rows are here; the clickers
+            # skip already-picked cells, so this only tops up the stripped ones)
+            # and place in the same breath — the fresh slip has ~no exposed idle.
+            if legs and isinstance(slip_count, (int, float)) and 0 <= slip_count < len(legs):
+                self._emit_direct(gui_callback,
+                                  f"   🧮 Slip shrank to {slip_count} of {len(legs)} — "
+                                  "re-clicking stripped legs on the current page...")
+                for odds, name, gid, market, prob in legs:
+                    if self._read_betslip_count(driver) >= len(legs):
+                        break
+                    home = name.split(" vs ")[0].strip() if " vs " in name else str(name).strip()
+                    if self._click_leg_on_listing_row(driver, home, gid, market):
+                        time.sleep(0.4)
+                time.sleep(0.8)
+                slip_count = self._read_betslip_count(driver)
+                if isinstance(slip_count, (int, float)) and slip_count >= 0:
+                    self._emit_direct(gui_callback,
+                                      f"   🧮 BetslipService re-verified: {slip_count} selection(s)")
             # The slip is empty or shrank below 2 selections. Empty means the
             # removal prompt stripped every selection without placing — rebuild.
             if slip_count == 0 or (slip_count > 0 and slip_count < 2):
@@ -9827,12 +13158,52 @@ return p ? p.offsetHeight : 0;
                 self._emit_direct(gui_callback,
                                   f"  🛑 ABORT: could not set the stake to KES {stake:,.2f}. "
                                   "Not placing the bet with an unknown stake.")
+                self._emit_direct(gui_callback,
+                                  f"  🔬 PLACE-STATE: {self._place_step_diagnostics(driver)}")
                 return False
             # The site can step the stake (10/15/20 units) onto a real, sanctioned
             # amount different from the requested one — place at THAT real value.
             stake = float(stake_ok)
             self._emit_direct(gui_callback,
                               f"  Placing at the real on-slip stake KES {stake:,.2f}")
+            # ── Shell probe AFTER stake typing: the SPA's silent empty re-mount
+            # (~7min after login) hits WHILE we type the stake — the mint gate above
+            # ran pre-typing so it may have missed it. If the slip is now empty on a
+            # bare page, force a REAL re-login POST and re-click the legs on the
+            # fresh hydrated session, then restart this attempt (the fresh session's
+            # page-load re-renders the whole shell away). Bounded: only one force
+            # mint per attempt iteration via `minted`.
+            if phone and password and legs and not minted:
+                try:
+                    post_shell = bool(driver.execute_script(r"""
+var c = -1;
+try { var app = document.querySelector('body');
+      c = window.angular.element(app).injector().get('BetslipService').count() || 0; } catch (e) {}
+var bodyLen = (document.body && document.body.innerText || '').length;
+return c === 0 && bodyLen < 40000;
+"""))
+                except Exception:
+                    post_shell = False
+                if post_shell:
+                    self._emit_direct(gui_callback,
+                                      "  🔒 Slip went silent mid-typing (late SPA re-mount) — "
+                                      "forcing a fresh real-login POST.")
+                    if not self._hard_spa_login(driver, phone, password,
+                                                gui_callback=gui_callback, force=True):
+                        return False
+                    minted = True
+                    re_clicked = 0
+                    for odds2, name2, gid2, market2, prob2 in legs:
+                        if self._read_betslip_count(driver) >= len(legs):
+                            break
+                        home2 = name2.split(" vs ")[0].strip() if " vs " in name2 else str(name2).strip()
+                        if self._click_leg_on_listing_row(driver, home2, gid2, market2):
+                            re_clicked += 1
+                            time.sleep(0.3)
+                    time.sleep(0.8)
+                    self._emit_direct(gui_callback,
+                                      f"  🔒 Re-clicked {re_clicked} leg(s) after the late re-mount")
+                    continue
             # final re-check right before clicking PLACE. The React-bound amount field
             # (#amount-prematch) is the authoritative stake; the possible-win/odds ratio
             # carries a ~3% site boost, so it only cross-checks. Abort on disagreement —
@@ -9855,20 +13226,39 @@ return p ? p.offsetHeight : 0;
             self._emit_direct(gui_callback,
                               f"  Attempt {attempt}/{max_attempts} | Total odds: "
                               f"{totals2['odds']} | Possible win: KSH {totals2['win']}")
+            if not totals2.get("odds"):
+                # Slip reads empty at the exact moment we are about to click PLACE.
+                # Snapshot the page so we can tell a /login bounce from a logged-in
+                # page whose Angular betslip re-mounted empty.
+                self._emit_direct(gui_callback,
+                                  f"  🔬 SLIP-STATE: {self._place_step_diagnostics(driver)}")
 
-            # Final identity gate: if the session died or swapped accounts while we
-            # prepared the slip, re-login (which reloads today-games) — the slip is
-            # gone at that point, so tell the caller to rebuild from fresh games.
+            # Final identity gate: if the session died or swapped accounts while
+            # we prepared the slip, re-login. The betslip ALWAYS persists across
+            # navigation (owner rule) — a momentary count of 0 right after a
+            # re-login is the panel re-rendering, NOT a lost slip. Settle, reopen
+            # the panel and re-count before ever concluding the slip is empty.
             if phone and password:
                 if not self._assert_account_session(driver, phone, password,
                                                     gui_callback=gui_callback):
                     return False
                 if self._read_betslip_count(driver) == 0:
-                    self._emit_direct(gui_callback,
-                                      "  ↻ Slip lost after re-login — rebuilding from fresh games.")
-                    if self._clear_betslip(driver, gui_callback=gui_callback):
-                        return {"needs_legs": True, "count": 0}
-                    return False
+                    time.sleep(1.2)
+                    try:
+                        driver.execute_script("""
+var slip = document.querySelector('[data-qa="betslip-counter"]');
+if (slip) { slip.click(); }
+""")
+                    except Exception:
+                        pass
+                    time.sleep(1.5)
+                    if self._read_betslip_count(driver) == 0:
+                        self._emit_direct(gui_callback,
+                                          "  ↻ Betslip still empty after re-login — "
+                                          "rebuilding from fresh games.")
+                        if self._clear_betslip(driver, gui_callback=gui_callback):
+                            return {"needs_legs": True, "count": 0}
+                        return False
 
             if not getattr(self, "running", True):
                 self._emit_direct(gui_callback,
@@ -9876,6 +13266,22 @@ return p ? p.offsetHeight : 0;
                 return False
 
             self._emit_direct(gui_callback, "Placing bet...")
+            spa_result = self._place_via_spa_service(driver, gui_callback=gui_callback)
+            if spa_result.get("placed"):
+                self._emit_direct(gui_callback,
+                                  f"  ✅ SPA service submitted and cleared the betslip "
+                                  f"({spa_result.get('detail', '')[:160]})")
+                self._last_placed_stake = float(stake)
+                after = self._read_balance_text(driver)
+                if (before_balance > 0.0) and (after > 0.0) and (before_balance - after) >= 1.0:
+                    self._emit_direct(gui_callback,
+                                      f"✅ Balance reduced: KES {before_balance:,.2f} → "
+                                      f"KES {after:,.2f} — bet placed")
+                return True
+            self._emit_direct(gui_callback,
+                              f"  ↻ SPA service did not place "
+                              f"({spa_result.get('detail', '')[:160]}) — "
+                              "falling back to the DOM PLACE BET button")
             if not self._click_place_bet_button(driver):
                 self._emit_direct(gui_callback, "  ⚠️ PLACE BET button not found — retrying")
                 time.sleep(2)
@@ -9890,6 +13296,29 @@ return p ? p.offsetHeight : 0;
                 return False
             elif act == "none":
                 self._emit_direct(gui_callback, "  (no confirmation prompt appeared — re-checking)")
+                self._emit_direct(gui_callback,
+                                  f"  🔬 PLACE-STATE: {self._place_step_diagnostics(driver)}")
+                # If PLACE BET bounced us to /login, the session token lapsed mid-tour.
+                # Rebuilding re-logins with a minted token, so hand the slip back to
+                # the caller instead of burning attempts on a dead page.
+                try:
+                    logged_out = "/login" in (driver.current_url or "")
+                except Exception:
+                    logged_out = False
+                if logged_out:
+                    self._emit_direct(gui_callback,
+                                      "  🔁 Session lapsed to /login at PLACE — returning slip "
+                                      "for fresh re-login + quick rebuild (minted token).")
+                    if self._clear_betslip(driver, gui_callback=gui_callback):
+                        return {"needs_legs": True, "count": 0}
+                    return False
+            elif act == "logged_out":
+                self._emit_direct(gui_callback,
+                                  "  🔁 Logged out mid-place — rebuilding from a fresh login "
+                                  "so the next PLACE runs on a minted token.")
+                if self._clear_betslip(driver, gui_callback=gui_callback):
+                    return {"needs_legs": True, "count": 0}
+                return False
             elif act == "confirmed":
                 self._emit_direct(gui_callback, "  ✅ Confirm prompt accepted")
             elif act == "invalid":
