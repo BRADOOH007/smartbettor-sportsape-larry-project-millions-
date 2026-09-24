@@ -22,9 +22,11 @@ import urllib.request
 XAI_BASE_URL    = "https://api.x.ai/v1"
 GROQ_BASE_URL   = "https://api.groq.com/openai/v1"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL_XAI    = "grok-3"
 DEFAULT_MODEL_GROQ   = "openai/gpt-oss-120b"
 DEFAULT_MODEL_GEMINI = "gemini-2.0-flash"
+DEFAULT_MODEL_OPENAI = "gpt-4o-mini"
 # Akamai on Groq/xAI edges blocks the default Python-urllib signature — send a
 # real Chrome UA + accept headers exactly like the tool's stealth layer does.
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -35,6 +37,7 @@ def _detect_provider(api_key: str, model: str):
     """Detect AI provider from key prefix.
     gsk_xxx  -> Groq
     AQ.*     -> Google Gemini (openai-compatible endpoint)
+    sk-proj- -> OpenAI
     anything -> xAI Grok
     """
     key = (api_key or "").strip()
@@ -44,6 +47,9 @@ def _detect_provider(api_key: str, model: str):
     elif key.startswith("AQ.") or key.startswith("AI"):
         base = GEMINI_BASE_URL
         default_model = DEFAULT_MODEL_GEMINI
+    elif key.startswith("sk-proj-"):
+        base = OPENAI_BASE_URL
+        default_model = DEFAULT_MODEL_OPENAI
     else:
         base = XAI_BASE_URL
         default_model = DEFAULT_MODEL_XAI
@@ -58,10 +64,16 @@ class RotatingGovernor:
     Usage is identical to GrokGovernor: call _chat() or advise() directly.
     """
 
-    def __init__(self, api_keys: list, models: list = None, timeout: int = 45):
+    def __init__(self, api_keys: list, models: list = None, timeout: int = 45,
+                 max_calls_per_hour: int = 0):
         """*api_keys*: list of API keys.  *models*: optional list of model names,
-        same length as api_keys; None entries use auto-detection."""
+        same length as api_keys; None entries use auto-detection.
+        *max_calls_per_hour*: if > 0, a sliding-window cap on outbound AI calls.
+        When the cap is hit the governor suspends AI cycles (returns no-op / raises)
+        until the window rolls over — used to keep OpenAI spend bounded."""
         models = models or []
+        self._max_calls_per_hour = max(0, int(max_calls_per_hour or 0))
+        self._call_times = []          # sliding window: last successful call timestamps
         self._clients = []
         for i, key in enumerate(api_keys or []):
             key = (key or "").strip()
@@ -70,6 +82,17 @@ class RotatingGovernor:
             model = models[i] if i < len(models) else None
             self._clients.append(GrokGovernor(key, model=model, timeout=timeout))
         self._idx = 0  # current client index
+
+    def _budget_ok(self) -> bool:
+        if self._max_calls_per_hour <= 0:
+            return True
+        now = time.time()
+        cutoff = now - 3600.0
+        self._call_times = [t for t in self._call_times if t >= cutoff]
+        return len(self._call_times) < self._max_calls_per_hour
+
+    def _record_call(self):
+        self._call_times.append(time.time())
 
     def _next(self):
         """Rotate to the next client and return it."""
@@ -92,9 +115,11 @@ class RotatingGovernor:
         return self._current().api_key if self._clients else ""
 
     def _chat(self, messages, temperature: float = 0.2):
-        """Chat with automatic key rotation on 429."""
+        """Chat with automatic key rotation on 429 and a per-hour usage budget."""
         if not self._clients:
             raise RuntimeError("No AI clients configured")
+        if not self._budget_ok():
+            raise RuntimeError("AI usage budget reached for this hour — call skipped")
         last_exc = None
         for attempt in range(len(self._clients)):
             client = self._clients[(self._idx + attempt) % len(self._clients)]
@@ -102,6 +127,7 @@ class RotatingGovernor:
                 result = client._chat(messages, temperature=temperature)
                 # Success — keep using this client
                 self._idx = (self._idx + attempt) % len(self._clients)
+                self._record_call()
                 return result
             except urllib.error.HTTPError as exc:
                 if exc.code == 429:
@@ -118,15 +144,25 @@ class RotatingGovernor:
         raise RuntimeError("All AI keys failed")
 
     def advise(self, state: dict, log_tail: list, journal: list) -> dict:
-        """Delegate to the current client with rotation on failure."""
+        """Delegate to the current client with rotation on failure.
+
+        When the per-hour usage budget is exhausted the cycle returns a benign
+        no-op (the engine keeps self-governing) instead of burning a key or
+        raising — spending stays capped without tripping the worker's fail streak.
+        """
         if not self._clients:
             return {"observation": "", "ok": True, "issues": [], "actions": []}
+        if not self._budget_ok():
+            return {"observation": "AI usage budget reached for this hour — "
+                                   "AI cycle suspended (engine self-governs).",
+                    "ok": True, "issues": [], "actions": []}
         last_exc = None
         for attempt in range(len(self._clients)):
             client = self._clients[(self._idx + attempt) % len(self._clients)]
             try:
                 result = client.advise(state, log_tail, journal)
                 self._idx = (self._idx + attempt) % len(self._clients)
+                self._record_call()
                 return result
             except urllib.error.HTTPError as exc:
                 if exc.code == 429:
@@ -289,6 +325,10 @@ class GrokGovernor:
             "messages": messages,
             "temperature": temperature,
         }
+        # OpenAI bills per token — cap the response so the governor never spends
+        # more than a compact diagnostic reply needs. Others tolerate the field.
+        if self.base_url.endswith("api.openai.com/v1") or "openai" in self.base_url:
+            body["max_tokens"] = 1500
         req = urllib.request.Request(
             self.base_url + "/chat/completions",
             data=json.dumps(body).encode("utf-8"),

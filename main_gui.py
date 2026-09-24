@@ -10,6 +10,8 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
 
+import single_instance
+
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(errors="replace")
@@ -20,6 +22,15 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(errors="replace")
     except Exception:
         pass
+
+# ── Single-instance guard ─────────────────────────────────────────────
+# EVERY entry point (start_gui.py, main.py, spa_auto_start.py and each
+# PyInstaller build) imports this module, so the guard placed here runs in
+# every process that boots the tool. Whichever process grabs the named mutex
+# first continues; every later process immediately exits. Two instances of the
+# tool can never coexist, regardless of which launcher or which EXE build.
+if not single_instance.acquire():
+    single_instance.notify_and_exit()
 
 from sportsape_backend import SportsapeBackend
 from resource_path import writable_path
@@ -44,7 +55,65 @@ def set_windows_app_id(app_id: str):
         pass
 
 
-APP_VERSION = "6.0.0"
+APP_VERSION = "5.6.0"
+
+# ── Crash harness ─────────────────────────────────────────────────────
+# The GUI used to silently VANISH with no error message. These hooks make
+# sure ANY uncaught exception — main thread, worker thread, or a Tk
+# callback — is dumped to gui_crash.log next to this file so the cause is
+# never lost again.
+CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_crash.log")
+# Every terminal line is also appended verbatim to this file so runs can be
+# reviewed/inspected after the fact (same diagnostic intent as CRASH_LOG).
+TERMINAL_TEE_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_terminal.log")
+
+
+def _log_failure(source, exc):
+    try:
+        import traceback as _tb
+        with open(CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 60 + "\n")
+            f.write(f"{source} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("".join(_tb.format_exception(
+                type(exc), exc, getattr(exc, "__traceback__", None))))
+    except Exception:
+        pass
+
+
+def _install_crash_harness(root):
+    def _main_hook(tp, val, tb):
+        try:
+            _log_failure("MAIN-THREAD EXCEPTION", val)
+        finally:
+            orig = getattr(sys, "__excepthook_orig__", None) or sys.__excepthook__
+            orig(tp, val, tb)
+
+    sys.__excepthook_orig__ = sys.excepthook
+    sys.excepthook = _main_hook
+
+    def _thread_hook(args):
+        try:
+            import traceback as _tb
+            name = getattr(getattr(args, "thread", None), "name", "?")
+            _log_failure(f"THREAD CRASH ({name})", args.exc_value)
+            with open(CRASH_LOG, "a", encoding="utf-8") as f:
+                f.write("".join(_tb.format_exception(
+                    args.exc_type, args.exc_value, args.exc_traceback)))
+        except Exception:
+            pass
+
+    threading.excepthook = _thread_hook
+
+    def _tk_hook(tp, val, tb):
+        try:
+            _log_failure("TK CALLBACK", val)
+        except Exception:
+            pass
+
+    try:
+        root.report_callback_exception = _tk_hook
+    except Exception:
+        pass
 
 DARK = {
     "bg": "#111417",
@@ -121,7 +190,16 @@ class BetFlowProGUI:
         self.theme_name = os.environ.get("BETFLOW_THEME", "dark")
         self.colors = dict(DARK if self.theme_name == "dark" else LIGHT)
         set_windows_app_id(f"BetFlowPro.{APP_VERSION}")
-        self.backend = SportsapeBackend()
+        self.backend = None
+        self._backend_ready = threading.Event()
+        def _load_backend():
+            try:
+                self.backend = SportsapeBackend()
+            except Exception:
+                pass
+            self._backend_ready.set()
+        self._backend_thread = threading.Thread(target=_load_backend, daemon=True)
+        self._backend_thread.start()
         self.state = AppState()
         self.bus = EventBus()
         self._stop_event = None
@@ -130,13 +208,46 @@ class BetFlowProGUI:
         root.title(f"⚽ BetFlow Pro v{APP_VERSION} — SportPesa Auto-Bet Machine")
         root.configure(bg=self.colors["bg"])
         root.geometry(self._center_geometry(1080, 760))
-        self._set_app_icon()
         self._build_ui()
         self._load_settings()
-        self._refresh_ledger()
+        # Icon is deferred so the HWND exists and paint is not blocked
+        try:
+            root.after(20, self._set_app_icon)
+        except Exception:
+            self._set_app_icon()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._log_lines = []
+        self._last_emit_key = None
+        self._last_emit_time = 0
         self._pump()
+        # Roll-over visibility: top-bar chip + param checkbox sync
+        try:
+            def _sync_roll_chip(*_a):
+                try:
+                    on = bool(self.roll_over_var.get())
+                    if on:
+                        self.roll_chip.config(text="⚡ ROLL-OVER 50/3", fg=self.colors["accent"])
+                    else:
+                        self.roll_chip.config(text="● NORMAL", fg=self.colors["muted"])
+                    # keep the action-row toggle button in step with the variable
+                    btn = getattr(self, "roll_btn", None)
+                    if btn is not None:
+                        btn.config(bg=self.colors["accent"] if on else self.colors["button_bg"],
+                                   fg="#0a1420" if on else self.colors["button_fg"])
+                except Exception:
+                    pass
+            self.roll_over_var.trace_add("write", _sync_roll_chip)
+            _sync_roll_chip()
+            # re-sync after settings load (after 300ms, settings already loaded in _load_settings)
+            root.after(400, _sync_roll_chip)
+        except Exception:
+            pass
+        # Defer heavy ledger I/O so the window paints instantly — fixes
+        # "Not Responding" on double-click. Ledger loads ~50ms after paint.
+        try:
+            root.after(50, self._refresh_ledger)
+        except Exception:
+            self._refresh_ledger()
         # Auto-sync on startup: settle any bets that finished while the tool was
         # closed. Fires 3 s after launch so the UI has time to fully render first.
         # Only runs if phone + password are already saved in settings.
@@ -200,6 +311,66 @@ class BetFlowProGUI:
             except Exception:
                 try:
                     self.root.iconbitmap(default=ico_abs)
+                except Exception:
+                    pass
+            # Deterministic taskbar-button icon: the button's icon is driven by
+            # WM_SETICON/class-icon on THIS window's HWND — broadcasts only nudge
+            # the theme cache into redrawing, which is exactly why the feather
+            # keeps winning intermittently.  Load the .ico as a real HICON and
+            # push it straight to our own HWND (small=taskbar, big=alt-tab).
+            if sys.platform == "win32":
+                try:
+                    import ctypes as _ct
+                    from ctypes import wintypes
+
+                    # winfo_id() -> HWND of the child widget; the window that
+                    # actually OWNS the taskbar button is the root ancestor of that
+                    # child (GA_ROOT = 2). GetParent() on the child returns the
+                    # frame window, not the toplevel — that mismatch is exactly why
+                    # the taskbar kept showing the stock Tk "feather" instead of the
+                    # balance icon. We climb to GA_ROOT and then also pin an explicit
+                    # AppUserModelID so Windows groups the button under this app and
+                    # re-reads its icon from the EXE resource on relaunch.
+                    try:
+                        _child = self.root.winfo_id()
+                        hwnd = ctypes.windll.user32.GetAncestor(_child, 2)  # GA_ROOT
+                    except Exception:
+                        try:
+                            hwnd = self.root.winfo_id()
+                        except Exception:
+                            hwnd = None
+                    if not hwnd:
+                        hwnd = None
+                    try:
+                        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                            "SportsApe.BetflowProAuto")
+                    except Exception:
+                        pass
+                    if hwnd:
+                        IMAGE_ICON = 1
+                        LR_LOADFROMFILE = 0x0010
+                        LR_DEFAULTSIZE = 0x0040
+                        WM_SETICON = 0x0080
+                        ICON_SMALL = 0
+                        ICON_BIG = 1
+                        try:
+                            hsm = ctypes.windll.user32.LoadImageW(
+                                None, ico_abs, IMAGE_ICON, 0, 0,
+                                LR_LOADFROMFILE | LR_DEFAULTSIZE)
+                            if hsm:
+                                ctypes.windll.user32.SendMessageW(
+                                    hwnd, WM_SETICON, ICON_SMALL, hsm)
+                        except Exception:
+                            pass
+                        try:
+                            hbg = ctypes.windll.user32.LoadImageW(
+                                None, ico_abs, IMAGE_ICON, 0, 0,
+                                LR_LOADFROMFILE | LR_DEFAULTSIZE)
+                            if hbg:
+                                ctypes.windll.user32.SendMessageW(
+                                    hwnd, WM_SETICON, ICON_BIG, hbg)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             # Tell Windows to refresh its shell icon cache for this window.
@@ -270,10 +441,19 @@ class BetFlowProGUI:
     def _pump(self):
         try:
             for kind, payload in self.bus.drain():
-                self._handle_event(kind, payload)
-            self._tick()
+                try:
+                    self._handle_event(kind, payload)
+                except Exception as exc:
+                    _log_failure(f"EVENT HANDLER ({kind})", exc)
+            try:
+                self._tick()
+            except Exception as exc:
+                _log_failure("TICK", exc)
         finally:
-            self.root.after(120, self._pump)  # ~8fps — sufficient, saves CPU vs 60ms
+            try:
+                self.root.after(120, self._pump)  # ~8fps — sufficient, saves CPU vs 60ms
+            except Exception:
+                pass
 
     def _handle_event(self, kind, payload):
         if kind == "log":
@@ -315,6 +495,112 @@ class BetFlowProGUI:
             self._last_ready_refresh = now
             self._refresh_jackpot_ready()
             self._update_per_phone_balances()
+        now = time.time()
+        if now - getattr(self, "_last_phone_reconcile", 0.0) > 8.0:
+            self._last_phone_reconcile = now
+            self._reconcile_phone_list()
+        if now - getattr(self, "_last_mem_watch", 0.0) > 60.0:
+            self._last_mem_watch = now
+            self._watch_memory()
+
+    def _process_mem_mb(self):
+        """Current process RAM in MB (Windows). Returns 0 if unavailable."""
+        if not _HAS_CTYPES:
+            return 0
+        try:
+            import ctypes as _c
+
+            class _PMC(_c.Structure):
+                _fields_ = [("cb", _c.c_ulong),
+                            ("PageFaultCount", _c.c_ulong),
+                            ("PeakWorkingSetSize", _c.c_size_t),
+                            ("WorkingSetSize", _c.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", _c.c_size_t),
+                            ("QuotaPagedPoolUsage", _c.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", _c.c_size_t),
+                            ("QuotaNonPagedPoolUsage", _c.c_size_t),
+                            ("PagefileUsage", _c.c_size_t),
+                            ("PeakPagefileUsage", _c.c_size_t),
+                            ("PrivateUsage", _c.c_size_t)]
+
+            hproc = _c.windll.kernel32.GetCurrentProcess()
+            pmc = _PMC()
+            ok = _c.windll.psapi.GetProcessMemoryInfo(
+                hproc, _c.byref(pmc), _c.sizeof(pmc))
+            if not ok:
+                return 0
+            return (pmc.WorkingSetSize or 0) / (1024.0 * 1024.0)
+        except Exception:
+            return 0
+
+    def _watch_memory(self):
+        """Memory creep is the classic cause of the window silently vanishing
+        (each phone worker owns its own Chrome). Warn early and sweep orphan
+        browsers so a freshly added number never tips the process over."""
+        try:
+            mb = self._process_mem_mb()
+            if mb <= 0:
+                return
+            if mb >= 1600:
+                self._append_log(
+                    f"🛑 WARNING: app using ~{mb:.0f} MB. This is the danger zone "
+                    f"where the window silently closes. Sweeping orphan browsers "
+                    f"now and recommending a restart.")
+                try:
+                    self.backend._sweep_orphan_chromedrivers(gui_callback=self._emit,
+                                                             aggressive=False)
+                except Exception:
+                    pass
+            elif mb >= 1100:
+                self._append_log(
+                    f"⚠️ Memory high (~{mb:.0f} MB). Sweeping orphaned browsers "
+                    f"to make room for new phone workers.")
+                try:
+                    self.backend._sweep_orphan_chromedrivers(gui_callback=self._emit,
+                                                             aggressive=False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _reconcile_phone_list(self):
+        """While the machine is running, diffs the phone box against the
+        backend's active phone list. Newly typed numbers get a dedicated
+        worker; removed numbers wind their worker down. Engine reads
+        _engine_state['phones'] inside its own supervisor loop."""
+        try:
+            if not getattr(self.backend, "running", False):
+                return
+            if not self.state.worker_busy.get("bet"):
+                return
+            new_phones = [str(p) for p in self._phone_list() if str(p).strip()]
+            if not new_phones:
+                return
+            es = getattr(self.backend, "_engine_state", None)
+            if es is None:
+                return
+            old = [str(p) for p in (es.get("phones") or []) if str(p).strip()]
+            added = [p for p in new_phones if p not in old]
+            removed = [p for p in old if p not in new_phones]
+            if not added and not removed:
+                return
+            es["phones"] = list(new_phones)
+            for p in added:
+                self._append_log(f"➕ {p} ADDED to the phone list — its worker will "
+                                 f"start on the next round.")
+                try:
+                    notify.toast("Phone list update", f"➕ {p} added")
+                except Exception:
+                    pass
+            for p in removed:
+                self._append_log(f"➖ {p} REMOVED from the phone list — winding "
+                                 f"down its worker now.")
+                try:
+                    notify.toast("Phone list update", f"➖ {p} removed")
+                except Exception:
+                    pass
+        except Exception:
+            _log_failure("PHONE RECONCILE", sys.exc_info()[1])
 
     def _refresh_jackpot_ready(self):
         """Live 'Mega / Midweek jackpot — picks ready' alert fed by the idle
@@ -370,10 +656,6 @@ class BetFlowProGUI:
             prev = self.status_chip.cget("text")
             self.status_chip.config(text="🎉 WIN! 💰", fg="#ffd75e")
             self.balance_label.config(fg="#ffd75e")
-            try:
-                self.root.bell()
-            except Exception:
-                pass
 
             def _settle():
                 try:
@@ -397,6 +679,10 @@ class BetFlowProGUI:
         self.status_chip = tk.Label(top, text="● IDLE", fg=c["muted"], bg=c["panel"],
                                     font=("Consolas", 11, "bold"))
         self.status_chip.pack(side="left")
+
+        self.roll_chip = tk.Label(top, text="● NORMAL", fg=c["muted"], bg=c["panel"],
+                                  font=("Consolas", 10, "bold"))
+        self.roll_chip.pack(side="left", padx=(12, 0))
 
         self.balance_label = tk.Label(top, text="Balance: —", fg=c["accent"], bg=c["panel"],
                                       font=("Consolas", 11, "bold"))
@@ -442,14 +728,14 @@ class BetFlowProGUI:
         account = tk.LabelFrame(tab, text="  Account(s)  ", bg=c["panel"], fg=c["accent"],
                                 font=("Segoe UI", 9, "bold"),
                                 labelanchor="nw", bd=1, relief=tk.GROOVE)
-        account.pack(fill="x", pady=(0, 8))
+        account.pack(fill="x", pady=(0, 5))
 
         arow = tk.Frame(account, bg=c["panel"])
-        arow.pack(fill="x", padx=8, pady=6)
+        arow.pack(fill="x", padx=8, pady=3)
         arow.columnconfigure(1, weight=1)
         tk.Label(arow, text="Phone (one per line):", bg=c["panel"], fg=c["muted"],
                  font=("Segoe UI", 9)).grid(row=0, column=0, sticky="nw", padx=(0, 8), pady=4)
-        self.phone_text = scrolledtext.ScrolledText(arow, height=3, width=32,
+        self.phone_text = scrolledtext.ScrolledText(arow, height=1, width=32,
                                                     bg=c["text_bg"], fg=c["text_fg"],
                                                     insertbackground=c["text_fg"],
                                                     relief=tk.FLAT, bd=0,
@@ -470,7 +756,7 @@ class BetFlowProGUI:
         self.password_entry.pack(anchor="w", padx=(0, 8), pady=(2, 0), ipady=4)
         self.show_pw_btn = self._styled_button(arow, "👁", self._toggle_show_pw,
                                                width=3, font=("Segoe UI", 10))
-        self.show_pw_btn.grid(row=0, column=3, sticky="n", pady=18)
+        self.show_pw_btn.grid(row=0, column=3, sticky="n", pady=14)
 
         # ── Lock In button — saves phone numbers so they auto-load on next launch ──
         self.lock_in_var = tk.BooleanVar(value=False)
@@ -482,23 +768,24 @@ class BetFlowProGUI:
             selectcolor="#1a3a1a",
             activebackground=c["panel"],
             activeforeground=c["fg"],
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 8, "bold"),
             cursor="hand2",
         )
-        self.lock_in_btn.grid(row=0, column=4, sticky="n", padx=(8, 0), pady=18)
+        self.lock_in_btn.grid(row=0, column=4, sticky="n", padx=(8, 0), pady=14)
 
         self.sync_btn = self._styled_button(arow, "🔄 Sync Winnings",
                                             self.start_sync_winnings,
-                                            bg=c["accent"], fg="#0a1420", width=16)
-        self.sync_btn.grid(row=0, column=5, sticky="n", padx=(8, 0), pady=18)
+                                            bg=c["accent"], fg="#0a1420", width=11,
+                                            font=("Segoe UI", 8, "bold"))
+        self.sync_btn.grid(row=0, column=5, sticky="n", padx=(8, 0), pady=14)
         self.history_btn = self._styled_button(arow, "📋 Live History",
                                                self.show_live_bet_history,
-                                               bg=c["button_bg"], width=14,
-                                               font=("Segoe UI", 9, "bold"))
-        self.history_btn.grid(row=0, column=6, sticky="n", padx=(4, 0), pady=18)
+                                               bg=c["button_bg"], width=10,
+                                               font=("Segoe UI", 8, "bold"))
+        self.history_btn.grid(row=0, column=6, sticky="n", padx=(4, 0), pady=14)
 
         params = tk.Frame(tab, bg=c["bg"])
-        params.pack(fill="x", pady=(0, 8))
+        params.pack(fill="x", pady=(0, 4))
         self._field(params, "Stake KES", "stake_var", "10", 0, 0)
         self._field(params, "Every (min)", "cadence_var", "60", 0, 1)
         self._field(params, "Daily cap (0=∞)", "daily_var", "20", 0, 2)
@@ -506,7 +793,7 @@ class BetFlowProGUI:
         self._field(params, "Stake % (0=fixed)", "pct_var", "0", 1, 1)
 
         self.chain_var = tk.BooleanVar(value=True)
-        self.autostart_var = tk.BooleanVar(value=False)
+        self.autostart_var = tk.BooleanVar(value=True)
         self.longshot_var = tk.BooleanVar(value=True)
         self.headless_var = tk.BooleanVar(value=True)
         chain_chk = tk.Checkbutton(params, text="🧲 Chain slips (hungry)",
@@ -529,11 +816,24 @@ class BetFlowProGUI:
                                 selectcolor=c["panel"], activebackground=c["bg"],
                                 activeforeground=c["fg"], font=("Segoe UI", 9))
         hd_chk.grid(row=2, column=1, sticky="w", padx=2)
+        # ── ROLL-OVER mode (owner rule): KES 50 @ ~x3.00 odds, exactly 3 legs,
+        # twice a day. Lives as a compact toggle button next to MID POT in the
+        # action row — an in-parameter full-width chip ate terminal height
+        # every launch, so it moved out of the params grid. ─────────────────
+        self.roll_over_var = tk.BooleanVar(value=False)
         self._field(params, "LS legs (0=off)", "ls_legs_var", "14", 3, 0)
         self._field(params, "LS x min", "ls_min_var", "15", 3, 1)
         self._field(params, "LS x max", "ls_max_var", "60", 3, 2)
         self._field(params, "Auto-withdraw KES (0=off)", "withdraw_var", "200", 4, 0)
         self._field(params, "Deposit KES (M-Pesa)", "deposit_var", "99", 4, 1)
+        self.cashout_var = tk.BooleanVar(value=True)
+        self.cashout_pct_var = tk.StringVar(value="75")
+        tk.Checkbutton(params, text="💱 Auto cash-out",
+                       variable=self.cashout_var, bg=c["bg"], fg=c["fg"],
+                       selectcolor=c["panel"], activebackground=c["bg"],
+                       activeforeground=c["fg"], font=("Segoe UI", 9, "bold")).grid(
+                       row=4, column=2, sticky="w", padx=14)
+        self._field(params, "CO min % (0-100)", "cashout_pct_var", "75", 5, 2)
         self.notify_var = tk.BooleanVar(value=True)
         tk.Checkbutton(params, text="🔔 Sounds + toasts",
                        variable=self.notify_var, bg=c["bg"], fg=c["fg"],
@@ -542,65 +842,72 @@ class BetFlowProGUI:
                        row=5, column=0, sticky="w", padx=2, pady=(6, 0))
         self._field(params, "Jackpot KES", "jackpot_stake_var", "99", 5, 1)
 
-        # ── Markets to bet — owner toggles; all on by default. The selector
-        # then only builds legs from the ticked market groups (e.g. switch to
-        # O/U 1.5 + O/U 2.5 only, or drop BTTS). ─────────────────────────
+        # ── Markets to bet — kept as always-on defaults; the on-screen toggles
+        # were removed to give the terminal more vertical area. All markets stay
+        # enabled (selector builds legs from every group below). ─────────────
         self.mk_vars = {
             "1x2": tk.BooleanVar(value=True),
             "btts": tk.BooleanVar(value=True),
             "ou25": tk.BooleanVar(value=True),
             "ou15": tk.BooleanVar(value=True),
         }
-        mrow = tk.Frame(params, bg=c["bg"])
-        mrow.grid(row=6, column=0, columnspan=3, sticky="w", padx=2, pady=(6, 0))
-        tk.Label(mrow, text="Bet on:", bg=c["bg"], fg=c["fg"],
-                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 6))
-        for _mk, _txt in (("1x2", "1X2"), ("btts", "BTTS"),
-                          ("ou25", "O/U 2.5"), ("ou15", "O/U 1.5")):
-            tk.Checkbutton(mrow, text=_txt, variable=self.mk_vars[_mk],
-                           bg=c["bg"], fg=c["fg"], selectcolor=c["panel"],
-                           activebackground=c["bg"], activeforeground=c["fg"],
-                           font=("Segoe UI", 9)).pack(side="left", padx=3)
+        self.bet_on_label = tk.Label(params, text="Betting on: 1X2 · BTTS · O/U 2.5 · O/U 1.5 (all)",
+                                     bg=c["bg"], fg=c["muted"], font=("Segoe UI", 8))
+        self.bet_on_label.grid(row=6, column=0, columnspan=3, sticky="w", padx=2, pady=(1, 0))
 
         ctl = tk.Frame(tab, bg=c["bg"])
-        ctl.pack(fill="x", pady=(0, 8))
-        self.start_btn = self._styled_button(ctl, "▶  START BET MACHINE",
+        ctl.pack(fill="x", pady=(0, 4))
+        _bfont = ("Segoe UI", 8, "bold")
+        _mfont = ("Segoe UI", 8)
+        self.start_btn = self._styled_button(ctl, "▶ START",
                                              self.start_bet_machine,
-                                             bg=c["ok"], fg="#04110a", width=24)
-        self.start_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self.stop_btn = self._styled_button(ctl, "■  EMERGENCY STOP",
+                                             bg=c["ok"], fg="#04110a", width=10,
+                                             font=_bfont)
+        self.start_btn.grid(row=0, column=0, sticky="w", padx=(0, 4))
+        self.stop_btn = self._styled_button(ctl, "■ STOP",
                                             self.emergency_stop,
-                                            bg=c["err"], fg="white", width=20)
+                                            bg=c["err"], fg="white", width=9,
+                                            font=_bfont)
         self.stop_btn.config(state="disabled")
-        self.stop_btn.grid(row=0, column=1, sticky="w", padx=(0, 8))
-        self.check_balance_btn = self._styled_button(ctl, "⚡ Balance Check",
+        self.stop_btn.grid(row=0, column=1, sticky="w", padx=(0, 4))
+        self.check_balance_btn = self._styled_button(ctl, "⚡ Balance",
                                                      self.start_balance_check,
-                                                     bg=c["button_bg"], width=16)
-        self.check_balance_btn.grid(row=0, column=2, sticky="w", padx=(0, 8))
+                                                     bg=c["button_bg"], width=9,
+                                                     font=_bfont)
+        self.check_balance_btn.grid(row=0, column=2, sticky="w", padx=(0, 4))
         self.withdraw_btn = self._styled_button(ctl, "💸 Withdraw",
                                                 self.start_withdraw_flow,
                                                 bg=c["accent_dark"], fg="#201800",
-                                                width=14)
-        self.withdraw_btn.grid(row=0, column=3, sticky="w", padx=(0, 8))
-        self.deposit_btn = self._styled_button(ctl, "💵 Deposit (M-Pesa)",
+                                                width=9, font=_bfont)
+        self.withdraw_btn.grid(row=0, column=3, sticky="w", padx=(0, 4))
+        self.deposit_btn = self._styled_button(ctl, "💵 Deposit",
                                                self.start_deposit_flow,
-                                               bg="#1f7a33", fg="white", width=16)
-        self.deposit_btn.grid(row=0, column=4, sticky="w", padx=(0, 8))
-        self.mega_btn = self._styled_button(ctl, "🎰 MEGA POT",
+                                               bg="#1f7a33", fg="white", width=9,
+                                               font=_bfont)
+        self.deposit_btn.grid(row=0, column=4, sticky="w", padx=(0, 4))
+        self.mega_btn = self._styled_button(ctl, "🎰 MEGA",
                                             self.start_mega_pot,
-                                            bg="#8a5a00", fg="#ffe08a", width=13)
-        self.mega_btn.grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0))
-        self.mid_btn = self._styled_button(ctl, "🀄 MID POT",
+                                            bg="#8a5a00", fg="#ffe08a", width=8,
+                                            font=_bfont)
+        self.mega_btn.grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(3, 0))
+        self.mid_btn = self._styled_button(ctl, "🀄 MID",
                                            self.start_mid_pot,
-                                           bg="#5b3d8f", fg="#e8dcff", width=13)
-        self.mid_btn.grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
-        self.form_btn = self._styled_button(ctl, "📈 Form cache",
-                                            self.show_form_cache, width=13, font=("Segoe UI", 9),
+                                           bg="#5b3d8f", fg="#e8dcff", width=8,
+                                           font=_bfont)
+        self.mid_btn.grid(row=1, column=1, sticky="w", padx=(0, 4), pady=(3, 0))
+        self.form_btn = self._styled_button(ctl, "📈 Form",
+                                            self.show_form_cache, width=8,
+                                            font=_mfont,
                                             bg=c["muted"])
-        self.form_btn.grid(row=1, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.form_btn.grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(3, 0))
+        self.roll_btn = self._styled_button(ctl, "⚡ ROLL",
+                                            self._toggle_roll_over,
+                                            bg=c["button_bg"], width=8,
+                                            font=_bfont)
+        self.roll_btn.grid(row=1, column=3, sticky="w", padx=(0, 4), pady=(3, 0))
         self.ready_lbl = tk.Label(ctl, text="⚪ jackpot research idle", bg=c["panel"],
-                                  fg=c["muted"], font=("Segoe UI", 9, "bold"))
-        self.ready_lbl.grid(row=1, column=3, columnspan=2, sticky="w", padx=(10, 0), pady=(8, 0))
+                                  fg=c["muted"], font=("Segoe UI", 8, "bold"))
+        self.ready_lbl.grid(row=1, column=4, columnspan=2, sticky="w", padx=(8, 0), pady=(3, 0))
         self._last_ready_refresh = 0.0
 
         lbl = tk.Label(tab, text="  Live Machine Log  ", bg=c["bg"], fg=c["muted"],
@@ -610,7 +917,7 @@ class BetFlowProGUI:
         logrow.pack(fill="both", expand=True)
         _fsize = getattr(self, "_terminal_font_size", 10)
         self._terminal_font_size = _fsize
-        self.terminal = scrolledtext.ScrolledText(logrow, height=18, state="disabled",
+        self.terminal = scrolledtext.ScrolledText(logrow, height=26, state="disabled",
                                                   wrap="word", relief=tk.FLAT, bd=0,
                                                   bg=c["terminal_bg"],
                                                   fg=c["terminal_fg"],
@@ -651,12 +958,20 @@ class BetFlowProGUI:
                             width=13, font=("Segoe UI", 8),
                             bg=c["muted"]).pack(pady=(0, 6))
 
+        self._show_all_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(logtools, text="Show all", variable=self._show_all_var,
+                       command=self._toggle_show_all, bg=c["bg"], fg=c["muted"],
+                       selectcolor=c["text_bg"], activebackground=c["bg"],
+                       activeforeground=c["text_fg"], font=("Segoe UI", 8),
+                       highlightthickness=0, anchor="w", justify="left"
+                       ).pack(fill="x", pady=(0, 6))
+
         self.auto_scroll_enabled = True
 
     def _field(self, parent, label, var_name, default, r, col):
         c = self.colors
         f = tk.Frame(parent, bg=c["bg"])
-        f.grid(row=r, column=col, sticky="w", padx=(0, 18), pady=3)
+        f.grid(row=r, column=col, sticky="w", padx=(0, 18), pady=1)
         tk.Label(f, text=label, bg=c["bg"], fg=c["muted"], font=("Consolas", 8)).pack(side="left")
         var = tk.StringVar(value=default)
         setattr(self, var_name, var)
@@ -1068,6 +1383,22 @@ class BetFlowProGUI:
     def toggle_auto_scroll(self):
         self.auto_scroll_enabled = not self.auto_scroll_enabled
 
+    def _toggle_roll_over(self):
+        """Compact ROLL-OVER toggle (button next to MID POT). Flips the same
+        variable the settings save/load path uses, so the top-bar chip and the
+        button both reflect the mode."""
+        try:
+            self.roll_over_var.set(not self.roll_over_var.get())
+        except Exception:
+            pass
+
+    def _toggle_show_all(self):
+        """Tickbox: when off, only important lines (bets/wins/money/errors)
+        show; when on, every line including research + crawl noise appears."""
+        self._reseed_terminal()
+        self._append_log("👁 Show-all view " +
+                         ("ON" if self._show_all_var.get() else "OFF"))
+
     # ── Terminal zoom ─────────────────────────────────────────────────
     _TERM_FONT_MIN = 7
     _TERM_FONT_MAX = 26
@@ -1168,6 +1499,39 @@ class BetFlowProGUI:
         "FOOTBALL AUTO-BET:",
     )
 
+    # "Show only important" filter — which lines are worth watching live.
+    # Everything not listed here (or unclassified) still appears; only research
+    # spam, crawl status lines and per-leg detail lines get hidden by default.
+    _IMPORTANT_TAGS = frozenset({
+        "win", "loss", "bet", "longshot", "warn", "money", "fibi", "ok",
+    })
+    _IMPORTANT_MARKERS = (
+        "⚽ STARTING", "🛑 EMERGENCY", "Selected",
+        "Thread crash", "thread crash", "🚨", "💥",
+    )
+    _NOISE_MARKERS = (
+        "Crawl-and-bet attempt", "📅 Games (", "  •",
+        "↗ ", "↖ DC:", "🔀 ", "🔎 Pre-flight skip", "Re-crawling shortly",
+        "full-markets opener", "scroll", "│ ",
+    )
+
+    def _log_line_visible(self, raw: str, tag: str) -> bool:
+        """Decide whether a log line should appear in the live terminal when the
+        'Show all' checkbox is off. Classified lines (bets, wins, money, errors,
+        cash-outs, balance) always show; research/crawl noise and per-leg detail
+        are hidden until the user ticks 'Show all'."""
+        if getattr(self, "_show_all_var", None) and self._show_all_var.get():
+            return True
+        if tag and tag in self._IMPORTANT_TAGS:
+            return True
+        if any(m in raw for m in self._IMPORTANT_MARKERS):
+            return True
+        if tag in ("research", "muted", "div"):
+            return False
+        if any(m in raw for m in self._NOISE_MARKERS):
+            return False
+        return True
+
     def _auto_tag(self, text: str) -> str:
         """Return the best colour tag for this log line, or empty string for default."""
         for pattern, tag in self._LOG_TAG_RULES:
@@ -1180,11 +1544,20 @@ class BetFlowProGUI:
         self._log_lines.append(line)
         if len(self._log_lines) > 6000:
             del self._log_lines[: len(self._log_lines) - 6000]
+        try:
+            with open(TERMINAL_TEE_LOG, "a", encoding="utf-8", errors="replace") as _fh:
+                _fh.write(line + "\n")
+        except Exception:
+            pass
         if not getattr(self, "terminal", None):
             return
         try:
             # Auto-detect tag from content if caller didn't specify one
             effective_tag = tag or self._auto_tag(text)
+
+            # "Show only important" filter: skip noise lines until 'Show all' is on
+            if not self._log_line_visible(text, effective_tag):
+                return
 
             self.terminal.config(state="normal")
 
@@ -1283,6 +1656,10 @@ class BetFlowProGUI:
             "withdraw_amount": withdraw,
             "headless": bool(self.headless_var.get()),
             "market_whitelist": market_whitelist,
+            "cashout_enabled": bool(self.cashout_var.get()),
+            "cashout_threshold": max(0.1, min(1.0,
+                                      float(str(self.cashout_pct_var.get()).strip() or 75) / 100.0)),
+            "roll_over": bool(self.roll_over_var.get()),
         }
 
     def start_bet_machine(self):
@@ -1295,6 +1672,10 @@ class BetFlowProGUI:
             return
         self._save_settings()
         self._stop_event = threading.Event()
+        if self.backend is None or not self._backend_ready.is_set():
+            messagebox.showwarning("Backend loading",
+                                   "The backend is still loading — wait a moment, then try again.")
+            return
         self.backend.running = True
         self.state.engine_state = "RUNNING"
         self.bus.emit("status", "RUNNING")
@@ -1303,6 +1684,7 @@ class BetFlowProGUI:
         wd_txt = (f"auto-withdraw ON KES {q['withdraw_amount']:g}/day | "
                   if q.get("auto_withdraw") else "auto-withdraw OFF | ")
         hd_txt = "HEADLESS | " if q.get("headless") else ""
+        ro_txt = "⚡ ROLL-OVER | " if q.get("roll_over") else ""
         pct_txt = f"{q['stake_percent']:g}%" if q["stake_percent"] else "OFF"
         daily_txt = "∞"
         if q.get("daily_bets"):
@@ -1314,7 +1696,7 @@ class BetFlowProGUI:
                          f"daily {daily_txt} | " +
                          f"bets {'∞' if not q['max_bets'] else q['max_bets']} | " +
                          f"stake% {pct_txt} | " +
-                         hd_txt + ls_txt + wd_txt)
+                         ro_txt + hd_txt + ls_txt + wd_txt)
 
         def job():
             qq = q
@@ -1335,10 +1717,13 @@ class BetFlowProGUI:
                     withdraw_amount=qq.get("withdraw_amount", 200.0),
                     headless=True,
                     market_whitelist=qq.get("market_whitelist", "*"),
-                    grok_api_key=self._grok_cfg().get("grok_api_key") or None,
-                    grok_model=self._grok_cfg().get("grok_model") or None,
-                    grok_interval=self._grok_cfg().get("grok_interval") or 90.0,
-                    agent_cfg=self._agent_cfg())
+                    cashout_enabled=qq.get("cashout_enabled", True),
+                    cashout_threshold=qq.get("cashout_threshold", 0.75),
+                     grok_api_key=self._grok_cfg().get("grok_api_key") or None,
+                     grok_model=self._grok_cfg().get("grok_model") or None,
+                     grok_interval=self._grok_cfg().get("grok_interval") or 90.0,
+                     agent_cfg=self._agent_cfg(),
+                     roll_over=q.get("roll_over", False))
                 if isinstance(res, dict) and res.get("deposit_needed"):
                     self.bus.emit("deposit", (res.get("deposit_needed", 0.0),
                                               res.get("balance", 0.0)))
@@ -2039,6 +2424,8 @@ class BetFlowProGUI:
                     # Strip the timestamp prefix to get the raw message for tag detection
                     raw = re.sub(r"^\[\d{2}:\d{2}:\d{2}\] ", "", line)
                     tag = self._auto_tag(raw)
+                    if not self._log_line_visible(raw, tag):
+                        continue
                     if any(trigger in raw for trigger in self._SEPARATOR_TRIGGERS):
                         self.terminal.insert(tk.END, "─" * 72 + "\n", "div")
                     self.terminal.insert(tk.END, line + "\n", tag or "")
@@ -2100,6 +2487,11 @@ class BetFlowProGUI:
             # All AI keys for rotation (Grok + Gemini)
             "ai_keys":             [str(k).strip() for k in (d.get("ai_keys") or [])
                                     if str(k or "").strip()],
+            # Per-hour cap on AI calls (spend guard for paid keys)
+            "ai_calls_per_hour":   int(d.get("ai_calls_per_hour") or 0),
+            # JEV (tokenra.io) — fast typed-decision leg validator
+            "jev_api_key":         str(d.get("jev_api_key") or "").strip(),
+            "jev_weight":          float(d.get("jev_weight") or 0.35),
         }
 
     def _load_settings(self):
@@ -2122,6 +2514,11 @@ class BetFlowProGUI:
             self.headless_var.set(bool(data.get("headless", True)))
             self.autostart_var.set(bool(data.get("autostart", False)))
             self.notify_var.set(bool(data.get("notify", True)))
+            try:
+                self.cashout_var.set(bool(data.get("cashout_enabled", True)))
+                self.cashout_pct_var.set(str(int(round(float(data.get("cashout_threshold", 0.75)) * 100))))
+            except Exception:
+                pass
             try:
                 self.jackpot_stake_var.set(str(data.get("jackpot_stake", 99)))
             except Exception:
@@ -2188,6 +2585,9 @@ class BetFlowProGUI:
                 "autostart": bool(self.autostart_var.get()),
                 "notify": bool(self.notify_var.get()),
                 "jackpot_stake": float(self.jackpot_stake_var.get().strip() or 99),
+                "cashout_enabled": bool(self.cashout_var.get()),
+                "cashout_threshold": max(0.1, min(1.0,
+                     float(str(self.cashout_pct_var.get()).strip() or 75) / 100.0)),
                 "markets": {k: bool(v.get()) for k, v in self.mk_vars.items()},
                 # Lock-in state
                 "lock_in": bool(getattr(self, "lock_in_var", tk.BooleanVar()).get()),
@@ -2198,6 +2598,27 @@ class BetFlowProGUI:
             data["grok_api_key"] = gc["grok_api_key"]
             data["grok_model"] = gc["grok_model"]
             data["grok_interval"] = gc["grok_interval"]
+            # Preserve AI-key rotation + JEV fields that live in the file but
+            # have no dedicated widgets (never clobber them on save).
+            try:
+                with open(self._settings_path(), "r", encoding="utf-8") as f:
+                    prev = json.load(f)
+                if prev.get("ai_keys"):
+                    data["ai_keys"] = prev["ai_keys"]
+                if "ai_calls_per_hour" in prev:
+                    data["ai_calls_per_hour"] = int(prev["ai_calls_per_hour"] or 0)
+                if prev.get("jev_api_key"):
+                    data["jev_api_key"] = str(prev["jev_api_key"]).strip()
+                if prev.get("jev_weight"):
+                    data["jev_weight"] = float(prev["jev_weight"])
+                for k in ("api_football_key", "api_football_keys",
+                          "twilio_sid", "twilio_auth", "twilio_from",
+                          "alert_phone", "webhook_url", "webhook_token",
+                          "alert_provider", "agents_enabled", "alerts_enabled"):
+                    if k in prev:
+                        data[k] = prev[k]
+            except Exception:
+                pass
             with open(self._settings_path(), "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception:
@@ -2219,6 +2640,16 @@ class BetFlowProGUI:
             self.backend.running = False
             if self._stop_event is not None:
                 self._stop_event.set()
+        except Exception:
+            pass
+        try:
+            self.backend.force_stop_bet_driver()
+        except Exception:
+            pass
+        try:
+            closed = self.backend.shutdown_all_browsers()
+            if closed:
+                print(f"[exit] Quit {closed} tool browser session(s)")
         except Exception:
             pass
         try:
@@ -2260,6 +2691,7 @@ def main():
     # Withdraw before building UI so the window is never shown with the
     # default Tk feather icon — it only becomes visible after the icon is set.
     root.withdraw()
+    _install_crash_harness(root)
     app = BetFlowProGUI(root)
     # Show the window after a short delay so _set_app_icon's after(200,...) has
     # already been scheduled and will fire while the window is visible.

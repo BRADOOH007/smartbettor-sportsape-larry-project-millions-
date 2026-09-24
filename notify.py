@@ -14,43 +14,35 @@ _ACTIVE_TOAST = {"win": None}
 
 
 def sound(kind: str) -> None:
-    """Play a single soft non-blocking beep for an event kind.
-
-    Uses Windows MB_* system sounds (MessageBeep) where possible —
-    these respect the user's system volume and 'quiet hours' settings.
-    Falls back to a single short winsound.Beep if MessageBeep unavailable.
+    """Play a single short pure-tone beep *only* for the three important events:
+         won    → high short note (gentle ascending)
+         lost   → low short note
+         placed → mid short note
+    All other event kinds (funds, withdraw, planned, warn, info, etc.) are
+    deliberately SILENT — they only ever show the visual toast, never a
+    desktop system sound or a beep. No MessageBeep (Windows stock sound
+    schemes) is ever used because those play the user's configured
+    information / warning / exclamation wav file, which is loud and
+    sounds identical to OS-level alerts the user actually cares about.
     """
     if sys.platform != "win32":
         return
 
-    # Map event kind to a single (freq, duration_ms) — short and quiet.
-    # MB_ICONINFORMATION = 64, MB_ICONWARNING = 48, MB_ICONERROR = 16,
-    # MB_OK = 0 (default system beep — usually the quietest)
-    _MB_SOUNDS = {
-        "won":      64,   # information sound — pleasant chime
-        "placed":   0,    # default system beep — subtle
-        "lost":     48,   # warning sound — low
-        "warn":     48,   # warning
-        "funds":    0,    # default
-        "withdraw": 64,   # information
-        "planned":  0,    # default
+    tones = {
+        "won":    (880, 120),
+        "lost":   (330, 150),
+        "placed": (660,  80),
     }
+    if kind not in tones:
+        return
+    freq, dur = tones[kind]
 
     def _play():
         try:
-            import ctypes
-            mb = _MB_SOUNDS.get(kind, -1)  # -1 = no sound
-            if mb >= 0:
-                ctypes.windll.user32.MessageBeep(mb)
+            import winsound
+            winsound.Beep(freq, dur)
         except Exception:
-            try:
-                import winsound
-                # Single short soft beep — never a pattern
-                freq, dur = {"won": (880, 120), "placed": (660, 80),
-                             "lost": (330, 150), "warn": (520, 100)}.get(kind, (440, 80))
-                winsound.Beep(freq, dur)
-            except Exception:
-                pass
+            pass
 
     threading.Thread(target=_play, daemon=True).start()
 

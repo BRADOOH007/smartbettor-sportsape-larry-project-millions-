@@ -12,12 +12,14 @@ dist/
 !SportsapeBitBot.exe
 
 # Runtime state (accounts & keys — never commit)
+sportsape_secrets.json
 sportsape_settings.json
 sportsape_ledger.json
 sportsape_stats.json
 sportsape_withdraw.json
 sportsape_usage.json
 sportsape_form_cache.json
+sportsape_enrich_cache.json
 sportsape_jackpot_ready.json
 sportsape_grok_journal.json
 sportsape_balances.json
