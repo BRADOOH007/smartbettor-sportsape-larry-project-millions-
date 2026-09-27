@@ -1657,6 +1657,36 @@ class Fibi:
         self.state["consecutive_aborts"] = int(self.state.get("consecutive_aborts", 0)) + 1
         self._save_state()
 
+    def note_skip(self, reason: str = ""):
+        """Record a HEALTHY no-bet round (nothing cleared the gates)."""
+        self.state["last_skip"] = {"ts": time.time(), "reason": str(reason)[:120]}
+        self.state["skipped_rounds"] = int(self.state.get("skipped_rounds") or 0) + 1
+        self._save_state()
+
+    def clear_aborts(self, note: str = "risk refusal"):
+        """Reset the abort streak after a DELIBERATE risk refusal.
+
+        The portfolio gates (drawdown halt, correlation cap, Kelly, recipe veto)
+        return "aborted" without touching the browser, because the engine chose
+        not to bet. That is a healthy decision, not a broken session. Letting it
+        increment this counter made the supervisor tear down and rebuild drivers
+        on a timer, which caused real selenium instability, which caused genuine
+        aborts — a self-feeding loop that buried the real state in warnings.
+        """
+        if int(self.state.get("consecutive_aborts") or 0) or note:
+            self.state["consecutive_aborts"] = 0
+            self.state["last_risk_refusal"] = {"ts": time.time(), "note": str(note)[:120]}
+            self._save_state()
+
+    def note_risk_refusal(self, reason: str = ""):
+        """Record a portfolio/risk refusal for the digest, separately from aborts."""
+        self.state.setdefault("risk_refusals", []).append(
+            {"ts": time.time(), "reason": str(reason)[:120]})
+        # keep it bounded — this is diagnostic, not an audit log
+        if len(self.state["risk_refusals"]) > 200:
+            del self.state["risk_refusals"][:-200]
+        self._save_state()
+
     def beat_driver_heal(self):
         self.state.setdefault("driver_heals_last_hour", []).append(time.time())
         self._prune_driver_heals()
@@ -1724,15 +1754,30 @@ class Fibi:
             warnings.append("Engine has not completed its first round yet")
 
         # 2) No bets placed for a long time?
+        # Distinguish "correctly declining" from "actually stuck" (2026-09-27).
+        # A long dry spell is only a problem if rounds stopped completing. When
+        # the engine is still actively crawling and simply declining thin or
+        # negative-edge rounds, that is the risk controls WORKING, and calling
+        # it "stuck" sent operators chasing a fault that did not exist.
+        _last_skip = float((self.state.get("last_skip") or {}).get("ts") or 0.0)
+        _skipping_now = _last_skip > 0 and (now - _last_skip) < 3600.0
         if now - last_placed > self.NO_BET_THRESHOLD_S and last_placed > 0:
             hrs = round((now - last_placed) / 3600, 1)
-            w = f"NO BETS in ~{hrs}h — machine may be stuck waiting / out of budget"
-            warnings.append(w)
-            recommendations.append({
-                "action": "investigate_no_bets",
-                "reason": w,
-                "severity": "warning",
-            })
+            if _skipping_now:
+                w = (f"No bet placed in ~{hrs}h — engine healthy, declining rounds "
+                     f"(gates not met); not stuck")
+                recommendations.append({
+                    "action": "none",
+                    "reason": w,
+                    "severity": "info",
+                })
+            else:
+                w = f"NO BETS in ~{hrs}h — machine may be stuck waiting / out of budget"
+                recommendations.append({
+                    "action": "investigate_no_bets",
+                    "reason": w,
+                    "severity": "warning",
+                })
 
         # 3) Consecutive aborts?
         if consec_aborts >= 8:
@@ -1759,7 +1804,14 @@ class Fibi:
                 })
 
         # 5) Account parked too long?
-        for acct, parked_ts in (self.state.get("parked_since") or {}).items():
+        # Only judge accounts this machine actually trades. `parked_since` is
+        # persistent state, so it still holds entries for accounts that were
+        # configured months ago. Without this filter the supervisor warned
+        # (and unparked) phones nobody owns, several times an hour, forever.
+        _known = {str(a).strip() for a in (accounts or []) if str(a or "").strip()}
+        for acct, parked_ts in list((self.state.get("parked_since") or {}).items()):
+            if _known and str(acct).strip() not in _known:
+                continue
             parked_s = now - float(parked_ts or now)
             if parked_s > self.ACCOUNT_PARK_THRESHOLD_S:
                 mins = int(parked_s / 60)

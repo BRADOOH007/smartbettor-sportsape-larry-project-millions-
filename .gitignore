@@ -58,3 +58,42 @@ sportsape_calibration.json
 sportsape_alerts.log
 Assets/icon.ico
 Assets/icon_preview.png
+
+# One-off diagnostic scripts from debugging sessions
+_diag*.ps1
+_find*.ps1
+_cfg*.ps1
+_gate*.ps1
+_check*.ps1
+_ledger*.ps1
+_verify*.ps1
+_pycompile*.ps1
+_truth*.ps1
+_research*.ps1
+_supabase_*.ps1
+_count*.ps1
+_id_*.ps1
+_locate*.ps1
+_set*.ps1
+_mine_*.py
+_patch_*.py
+_probe*.py
+_probe*.json
+_build_probe.ps1
+_fetch_bundles.py
+_fix_*.ps1
+_grep_*.py
+_login_store.ps1
+_app.js
+_gui_pid.txt
+betcard_probe.txt
+_shots_visible/
+
+# Captured credentials or live session tokens - never commit
+sportsape_settings_pre_gui_compact.json
+*_local_fixes_*.bak
+ledger_backup_*/
+
+# Runtime data and screenshots - regenerated, not source
+sportsape_odds_history.json
+*.png

@@ -498,7 +498,9 @@ class SportsapeBackend:
         Dedup: collapse identical messages within 45s into one."""
         now = time.time()
         key = str(message).strip().lower().replace(" ", "")
-        if key == self._last_emit_key and (now - self._last_emit_time) < 45:
+        _prev_key = getattr(self, "_last_emit_key", None)
+        _prev_time = float(getattr(self, "_last_emit_time", 0.0) or 0.0)
+        if key == _prev_key and (now - _prev_time) < 45:
             return
         self._last_emit_key = key
         self._last_emit_time = now
@@ -2245,6 +2247,24 @@ return true;
                      # meaningless 1-shilling tickets that never grow the bank. Floor
                      # is KES 5 (never below), stake scales with balance/sureness and
                      # is capped at KES 20 so a single slip can't torch the bankroll.
+    # OWNER RULES (2026-09-25) — the two numbers above were the whole staking
+    # policy, and both were static. The 09-24 ledger adds two more:
+    #  • SLIP_MIN_EV — a slip can only be staked (at ANY size) when the market-
+    #    weight-corrected joint win chance times the combined odds clears this
+    #    floor. Below it the slip is negative-EV once the book's margin is
+    #    stripped → it's a donation, not a bet. (Mirrors the old per-leg kelly
+    #    veto, applied at the SLIP level where it actually decides money.)
+    #  • STAKE_BANKROLL_SHARE — even a "high-confidence" slip never risks more
+    #    than this fraction of the current balance, so a young KES 6.47 bankroll
+    #    can't be consumed by one too-good slip before it ever grows.
+    SLIP_MIN_EV = 1.05
+    STAKE_BANKROLL_SHARE = 0.33
+    # OWNER RULE (2026-09-26): max O/U (goals) legs per slip. The 09-26 ledger
+    # caught a 4x-"over" slip @ 0.93 confidence each that settled LOST — one
+    # correlated goal-stack, every leg dead together. 2 keeps O/U represented in
+    # the mix while forcing 1X2 / Double Chance / BTTS into the other slots, so
+    # the machine bets the whole board instead of one market four times.
+    MAX_GOALS_LEGS_PER_SLIP = 2
     DEFAULT_POOL_SHARE = 0.25  # share of each win banked toward the auto-withdraw reserve
 
     # Market groups for the owner's market whitelist (all-on by default).
@@ -2458,7 +2478,7 @@ return true;
 
     def _who_is_logged_in(self, driver) -> str:
         """Best-effort read of WHICH account the current session belongs to, as
-        normalized digits ("0706719388"). Returns '' when the page does not expose
+        normalized digits (e.g. "0700000001"). Returns '' when the page does not expose
         the account identity (we then rely on live/logged-out only)."""
         try:
             raw = driver.execute_script("""
@@ -2565,6 +2585,20 @@ return m ? m[0] : '';
             except Exception:
                 pass
 
+            # FRESH SLIP EVERY ROUND (owner rule): the betslip panel is persistent
+            # across navigation. If the previous round died on a suspended/removed
+            # selection, those stale legs sit in the panel, read as a "payable" slip,
+            # and block every later PLACE with "Not valid" — the exact account-2 bug.
+            # Clear at the start so each round rebuilds from the legs it actually
+            # clicks. (Clearing can never place a bet — it is always safe.)
+            try:
+                if self._read_betslip_count(driver) > 0:
+                    self._clear_betslip(driver, gui_callback=gui_callback)
+                    self._emit_direct(gui_callback,
+                                      "  🧹 Cleared stale persistent betslip before this round.")
+            except Exception:
+                pass
+
             balance, balance_confirmed = self._read_balance_confirmed(driver, wait=20.0)
             if balance_confirmed:
                 self._balance_cache = getattr(self, "_balance_cache", None) or self._load_balance_cache()
@@ -2600,6 +2634,37 @@ return m ? m[0] : '';
                             "balance_unreadable": True}
             self._emit_direct(gui_callback, f"Starting balance: KES {balance:,.2f}")
 
+            # ── PORTFOLIO GATE (2026-09-26): drawdown circuit breakers ─────
+            # Checked before any stake is sized or any slip is built. The
+            # portfolio-level halt is evaluated FIRST, because it catches the
+            # failure per-account checks structurally cannot see: every account
+            # bleeding at once. Per-account, an account down 40% from its own
+            # peak is frozen and must be reviewed by the owner.
+            _fleet = dict(getattr(self, "_engine_state", {}).get("balances") or {})
+            _fleet[phone] = balance
+            # NOTE: the whole fleet is passed, never just {phone: balance}. Peaks
+            # and drawdown are both fleet-level quantities, so feeding one account
+            # makes the others look like they vanished and manufactures a fake
+            # portfolio crash that halts every account for no reason.
+            self._note_balances(_fleet)
+            _allowed, _why = self._circuit_breaker_check(phone, balance, _fleet)
+            if not _allowed:
+                # A refusal with no reason is unactionable: the operator sees
+                # "no bet this round ()" and cannot tell a real freeze from a
+                # bookkeeping artifact. Name the live state that caused it.
+                if not str(_why).strip():
+                    _pf = self._load_portfolio()
+                    _why = ("portfolio breaker refused this round "
+                            f"(halted={bool(_pf.get('halted'))}, "
+                            f"frozen={bool((_pf.get('frozen') or {}).get(phone))}, "
+                            f"halt_reason={_pf.get('halt_reason') or 'none'}, "
+                            f"equity={self._equity_for(phone, balance):.2f}, "
+                            f"peak={_pf.get('peaks', {}).get(phone)})")
+                self._count_refusal(_why.split(":")[0][:40])
+                self._emit_direct(gui_callback, f"🛑 {phone}: {_why} — no bet this round.")
+            return {"status": "skipped", "skipped": True, "message": _why,
+                    "circuit_breaker": True}
+
             # Stake is fixed — always use exactly the base stake passed in.
             # Risk manager and compounding are disabled: the owner wants KES 10
             # minimum always, no automatic increases.
@@ -2631,7 +2696,11 @@ return m ? m[0] : '';
                                 balance = recheck
                         except Exception:
                             pass
-                    if float(balance) < self.MIN_STAKE:
+                    # SMART STOP (owner rule): once we KNOW the balance is below the
+                    # base stake, STOP attempting real bets — no "bet the full tiny
+                    # balance to grow it". Parking via the no-funds rest path so we
+                    # follow winnings but place nothing until funds return.
+                    if float(balance) < float(stake):
                         available = max(0.0, float(balance))
                         deposit_needed = max(0.0, round(float(stake) - available, 2))
                         # Rate-limit the deposit nag — say it once, then go quiet
@@ -2655,17 +2724,14 @@ return m ? m[0] : '';
                                         gui_callback=gui_callback)
                                 except Exception:
                                     pass
-                        return {"status": "aborted",
-                                "message": "Insufficient balance",
+            return {"status": "skipped", "skipped": True,
+                    "message": "Insufficient balance",
                                 "deposit_needed": deposit_needed,
                                 "balance": balance,
                                 "stake": float(stake)}
-            # Stake is always the base value passed in — never reduced by reserve.
-            # Owner rule: tiny balances get bet in full so they compound.
-            if self.MIN_STAKE <= float(balance) < float(stake):
-                self._emit_direct(gui_callback,
-                                  "Balance KES {:.2f} below base KES {:.2f} -- betting the full available amount to grow it.".format(float(balance), float(stake)))
-            stake = max(self.MIN_STAKE, min(float(stake), float(balance)))
+            # Reached only when balance >= stake: stake stays the base value passed
+            # in — never reduced by the reserve, never raised to grow a tiny pot.
+            stake = max(self.MIN_STAKE, float(stake))
 
             # Wait for the AngularSON-rendered game rows to replace the skeleton placeholders
             render_deadline = time.time() + 25
@@ -2819,16 +2885,19 @@ return { real: real, h: h };
                     else:
                         self._emit_direct(gui_callback,
                                           "⚠️ No upcoming games placeable either — re-crawling shortly.")
-                        return {"status": "aborted", "message": "No placeable games right now"}
+                        return {"status": "skipped", "skipped": True,
+                    "message": "No placeable games right now"}
                 except Exception as _e:
                     self._emit_direct(gui_callback,
                                       f"⚠️ Upcoming-games fallback failed: {str(_e)[:80]}")
-                    return {"status": "aborted", "message": "No placeable games right now"}
+                    return {"status": "skipped", "skipped": True,
+                    "message": "No placeable games right now"}
             if not playable:
                 self._emit_direct(gui_callback,
                                   f"⚠️ No games currently placeable (need >= {min_lead_minutes}m "
                                   "to kick-off). Re-crawling shortly.")
-                return {"status": "aborted", "message": "No placeable games right now"}
+                return {"status": "skipped", "skipped": True,
+                    "message": "No placeable games right now"}
             # ── Per-account hard split: each worker gets its OWN preferred slice
             # of the board. Even when the slice is thin and the round falls back
             # to the full board, the global used_set below blocks the whole game
@@ -2965,7 +3034,16 @@ return { real: real, h: h };
             if not legs:
                 self._emit_direct(gui_callback,
                                   "⚠️ Not enough qualifying games this round — re-crawling shortly.")
-                return {"status": "aborted", "message": "No accumulator combination found"}
+                # "skipped", NOT "aborted" (2026-09-27). A thin board where no
+                # qualifying combination clears the odds floor is a HEALTHY
+                # outcome: the engine crawled fine and correctly declined to bet.
+                # Reporting it as "aborted" made the supervisor count ordinary
+                # quiet rounds as a broken session, so it rebuilt drivers on a
+                # timer (18+/hour) and manufactured the selenium instability it
+                # was warning about. Nothing failed here; there was simply
+                # nothing worth betting on.
+                return {"status": "skipped", "skipped": True,
+                        "message": "No accumulator combination found"}
 
             # ── Always-learn shadow pick (owner rule: the tool improves every
             # round it runs). Record a runner-up slip from the games NOT used in
@@ -2991,6 +3069,43 @@ return { real: real, h: h };
             joint_prob = 1.0
             for o, name, gid, market, prob in legs:
                 joint_prob *= prob
+            # ── OWNER RULE (2026-09-26): single-market concentration cap ──
+            # The real-money ledger's biggest loser was the "small odds = safe"
+            # cluster: 2L@lt3 (217 bets, -12.4%) and 3L@lt3 (214 bets, -55.6%) —
+            # 431 of the ~1,465 settled, all sub-3.0 combined odds, all the same
+            # low-odds family. That is precisely the trap the owner called out:
+            # combining several tiny-odds legs feels safe but multiplies the
+            # bookmaker's margin, not our edge, so the slip dies slowly and often.
+            # Two limits now apply before a slip is allowed to be priced:
+            #   * no market may hold more than MAX_MARKET_LEGS_PER_SLIP slots
+            #     (stops one market being bet 3-4x — the correlated-bet trap), and
+            #   * a slip whose combined odds sit BELOW MIN_SKEW_ODDS is refused,
+            #     because that is the losing low-odds family itself.
+            _mk_counts: dict = {}
+            for _o, _n, _g, _m, _p in legs:
+                _mk_counts[_m] = _mk_counts.get(_m, 0) + 1
+            _over_cap = [m for m, n in _mk_counts.items() if n > self.MAX_MARKET_LEGS_PER_SLIP]
+            _skew_bad = product < self.MIN_SKEW_ODDS
+            if _over_cap:
+                self._emit_direct(gui_callback,
+                                  f"⛔ slip rejected: {', '.join(_over_cap)} held more than "
+                                  f"{self.MAX_MARKET_LEGS_PER_SLIP} legs (concentration cap)")
+            if _skew_bad:
+                self._emit_direct(gui_callback,
+                                  f"⛔ slip rejected: combined x{product:.2f} is below the "
+                                  f"x{self.MIN_SKEW_ODDS:.2f} skew floor — this low-odds family "
+                                  "is the historical loser (431 bets, -43% ROI), not a safe bet")
+            if _over_cap or _skew_bad:
+                # Refuse the slip cleanly (same contract as every other
+                # no-combo bail-out in this function) so the caller re-selects
+                # on the next round instead of pricing a slip we just rejected.
+                # "skipped" = healthy decline, not a session failure (2026-09-27).
+                return {"status": "skipped", "skipped": True,
+                        "message": (f"Slip refused ({'; '.join(_over_cap) if _over_cap else ''}"
+                                    f"{' concentration' if _over_cap else ''}"
+                                    f"{' + ' if _over_cap and _skew_bad else ''}"
+                                    f"{'sub-x%.2f skew' % product if _skew_bad else ''}"
+                                    ).strip()}
             self._emit_direct(gui_callback,
                               f"🎯 Selected {len(legs)} legs → combined x{product:.2f} "
                               f"| ~{joint_prob * 100:.1f}% weighted win chance:")
@@ -3021,13 +3136,83 @@ return { real: real, h: h };
                                       "no artificial minimum, betting it")
 
             # ── Owner rule (2026-09-23): binary confidence stake — 20 / 10 ──
-            # A "too good" slip (near-certain legs, or a high joint win chance)
-            # bets KES 20; anything less confident bets KES 10. Never under
-            # MIN_STAKE, never above the configured cap / available balance.
+            # A "too good" slip is one the MACHINE is genuinely confident about,
+            # NOT one whose odds happen to be small. OWNER LEARNING (2026-09-25):
+            # the old rule doubled the stake when every leg was low-odds (<=1.35),
+            # which assumed small odds = sure win. The 09-24 ledger refutes that:
+            # over 415 trials "over" landed 74.8% vs the 82.6% it was priced at, and
+            # the x1.2-1.35 "bankers" kept losing (over15 was retired outright). So
+            # the double-stake now rests SOLELY on the market-weight-corrected joint
+            # probability clearing a real floor. If nothing is that confident we
+            # stake KES 10, never more.
             _n_legs = len(legs)
             _max_odds = max(float(o) for o, _n, _g, _m, _p in legs) if legs else 1.0
-            high_conf = (_n_legs <= 4 and _max_odds <= 1.35) or joint_prob >= 0.55
-            sized = 20.0 if high_conf else 10.0
+            high_conf = joint_prob >= 0.62  # weighted joint win chance (markets already penalized)
+
+            # ── PORTFOLIO GATE: cross-account correlation (2026-09-26) ────
+            # With one account this is a no-op. With a fleet it is the whole
+            # point: two accounts on one match (or three on one market) is ONE
+            # position with the bookmaker's margin counted two or three times,
+            # which looks diversified in the UI and is not diversified at all.
+            # NOTE: the correlation and recipe-veto checks are deliberately NOT
+            # run here. Further down, a failed leg click triggers a rebuild that
+            # REBINDS used_legs to a different, narrower slip. Gates evaluated
+            # against the pre-rebuild `legs` would clear one slip while the
+            # bookmaker takes another, so they run after the rebuild instead.
+
+            # ── Stake: variance-scaled FRACTIONAL KELLY (2026-09-26) ─────
+            # Replaces the flat "20 if confident / 10 otherwise" rule. Kelly is
+            # the only sizing rule that respects the price you were actually
+            # offered, and it is scaled by (a) KELLY_FRACTION, because the
+            # model's own calibration error is material and full Kelly turns
+            # mispriced probability straight into ruin, and (b) the account's
+            # realised volatility, so a high-variance account automatically
+            # bets smaller on the same signal. Hard-capped as a share of both
+            # the account balance and the whole portfolio.
+            _fleet_total = 0.0
+            for _b in (getattr(self, "_engine_state", {}).get("balances") or {}).values():
+                try:
+                    _fleet_total += float(_b or 0.0)
+                except (TypeError, ValueError):
+                    pass
+            _fleet_total += float(balance or 0.0)
+            sized = self._kelly_stake(phone, balance, joint_prob, product, _fleet_total)
+            if sized <= 0:
+                self._count_refusal("kelly says no edge")
+                self._emit_direct(gui_callback,
+                                  f"⛔ Kelly: joint {joint_prob*100:.1f}% @ x{product:.2f} has no "
+                                  "positive edge at 1/5 Kelly — skipping this slip entirely.")
+                return {"status": "skipped", "skipped": True,
+                        "kelly_blocked": True,
+                        "message": "Kelly: no positive edge",
+                        "kelly_blocked": True}
+            self._emit_direct(gui_callback,
+                              f"📐 Kelly stake: KES {sized:,.2f} (joint {joint_prob*100:.1f}% "
+                              f"@ x{product:.2f}, 1/{int(round(1/self.KELLY_FRACTION))} Kelly, "
+                              f"vol-scaled)")
+
+            # ── OWNER GATE 1 (2026-09-25): slip-level EV, not per-leg odds ──
+            # "Too good" was being read as small per-leg odds. The ledger says
+            # that's exactly backwards (the x1.2-1.35 'bankers' kept losing).
+            # A slip is only worth a FULL stake when the WEIGHTED joint prob
+            # times the COMBINED odds clears the positive-EV floor. Below it,
+            # whatever the legs look like, the slip is negative-EV once the
+            # book's margin is stripped → downgrade to MIN stake (never $0).
+            _slip_ev = joint_prob * float(product) if product else 0.0
+            if _slip_ev < self.SLIP_MIN_EV:
+                sized = min(sized, self.MIN_STAKE)
+                self._emit_direct(gui_callback,
+                                  f"⛔ slip EV {_slip_ev:.2f} < {self.SLIP_MIN_EV:.2f} — "
+                                  f"MIN stake only (owner rule)")
+
+            # ── OWNER GATE 2 (2026-09-25): never torch the bankroll ──
+            # Even a genuine high-confidence slip never risks more than the
+            # bankroll share, and never bets its final KES (only what it can
+            # afford to lose and keep going). A fresh KES 6.47 or 29.29
+            # bankroll must survive to compound, not die on one slip.
+            sized = min(sized, max(self.MIN_STAKE, float(balance) * self.STAKE_BANKROLL_SHARE))
+            sized = min(sized, max(self.MIN_STAKE, float(balance) * 0.95))
+
             if stake_cap and stake_cap > 0:
                 sized = min(sized, float(stake_cap))
             sized = min(sized, max(1.0, float(balance)))
@@ -3052,7 +3237,8 @@ return { real: real, h: h };
                         self._emit_direct(gui_callback,
                                           f"⏰ {g['name']} kicks off in {remaining:.0f}m — too close, "
                                           "skipping to the next crawl window.")
-                        return {"status": "aborted", "message": "Kickoff too close, moved on"}
+                        return {"status": "skipped", "skipped": True,
+                    "message": "Kickoff too close, moved on"}
 
             self._stats_per_leg(driver, legs, gui_callback=gui_callback)
             if not self._assert_account_session(driver, phone, password,
@@ -3064,6 +3250,34 @@ return { real: real, h: h };
                 self._emit_direct(gui_callback, "⚠️ Could not click the selected odds.")
                 return {"status": "error", "message": f"Only {picked_count} odds selected"}
 
+            # ── Portfolio gates, applied to the slip about to be submitted ──
+            # This MUST run before _open_betslip_and_place: that call commits the
+            # money, so a refusal raised after it is worthless. It is a closure
+            # because a rebuild mid-loop swaps the legs, and the swapped slip
+            # needs re-checking before the next attempt submits it.
+            def _portfolio_gates(_legs_, _product_):
+                _gids = [str(l[2]) for l in _legs_]
+                _gnames = [l[1] for l in _legs_]
+                _gmkts = [l[3] for l in _legs_]
+                _ok, _why = self._correlation_verdict(phone, _gids, _gnames, _gmkts)
+                if not _ok:
+                    self._count_refusal("cross-account correlation")
+                    return False, (f"correlation: {_why or 'account/league/market overlap'}")
+                # Losing-recipe veto: a shape that has cleared VETO_MIN_TRIALS real
+                # bets at VETO_ROI or worse is not retried. Betting it again is not
+                # a new attempt, it is the identical bet the ledger already
+                # proved loses. This is where the learning actually removes money
+                # from play rather than merely reporting it.
+                _vkey = "{0}L@{1}/{2}/[{3}]".format(
+                    len(_legs_), self._band_of(_product_),
+                    self._lead_bucket(min((lead_by_gid.get(l[2]) or 999
+                                           for l in _legs_), default=None) or None),
+                    "-".join(sorted(set(_gmkts))) or "-")
+                if self._recipe_vetoed(_vkey):
+                    self._count_refusal("vetoed losing recipe")
+                    return False, f"vetoed recipe: {_vkey}"
+                return True, ""
+
             # Place with automatic retries. If the slip loses selections (games going
             # in-play / odds removed) and drops below 3 legs, rebuild the slip with
             # fresh pickable games and try again (bounded rounds).
@@ -3071,6 +3285,13 @@ return { real: real, h: h };
             used_legs = legs
             used_product = product
             used_ids = set(str(leg[2]) for leg in legs)
+            _gate_ok, _gate_why = _portfolio_gates(used_legs, used_product)
+            if not _gate_ok:
+                self._emit_direct(gui_callback, f"🛑 portfolio refused this slip — {_gate_why}")
+            return {"status": "skipped", "skipped": True, "message": _gate_why,
+                    "circuit_breaker": "HALT" in _gate_why.upper(),
+                    "correlation_blocked": "correlation" in _gate_why,
+                    "recipe_vetoed": "vetoed recipe" in _gate_why}
             for rebuild_round in range(1, 4):
                 res = self._open_betslip_and_place(driver, stake, phone, password,
                                                    gui_callback=gui_callback,
@@ -3109,7 +3330,7 @@ return { real: real, h: h };
                     self._emit_direct(gui_callback,
                                       "⚠️ Not enough fresh upcoming games to rebuild a valid "
                                       "2+-leg slip — no bet this round.")
-                    return {"status": "aborted",
+                    return {"status": "skipped", "skipped": True,
                             "message": "Slip lost selections and no fresh games left"}
                 used_ids |= {str(l[2]) for l in new_legs}
                 used_legs = new_legs
@@ -3122,6 +3343,17 @@ return { real: real, h: h };
                 if picked_count < 2:
                     return {"status": "error", "message": "Rebuild could not select 2 legs"}
                 time.sleep(1)
+                # The rebuild swapped the legs, so the slip that is about to be
+                # submitted is a DIFFERENT bet than the one vetted above. Re-run
+                # the gates on the new shape rather than trusting the old verdict.
+                _gate_ok, _gate_why = _portfolio_gates(used_legs, used_product)
+                if not _gate_ok:
+                    self._emit_direct(gui_callback,
+                                      f"🛑 portfolio refused the rebuilt slip — {_gate_why}")
+            return {"status": "skipped", "skipped": True, "message": _gate_why,
+                    "circuit_breaker": "HALT" in _gate_why.upper(),
+                    "correlation_blocked": "correlation" in _gate_why,
+                    "recipe_vetoed": "vetoed recipe" in _gate_why}
 
             possible = round(float(stake) * used_product, 2)
             if placed:
@@ -3129,6 +3361,20 @@ return { real: real, h: h };
             real_stake = float(getattr(self, "_last_placed_stake", None)) \
                 if (placed and getattr(self, "_last_placed_stake", None) is not None) \
                 else float(stake)
+            # ── CLV snapshot (2026-09-26): remember the price we were offered ──
+            # Re-read later (CLV_RECHECK_LEAD_MIN before kick-off) to see whether
+            # the market moved in our favour. Positive CLV = we beat the closing
+            # price = real edge, even if this particular slip loses. This is the
+            # only metric that separates skill from luck over thousands of bets.
+            if placed:
+                try:
+                    self._snapshot_clv(
+                        [str(l[2]) for l in used_legs],
+                        [l[3] for l in used_legs],
+                        [(str(l[2]), l[3], l[0]) for l in used_legs],
+                        phone=phone)
+                except Exception:
+                    pass
             return {"status": "success" if placed else "error",
                     "message": "Bet placed" if placed else "Bet not placed",
                     "legs": len(used_legs), "stake": real_stake,
@@ -3397,7 +3643,14 @@ return { real: real, h: h };
         "stake_percent": (0.5, 20.0),
         "stake_cap": (10.0, 2000.0),
         "research_seconds": (10.0, 300.0),
-        "chain_gap": (10.0, 600.0),
+        # OWNER RULE (2026-09-26): the floor is now 10 MINUTES, not 10 seconds.
+        # The engine was chaining a fresh betslip every ~25s, so it never had time
+        # to think — it re-drafted on whatever the board happened to show, which
+        # is exactly how 431 low-odds bets piled up at -43% ROI. Ten minutes gives
+        # the research pass time to actually resolve, the market-weight read to
+        # settle, and kick-off times to move before the next decision. The
+        # governor may slow this further but can never cut it below 10 minutes.
+        "chain_gap": (600.0, 3600.0),
         "min_lead_minutes": (5.0, 45.0),
         "target_odds_min": (1.5, 100.0),
         "target_odds_max": (1.5, 100.0),
@@ -4201,7 +4454,7 @@ return { real: real, h: h };
                                    gui_callback=None, stop_event=None,
                                     visible: bool = True, daily_bets: int = 20,
                                     stake_percent: float = 2.0, stake_cap: float = 500.0,
-                                    chain_bets: bool = True, chain_gap: float = 25.0,
+                                    chain_bets: bool = True, chain_gap: float = 600.0,
                                     research_seconds: float = 60.0,
                                     longshot: bool = True, longshot_odds_min: float = 15.0,
                                     longshot_odds_max: float = 60.0, longshot_odds_cap: float = 0.0,
@@ -4242,6 +4495,14 @@ agent_cfg: dict = None,
             acc_list = [phone] if str(phone or "").strip() else []
             phone = acc_list[0] if acc_list else ""
         acc_list = [str(p).strip() for p in acc_list]
+        # Publish the REAL account list for the supervisor (2026-09-27).
+        # Fibi was reading self._accounts_active, which nothing ever set, so it
+        # received an empty list and fell back to whatever phone numbers it found
+        # in the ledger/supervisor history. That made it park and rebuild drivers
+        # for accounts this machine no longer trades (two stale MSISDNs in the
+        # 011.../072... ledger history), emitting hundreds of warnings an hour
+        # about accounts nobody owns.
+        self._accounts_active = list(acc_list)
         acc_idx = 0
         active_phone = acc_list[acc_idx] if acc_list else ""
         # ── Roll-over mode (owner rule): KES 50, exactly 3 clean/sure legs,
@@ -4312,10 +4573,10 @@ agent_cfg: dict = None,
         self._load_usage()
         limit_txt = "unlimited" if not max_bets else f"max {int(max_bets)}"
         daily_txt = "∞" if not daily_bets else f"max {int(daily_bets)}/day"
-        chain_gap = max(10.0, float(chain_gap))
+        chain_gap = max(600.0, float(chain_gap))  # OWNER: 10 min between slips
         self._emit_direct(gui_callback,
                           f"📡 BET MACHINE: crawling now, hungry mode "
-                          f"{'ON (chained betslips ~every ' + str(int(chain_gap)) + 's while games remain)' if chain_bets else 'OFF (≤1 bet/hr)'}; "
+                           f"{'ON (chained betslips ~every ' + f'{chain_gap/60:g} min while games remain)' if chain_bets else 'OFF (≤1 bet/hr)'}; "
                           f"daily {daily_txt}; scope {limit_txt}; "
                           f"idle scan every {retry:g}s; "
                           f"win-sync every {monitor:g}s; compounded stake "
@@ -4760,7 +5021,11 @@ agent_cfg: dict = None,
         retry = float(cfg.get("retry", 300) or 10)
         monitor = float(cfg.get("monitor", 600) or 20)
         chain_bets = bool(cfg.get("chain_bets", True))
-        chain_gap = max(10.0, float(cfg.get("chain_gap", 25) or 10))
+        # OWNER RULE (2026-09-26): 10 minutes between betslips, not 25 seconds.
+        # 25s left no time for the research pass to resolve or for the market
+        # weights to be re-read, so the machine re-drafted on the raw board and
+        # buried itself in low-odds losers. floor/min = default = 10 minutes.
+        chain_gap = max(600.0, float(cfg.get("chain_gap", 600.0) or 600.0))
         daily_bets = int(cfg.get("daily_bets") or 0)
         max_bets = int(cfg["max_bets"]) if cfg.get("max_bets") else None
         longshot = bool(cfg.get("longshot", True))
@@ -4831,6 +5096,19 @@ agent_cfg: dict = None,
                         # New day → fresh board: archive yesterday's pending slips
                         # to a dated snapshot and start the day at 0 active.
                         self._fresh_day_board(today, gui_callback=gui_callback)
+                        # Weekly portfolio digest (2026-09-26) — the owner's
+                        # standing checkpoint on whether the whole fleet is
+                        # actually making money, so risk limits get widened on
+                        # evidence instead of on how a quiet week felt.
+                        try:
+                            _iso = datetime.now().isocalendar()
+                            _wk = f"{_iso[0]}-W{_iso[1]:02d}"
+                            if st.get("last_digest_week") != _wk:
+                                st["last_digest_week"] = _wk
+                                self._save_sched_state(st)
+                                self._emit_portfolio_digest(gui_callback=gui_callback)
+                        except Exception:
+                            pass
                 day_cap, night_cap = self._period_caps(daily_bets)
                 placed_now = self._today_placed_for(active_phone, today,
                                                     include_orphans=inc_orph)
@@ -5560,8 +5838,8 @@ agent_cfg: dict = None,
                         f"{tag} Bet #{shared['bets_placed']} placed on {active_phone} "
                         f"(day {daily_now}/{'∞' if not daily_bets else int(daily_bets)}) — "
                         + (f"spotting more games → next slip after research "
-                           f"({chain_gap:g}s min)" if chain_bets
-                           else f"next window in {cadence:g}s"))
+                           f"({chain_gap/60:g} min)" if chain_bets
+                           else f"next window in {cadence/60:g} min"))
                     if max_bets and shared["bets_placed"] >= int(max_bets):
                         cap_reached.set()
                         self._engine_busy = False
@@ -5776,10 +6054,50 @@ agent_cfg: dict = None,
                 else:
                     wait = retry
                     msg = (res.get("message") or "") if isinstance(res, dict) else ""
+                    if not str(msg).strip():
+                        # An unexplained empty reason is the worst kind of log
+                        # line: the operator sees "no bet this round ()" and
+                        # cannot tell a deliberate decline from a silent fault.
+                        # Report the truth rather than inventing a cause.
+                        _st = (res.get("status") if isinstance(res, dict) else "") or "unknown"
+                        _keys = sorted(res.keys()) if isinstance(res, dict) else []
+                        msg = (f"declined by the risk layer, no reason given "
+                               f"(status={_st}, keys={_keys}) — no bet placed")
+                        self._emit_direct(
+                            gui_callback,
+                            f"⚠️ {active_phone}: {msg}")
                     self._emit_direct(gui_callback,
                                       f"⏭️ {active_phone}: no bet this round "
                                       f"({str(msg)[:90]}) — re-crawling in {retry:g}s")
-                    if status == "aborted" or status == "error":
+                    # A HEALTHY DECLINE IS NOT A FAILURE (2026-09-27).
+                    # The portfolio gates (drawdown halt, correlation, Kelly,
+                    # recipe veto) and thin-board "no qualifying combination"
+                    # returns deliberately decline without touching the browser.
+                    # Those all reported "aborted", so the supervisor counted
+                    # ordinary quiet rounds as a broken session and tore down and
+                    # rebuilt drivers every few minutes (18+/hour) — manufacturing
+                    # the selenium instability it was warning about, and burying
+                    # the real state in hundreds of warnings. Only genuine
+                    # technical failures count as aborts.
+                    _declined = bool(isinstance(res, dict) and (
+                        res.get("skipped") or res.get("circuit_breaker")
+                        or res.get("correlation_blocked") or res.get("kelly_blocked")
+                        or res.get("recipe_vetoed")))
+                    if _declined:
+                        try:
+                            if self._agent_hub is not None:
+                                self._agent_hub.supervisor.note_skip(str(msg)[:90])
+                        except Exception:
+                            pass
+                        # A deliberate decline means the round completed cleanly,
+                        # so it clears any genuine abort streak accumulated earlier.
+                        if status == "aborted" and self._agent_hub is not None:
+                            try:
+                                self._agent_hub.supervisor.clear_aborts(
+                                    f"round declined cleanly: {str(msg)[:70]}")
+                            except Exception:
+                                pass
+                    elif status == "aborted" or status == "error":
                         if self._agent_hub is not None:
                             try:
                                 self._agent_hub.supervisor.beat_abort(str(msg)[:90])
@@ -8227,6 +8545,91 @@ return 'noicon';
     # settled, an epsilon-greedy bandit starts steering the odds band toward the
     # top-ROI recipes.
     MIN_BANDIT_SETTLED = 30
+    # OWNER RULE (2026-09-26): hard ROI veto. The real-money ledger closed at
+    # -43.6% ROI (KES 11,412 staked -> 6,439 returned) and the loop never once
+    # said NO: recipes like 6L@gt6 (46 bets, -100%) and 5L@gt6 (78 bets, -55%)
+    # were re-bet over and over because the bandit only ever STEERED the odds
+    # band, it never refused a band that was losing every time. A recipe with
+    # enough REAL bets behind it and a clearly negative ROI is now blocked
+    # outright. Enough bets to be sure, and a real-money table only.
+    VETO_MIN_TRIALS = 15
+    VETO_ROI = -0.20
+    # OWNER RULE (2026-09-26): concentration + skew floors.
+    # MAX_MARKET_LEGS_PER_SLIP — no single market may fill more than 2 slots, so
+    # the machine cannot build a 3-4x same-market slip (the correlated-bet trap:
+    # those die together). MIN_SKEW_ODDS — refuse any slip whose combined odds
+    # are below this. The historical "safe-looking" sub-3.0 accumulators
+    # (2L@lt3 / 3L@lt3) were 431 bets at -43% ROI: stacking tiny-odds legs
+    # multiplies the bookmaker's margin, not our edge.
+    MAX_MARKET_LEGS_PER_SLIP = 2
+    MIN_SKEW_ODDS = 3.0
+
+    # Hard ceiling on legs in ONE slip, enforced at both placement funnels.
+    # The ledger is unambiguous here: 14-leg and 25-leg shapes returned -100%
+    # across every market tested. Those are not low-variance lottery tickets,
+    # they are near-certain losses wearing a payout headline, and every one of
+    # them also destroys the Kelly edge the sizing above depends on. Capping at
+    # 6 keeps slips analysable (we can still attribute a result to a market)
+    # and keeps any single mistake from wiping the bookroll.
+    MAX_SLIP_LEGS_HARD = 6
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PORTFOLIO LAYER (2026-09-26) — the missing piece above the accounts.
+    # ══════════════════════════════════════════════════════════════════════
+    # Every account previously bet independently from its own slice of the board.
+    # That is N independent gamblers, not a portfolio: they can all be wrong the
+    # same way, and nothing above them owned the total bankroll or the total risk.
+    # With 2 accounts that is survivable; with 10 it is how a single bad read
+    # (like the 4x-"over" correlated slip) wipes every account simultaneously.
+    # These controls are what a 10-account operation actually needs.
+    PORTFOLIO_PATH = Path(writable_path("sportsape_portfolio.json"))
+
+    # Drawdown circuit breakers. Per-account freeze stops one account bleeding
+    # alone; the portfolio halt is the portfolio-level kill switch that catches
+    # the case where EVERY account is bleeding at once — the exact failure mode
+    # that per-account checks structurally cannot see.
+    ACCOUNT_DRAWDOWN_FREEZE = 0.40   # -40% from peak balance → freeze + review
+    PORTFOLIO_DRAWDOWN_HALT = 0.20   # -20% from peak combined → halt all, recalibrate
+    # How long a bet may sit "active" before we stop counting it as money in
+    # play. Football slips settle within a day; a row still marked active after
+    # that is a settlement-sync artifact, and counting it inflates equity (and
+    # therefore the recorded peak) forever.
+    STALE_ACTIVE_BET_S = 36 * 3600.0
+    # Fractional Kelly. Full Kelly is far too aggressive at the model's real
+    # calibration quality — the ledger shows probabilities off by 6-9 points,
+    # and full Kelly on a mispriced probability compounds that error straight
+    # into ruin. 1/5 Kelly is the standard defence against model error.
+    KELLY_FRACTION = 0.20
+    MAX_KELLY_SHARE = 0.05           # never risk >5% of bankroll on ONE slip
+    # Cross-account correlation caps. Ten accounts betting the same match or the
+    # same market are not diversified — they are one position with the
+    # bookmaker's margin counted ten times.
+    MAX_ACCOUNTS_PER_LEAGUE = 2       # league-window spread across accounts
+    MAX_ACCOUNTS_PER_MARKET = 3       # same market type across the fleet
+    MAX_ACCOUNTS_PER_LEAGUE_WINDOW_H = 6
+
+    # CLV (closing line value) — the measure that actually distinguishes skill
+    # from luck. We record the price we took, then re-read the same market's
+    # price shortly before kick-off. Positive CLV = the market moved in our
+    # favour = we beat the closing price = long-run edge, even while results
+    # read red in the short run. Negative CLV = we are paying up = bleed.
+    CLV_RECHECK_LEAD_MIN = 30         # re-read the line 30 min before kick-off
+    CLV_MAX_AGE_H = 26                 # forget lines from slips older than this
+    CLV_PATH = Path(writable_path("sportsape_clv.json"))
+
+    # ── Systematic cash-out policy (2026-09-26) ────────────────────────
+    # The old rule took a bet only when the offer reached 75% of POSSIBLE WIN.
+    # That is the wrong question for an accumulator. The offer is always a
+    # fraction of a headline number that no longer exists: once two of six legs
+    # are dead, "possible win" is fiction, so a 75%-of-fiction offer can still be
+    # a total loss. Cash-out is about the ONE number that is real — the stake we
+    # are down. So the policy is expressed in stake-recovery terms, with the
+    # possible-win ratio kept only as a "the bet is running" bonus branch.
+    CASHOUT_PROFIT_LOCK = 1.25   # take it if the offer banks stake + 25% profit
+    CASHOUT_MIN_RECOVERY = 0.35  # NEVER crystallise below 35% of stake back
+    CASHOUT_LATE_WINDOW_MIN = 20  # this long before the last leg kicks off...
+    CASHOUT_LATE_RECOVERY = 0.60  # ...accept 60% of stake (variance now dominates)
+    CASHOUT_WIN_FRACTION = 0.75   # running well: 75% of possible win is a good lock
     RETIRE_TRIALS = 50          # need 50+ trials before we trust a retirement decision
     RETIRE_HINTS = 0.15         # real hit-rate must fall this far below predicted to retire
     RETIRE_HINT  = 0.15         # alias used in _maybe_recalibrate
@@ -8292,6 +8695,16 @@ return 'noicon';
         self._stats_cache_time = time.time()
         try:
             self._stats["settled"] = int(self._stats.get("settled") or 0)
+            # Real/shadow split (2026-09-25): back-fill the real count from the
+            # real recipe table if a legacy stats file predates the split, so an
+            # old file is never trusted as "all real".
+            if not int(self._stats.get("settled_real") or 0):
+                _r = self._stats.get("recipes")
+                if isinstance(_r, dict):
+                    self._stats["settled_real"] = sum(
+                        int((v or {}).get("n") or 0) for v in _r.values())
+            self._stats["settled_real"] = int(self._stats.get("settled_real") or 0)
+            self._stats["settled_shadow"] = int(self._stats.get("settled_shadow") or 0)
             self.STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
             self.STATS_PATH.write_text(json.dumps(self._stats, indent=2), encoding="utf-8")
         except Exception:
@@ -8391,17 +8804,30 @@ return 'noicon';
                         (1.0 - (fail_probs[i] / t_fail))
         except Exception:
             pass
-        # ── Recipe stats (unchanged — recipe tracks overall slip outcome) ───
+        # ── Recipe stats (real money vs shadow, tracked SEPARATELY) ─────────
+        # OWNER RULE (2026-09-26): shadow research slips used to be written into the
+        # SAME "recipes" table as real bets, so the headline "1465 settled / learnt
+        # a lot" was mostly the tool grading its own homework with no money at
+        # risk. That flattered the sample and hid the truth: the real-money recipes
+        # were -43.6% ROI over KES 11,412 staked. Shadow picks are still valuable
+        # research, but they now land in "shadow_recipes" and can never inflate
+        # the real-money read. A recipe is only "real" when stake > 0.
         key = (b.get("recipe") or
                {"legs": b.get("legs"), "band": self._band_of(b.get("odds")),
                 "lead": b.get("lead_bucket") or "-", "mix": "-".join(sorted(set(markets))) or "-"})
         key_s = f"{key.get('legs')}L@{key.get('band')}/{key.get('lead')}/[{key.get('mix')}]"
-        r = self._stats.setdefault("recipes", {}).setdefault(
+        _stake_this = float(b.get("stake") or 0.0)
+        _is_real = _stake_this > 0.0
+        _table = "recipes" if _is_real else "shadow_recipes"
+        r = self._stats.setdefault(_table, {}).setdefault(
             key_s, {"trials": 0, "won": 0, "stake": 0.0, "ret": 0.0})
         r["trials"] = int(r.get("trials") or 0) + 1
         r["won"]    = int(r.get("won") or 0) + (1 if won else 0)
-        r["stake"]  = float(r.get("stake") or 0.0) + float(b.get("stake") or 0)
+        r["stake"]  = float(r.get("stake") or 0.0) + _stake_this
         r["ret"]    = float(r.get("ret") or 0.0) + float(b.get("won_amount") or 0)
+        # Keep the legacy combined counter for backwards compatibility, but the
+        # bandit and every ROI read now use "recipes" (real only) — see
+        # _recipe_roi_tables().
 
         # ── Analyst calibration feedback ─────────────────────────────────────
         # For each game ID in this bet, check whether the analyst made a pick and
@@ -8433,6 +8859,18 @@ return 'noicon';
         except Exception:
             pass
 
+        # Owner rule (2026-09-25): real and shadow learning must be counted
+        # SEPARATELY. Shadow slips are free, so a flood of them could otherwise
+        # push the "enough data to trust the bandit" threshold past while the
+        # real-money sample behind that decision is still tiny. settled stays as
+        # the legacy combined total for display; settled_real / settled_shadow are
+        # what the learning gates and the ROI veto actually read.
+        _is_shadow = str(b.get("status") or "").startswith("shadow") \
+            or float(b.get("stake") or 0.0) <= 0.0
+        if _is_shadow:
+            self._stats["settled_shadow"] = int(self._stats.get("settled_shadow") or 0) + 1
+        else:
+            self._stats["settled_real"] = int(self._stats.get("settled_real") or 0) + 1
         self._stats["settled"] = int(self._stats.get("settled") or 0) + 1
         self._maybe_recalibrate()
         self._save_stats()
@@ -8517,17 +8955,36 @@ return 'noicon';
                                       f"vs predicted {pred:.0%} ({trials} bets)")
             else:
                 e["bad_streak"] = 0
+                # OWNER LEARNING (2026-09-25): the old code only ever boosted a
+                # market in this branch — underperformers silently KEPT their last
+                # boost. That is exactly how over kept its 1.22 / btts its 1.30
+                # while losing. Now the adjustment is SIGNED: markets that beat
+                # prediction get weighted up, markets that keep underperforming get
+                # weighted DOWN toward their real hit-rate (never below 0.85 so a
+                # cold streak can't zero a useful market overnight).
+                perf = real - pred
                 boost = 0.0
-                if real >= pred + 0.03:
-                    # More aggressive boost: scale by how far above expectation
-                    boost = round((real - pred) * 6, 2)  # was *5
+                if abs(perf) >= 0.03:
+                    boost = round(perf * 6, 2)
                 # Calibration bonus: a market whose Brier beats its own baseline
                 # (forecast confident AND right) earns extra weight; a market
                 # whose probabilities were sloppy gets its boost clawed back.
                 calib_adj = (brier_baseline - brier_avg) * 2.0
                 boost = round(boost + calib_adj, 2)
+                # OWNER RULE (2026-09-26): the calibration bonus was OVERRIDING the
+                # performance signal. In the live table btts ended up at weight 1.39
+                # while its real hit-rate (72.7%) sat BELOW its predicted 73.1% —
+                # a market that is losing still carrying the biggest boost in the
+                # table, because a decent Brier score added +weight on top of a
+                # small negative perf. "Nicely calibrated but wrong" is still wrong.
+                # So a measured underperformance now DOMINATES: the bonus can only
+                # ever REDUCE the penalty, never manufacture a boost, and the floor
+                # is lowered to 0.60 so a persistent miss is actually reflected
+                # instead of being flattened back to 0.85.
+                if perf < 0:
+                    boost = min(boost, perf * 6.0)  # never let calib_adj rescue a miss
                 if abs(boost) >= 0.02:
-                    e["weight"] = min(1.6, max(0.85, 1.0 + boost))
+                    e["weight"] = min(1.6, max(0.60, 1.0 + boost))
                     self._emit_direct(None,
                                       f"🧠 WEIGHT '{mk}': → {e['weight']:.2f} "
                                       f"(real {real:.0%} vs expected {pred:.0%}, "
@@ -8538,7 +8995,37 @@ return 'noicon';
 
     def _market_type_weight(self, mk: str) -> float:
         self._load_stats()
-        return float((self._stats.get("market_types") or {}).get(str(mk), {}).get("weight") or 1.0)
+        e = (self._stats.get("market_types") or {}).get(str(mk)) or {}
+        w = float(e.get("weight") or 1.0)
+        trials = int(e.get("trials") or 0)
+        # OWNER LEARNING (2026-09-25): the market-weight table used to hold STALE
+        # BOOSTS. On 09-24 over/btts/under were sitting at 1.22/1.30/1.18 while each
+        # underperformed its predicted hit-rate by 6-9 points (over 74.8% vs 82.6%,
+        # btts 74.8% vs 80.7%, under 78.9% vs 87.4%) — so selection literally ranked
+        # the losing markets ABOVE the winning ones and the account bled. Once we
+        # have enough evidence that a market underperforms, a stale boost can never
+        # inflate it: cap its weight at 1.0 (neutral) until the recalibrator writes a
+        # signed penalty. Applied on every read so the fix is live immediately.
+        #
+        # OWNER RULE (2026-09-26): the 50-bet threshold was too lax AND the "cap at
+        # 1.0" was too weak. The LIVE stats showed btts sitting at weight 1.39 while
+        # its real hit-rate (72.7%) was BELOW its predicted 73.1% — a losing market
+        # carrying the biggest boost in the table, purely because 1.0 is still a
+        # free pass. So: the guard now scales with evidence (from 25 bets, not 50)
+        # and a proven underperformer is pushed BELOW neutral in proportion to how
+        # far it missed, instead of merely being allowed to sit at 1.0. A market
+        # that keeps missing its own forecast can never rank above an honest one.
+        if trials >= 25:
+            real = (e.get("won") or 0) / trials
+            pred = (e.get("expected") or 0.0) / trials
+            if pred > 0 and real < pred:
+                miss = (pred - real) / pred  # fractional shortfall, 0..1
+                # Neutral at a whiff, scaling down as the miss grows. Floor 0.60 so
+                # a genuinely useful market is damped, not deleted (retirement is
+                # the tool's job for hopeless markets, not this read guard).
+                penalty = max(0.0, min(0.40, miss * 4.0))
+                w = min(w, 1.0 - penalty)
+        return w
 
     def _league_name(self, game_name: str) -> str:
         """Best-effort league label for a 'Home vs Away' row (rule-based, no API)."""
@@ -8588,6 +9075,635 @@ return 'noicon';
         self._load_stats()
         return str(mk) in (self._stats.get("retired_markets") or [])
 
+    # ══════════════════════════════════════════════════════════════════════
+    # PORTFOLIO LAYER (2026-09-26)
+    # ══════════════════════════════════════════════════════════════════════
+    # Owns the TOTAL bankroll and the TOTAL risk for a fleet of accounts, and
+    # sits above the per-account workers. Three jobs:
+    #   1. Track peak balance per account + portfolio, so drawdown circuit
+    #      breakers have a real reference point (a 40% loss off a KES 30 peak
+    #      is a very different event from 40% off KES 5,000).
+    #   2. Refuse placements that concentrate correlated risk across accounts
+    #      (one game, one account; spread a league; cap a market across the fleet).
+    #   3. Size each slip with fractional Kelly, scaled down by the variance of
+    #      that account's own recent results, and hard-capped as a share of the
+    #      PORTFOLIO total — not just the account balance.
+    def _load_portfolio(self) -> dict:
+        pf = getattr(self, "_portfolio", None)
+        if pf is not None:
+            return pf
+        pf = {"peaks": {}, "portfolio_peak": 0.0, "frozen": {},
+              "halted": False, "halt_reason": "", "refused": 0,
+              "refused_reasons": {}}
+        try:
+            if self.PORTFOLIO_PATH.exists():
+                data = json.loads(self.PORTFOLIO_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    pf.update({k: v for k, v in data.items()
+                               if k in ("peaks", "portfolio_peak", "frozen",
+                                        "halted", "halt_reason", "refused",
+                                        "refused_reasons", "last_equity")})
+        except Exception:
+            pass
+        pf.setdefault("peaks", {})
+        pf.setdefault("frozen", {})
+        pf.setdefault("refused_reasons", {})
+        pf.setdefault("last_equity", {})
+        self._portfolio = pf
+        return pf
+
+    def _save_portfolio(self):
+        try:
+            self._load_portfolio()
+            self.PORTFOLIO_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self.PORTFOLIO_PATH.write_text(
+                json.dumps(self._portfolio, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _active_stake_for(self, phone: str) -> float:
+        """Cash currently sitting in OPEN bets for one account.
+
+        This is why drawdown cannot be measured on the cash balance alone.
+        Placing a bet moves stake out of the cash balance and into the slip, so
+        cash DROPS every time a bet is placed and only comes back if that bet
+        wins. Judging drawdown on cash therefore books every bet as an instant
+        loss, and a machine that places bets correctly looks like it is being
+        slaughtered. Equity = cash + open stake, so only a genuinely lost bet
+        reduces it.
+        """
+        total = 0.0
+        now = time.time()
+        for b in (getattr(self, "_bets", None) or []):
+            if str(b.get("phone") or "") != str(phone or ""):
+                continue
+            if str(b.get("status") or "") not in ("active", ""):
+                continue
+            # A bet that is still "active" long after kickoff is not money in
+            # play, it is a row the settlement sync failed to close. Counting it
+            # inflates equity, which inflates the recorded PEAK, and the fleet
+            # can then never fall back to its true high-water mark -- so a
+            # one-off stale row permanently poisons every future drawdown
+            # calculation. Ignore anything older than a settled-football
+            # window; if it is still unresolved by then, treat it as lost.
+            _ts = 0.0
+            for _k in ("ts", "placed_ts", "placed_at", "created_at", "time"):
+                try:
+                    _ts = float(b.get(_k) or 0.0)
+                except (TypeError, ValueError):
+                    _ts = 0.0
+                if _ts > 0:
+                    break
+            if _ts <= 0:
+                # unparseable/ISO timestamp: fall back to the string form
+                _iso = str(b.get("placed_at") or b.get("ts") or "")
+                try:
+                    _ts = datetime.fromisoformat(_iso).timestamp()
+                except Exception:
+                    _ts = 0.0
+            if _ts <= 0:
+                # No usable timestamp: we cannot prove the row is stale, so
+                # treat it as live. Only an explicitly OLD bet is excluded --
+                # guessing "old" from a missing clock would silently zero out
+                # real money in play.
+                _ts = now
+            if (now - _ts) > self.STALE_ACTIVE_BET_S:
+                continue
+            try:
+                total += float(b.get("stake") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return total
+
+    def _equity_for(self, phone: str, balance: float) -> float:
+        """True economic value of one account = spendable cash + money in play."""
+        try:
+            b = float(balance or 0.0)
+        except (TypeError, ValueError):
+            b = 0.0
+        return max(0.0, b) + self._active_stake_for(phone)
+
+    def _fleet_equity(self, balances: dict) -> float:
+        """Total equity across the WHOLE fleet.
+
+        Accounts missing from `balances` (because only one account has been read
+        this round) contribute their last known equity instead of being treated
+        as zero. Without that, a single-account round reads as if every other
+        account had vanished, which manufactures a huge fake drawdown and halts
+        the fleet for no reason.
+        """
+        pf = self._load_portfolio()
+        last = pf.get("last_equity") or {}
+        total = 0.0
+        seen = set()
+        for phone, bal in (balances or {}).items():
+            key = str(phone)
+            seen.add(key)
+            total += self._equity_for(key, bal)
+        for key, eq in last.items():
+            if key in seen:
+                continue
+            try:
+                total += float(eq or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return total
+
+    def _note_balances(self, balances: dict):
+        """Update peak-EQUITY tracking for the drawdown breakers. `balances` maps
+        phone -> current cash balance. Peaks only ever rise, so the reference
+        point survives losses and a restart."""
+        try:
+            pf = self._load_portfolio()
+            last = pf.setdefault("last_equity", {})
+            for phone, bal in (balances or {}).items():
+                key = str(phone)
+                try:
+                    eq = self._equity_for(key, bal)
+                except Exception:
+                    continue
+                last[key] = round(eq, 2)
+                prev = float(pf["peaks"].get(key) or 0.0)
+                if eq > prev:
+                    pf["peaks"][key] = round(eq, 2)
+            # The portfolio peak must be the peak of the FLEET total, and must be
+            # compared against a fleet total computed the same way every time.
+            # Only ratchet the peak up from a reading that actually covered the
+            # fleet: seeding a fleet peak from one account's total would lock in
+            # a high-water mark the real fleet can never reach, and every later
+            # round would then look like a total loss.
+            fleet = self._fleet_equity(balances)
+            known = set(last.keys()) | {str(p) for p in (balances or {}).keys()}
+            covered = len({str(p) for p in (balances or {}).keys()} & known)
+            # A single account is not a fleet. Until we have seen more than one,
+            # any "total" is one account's balance wearing a fleet's name.
+            if fleet > 0 and len(known) > 1 and covered >= len(known):
+                if fleet > float(pf.get("portfolio_peak") or 0.0):
+                    pf["portfolio_peak"] = round(fleet, 2)
+            self._save_portfolio()
+        except Exception:
+            pass
+
+    def _account_drawdown(self, phone: str, balance: float) -> float:
+        """Fractional drawdown from this account's peak EQUITY (0.0 = at peak)."""
+        pf = self._load_portfolio()
+        peak = float(pf["peaks"].get(str(phone)) or 0.0)
+        if peak <= 0:
+            return 0.0
+        eq = self._equity_for(str(phone), balance)
+        return max(0.0, (peak - eq) / peak)
+
+    def _portfolio_drawdown(self, balances: dict) -> float:
+        pf = self._load_portfolio()
+        peak = float(pf.get("portfolio_peak") or 0.0)
+        if peak <= 0:
+            return 0.0
+        total = self._fleet_equity(balances)
+        if total <= 0:
+            return 0.0
+        return max(0.0, (peak - total) / peak)
+
+    def _circuit_breaker_check(self, phone: str, balance: float, balances: dict = None):
+        """Return (allowed: bool, reason: str). The portfolio-level halt is checked
+        FIRST because it is the case per-account checks cannot see: every account
+        bleeding at the same time."""
+        pf = self._load_portfolio()
+        # The halt latches on the way in, but it MUST be able to clear itself.
+        # Otherwise one bad reading (a single-account round, a transient zero,
+        # a slow balance read) halts the whole fleet permanently and the engine
+        # can never recover without a manual file edit -- it just prints
+        # "PORTFOLIO HALT" forever while the money sits idle. Re-evaluate the
+        # live drawdown each round and release the latch once the fleet is
+        # genuinely back inside the limit.
+        if pf.get("halted"):
+            _bal_map = balances if isinstance(balances, dict) and balances else None
+            if _bal_map:
+                _live_dd = self._portfolio_drawdown(_bal_map)
+                if _live_dd < self.PORTFOLIO_DRAWDOWN_HALT:
+                    _was = pf.get("halt_reason") or ""
+                    pf["halted"] = False
+                    pf["halt_reason"] = ""
+                    self._save_portfolio()
+                    self._emit_direct(None,
+                                      f"🟢 PORTFOLIO HALT lifted — drawdown back to "
+                                      f"-{_live_dd:.0%}, inside the "
+                                      f"-{self.PORTFOLIO_DRAWDOWN_HALT:.0%} limit. "
+                                      f"Previous: {_was}")
+                else:
+                    return False, (f"PORTFOLIO HALT: {pf.get('halt_reason') or 'drawdown limit hit'}")
+            else:
+                # No balance map to re-evaluate against, so the latch stands.
+                return False, f"PORTFOLIO HALT: {pf.get('halt_reason') or 'drawdown limit hit'}"
+        if float(balance or 0) <= 0:
+            return False, "no funds"
+        dd = self._account_drawdown(phone, balance)
+        if dd >= self.ACCOUNT_DRAWDOWN_FREEZE:
+            pf["frozen"][str(phone)] = True
+            self._save_portfolio()
+            return False, (f"account frozen: -{dd:.0%} from peak "
+                           f"(limit -{self.ACCOUNT_DRAWDOWN_FREEZE:.0%})")
+        if pf["frozen"].get(str(phone)):
+            return False, "account frozen by drawdown breaker"
+        if balances:
+            # Do NOT trip a fleet-wide halt off a partial reading. If this round
+            # only managed to read ONE of the accounts, the total is not a fleet
+            # total and comparing it to the fleet peak manufactures a huge fake
+            # drawdown. _fleet_equity() substitutes last-known equity for
+            # missing accounts, which is right most of the time, but if that
+            # history is itself cold (first run, rotated state) there is nothing
+            # to fall back on and the result is a fraction of the real fleet.
+            # Require the total to be a genuine majority of the tracked fleet,
+            # otherwise treat it as "not enough data" and do not halt.
+            _tracked = set((self._load_portfolio().get("last_equity") or {}).keys())
+            _tracked |= {str(p) for p in balances.keys()}
+            _covered = len({str(p) for p in balances.keys()} & _tracked)
+            if _tracked and _covered * 2 <= len(_tracked):
+                self._emit_direct(
+                    None,
+                    f"ℹ Portfolio drawdown check skipped — only {_covered} of "
+                    f"{len(_tracked)} accounts read this round; not enough data "
+                    f"to judge the fleet safely (no halt).")
+            else:
+                pdd = self._portfolio_drawdown(balances)
+                if pdd >= self.PORTFOLIO_DRAWDOWN_HALT:
+                    pf["halted"] = True
+                    pf["halt_reason"] = (f"portfolio -{pdd:.0%} from combined peak "
+                                         f"(limit -{self.PORTFOLIO_DRAWDOWN_HALT:.0%})")
+                    self._save_portfolio()
+                    try:
+                        self._emit_direct(None,
+                                          f"🛑 PORTFOLIO HALT: {pf['halt_reason']} — all accounts "
+                                          "stopped. Review the market table before restarting.")
+                    except Exception:
+                        pass
+                    # Never hand back an empty reason: the caller reports the
+                    # message verbatim, and a blank one produces the useless
+                    # "no bet this round ()" line that hides WHY the round was
+                    # skipped. Falling through the lift above clears halt_reason,
+                    # so fall back to a generic but truthful description.
+                    return False, (pf.get("halt_reason")
+                                   or "portfolio drawdown limit hit")
+        return True, ""
+
+    def _portfolio_metrics(self) -> dict:
+        """The one-screen answer to "is this actually working?" — real results
+        only, with the refusals and the CLV next to them.
+
+        A strategy that places few bets and refuses the rest is not broken; it is
+        working. Without the refusal count next to the profit count, a quiet week
+        looks identical to a broken week, and the natural (wrong) reaction is to
+        loosen the gates.
+        """
+        try:
+            self._load_stats()
+            pf = self._load_portfolio()
+            real_stake = 0.0
+            real_ret = 0.0
+            real_n = 0
+            cashed = 0.0
+            for v in (self._recipe_roi_tables() or {}).values():
+                real_stake += float(v.get("stake") or 0.0)
+                real_ret += float(v.get("ret") or 0.0)
+                real_n += int(v.get("trials") or 0)
+            for b in (getattr(self, "_bets", None) or []):
+                if b.get("status") == "cashed_out":
+                    cashed += float(b.get("cashed_out_amount") or 0.0)
+            roi = ((real_ret - real_stake) / real_stake) if real_stake > 0 else 0.0
+            clv = self._clv_summary()
+            clv_n = sum(e["n"] for e in clv.values())
+            clv_avg = (sum(e["sum"] for e in clv.values()) / clv_n) if clv_n else None
+            return {
+                "real_bets": real_n,
+                "real_staked": round(real_stake, 2),
+                "real_returned": round(real_ret, 2),
+                "real_roi": round(roi, 4),
+                "cashed_out": round(cashed, 2),
+                "settled_real": int(self._stats.get("settled_real") or 0),
+                "settled_shadow": int(self._stats.get("settled_shadow") or 0),
+                "refused": int(pf.get("refused") or 0),
+                "refused_reasons": dict(pf.get("refused_reasons") or {}),
+                "frozen_accounts": sorted(pf.get("frozen", {}).keys()),
+                "halted": bool(pf.get("halted")),
+                "halt_reason": pf.get("halt_reason") or "",
+                "clv_samples": clv_n,
+                "clv_avg": round(clv_avg, 4) if clv_avg is not None else None,
+                "clv_by_market": {k: e["avg"] for k, e in sorted(clv.items())},
+            }
+        except Exception:
+            return {}
+
+    def _emit_portfolio_digest(self, gui_callback=None):
+        """Print the honest state of the whole fleet. The CLV line is the one to
+        read before anything else: if it is negative, the model is paying up and
+        no amount of bet volume will fix it."""
+        try:
+            m = self._portfolio_metrics()
+            if not m:
+                return
+            _clv_txt = (f"{m['clv_avg']:+.2%} over {m['clv_samples']} samples"
+                        if m.get("clv_avg") is not None else "not enough closed lines yet")
+            self._emit_direct(gui_callback,
+                f"📊 PORTFOLIO DIGEST — real {m['real_bets']} bets, "
+                f"KES {m['real_staked']:,.2f} staked, KES {m['real_returned']:,.2f} returned, "
+                f"ROI {m['real_roi']:+.1%}"
+                + (f", KES {m['cashed_out']:,.2f} banked via cash-out" if m.get("cashed_out") else ""))
+            self._emit_direct(gui_callback,
+                f"📐 CLV {_clv_txt}"
+                + (f" | by market: " + ", ".join(
+                    f"{k} {v:+.2%}" for k, v in m['clv_by_market'].items())
+                   if m.get("clv_by_market") else ""))
+            self._emit_direct(gui_callback,
+                f"🚫 Refused {m['refused']} slip(s)"
+                + (f" (" + ", ".join(f"{k}: {v}" for k, v in
+                                     sorted(m['refused_reasons'].items(),
+                                            key=lambda kv: -kv[1])[:5]) + ")"
+                   if m.get("refused_reasons") else "")
+                + f" | learning: {m['settled_real']} real / {m['settled_shadow']} shadow settled")
+            if m.get("halted"):
+                self._emit_direct(gui_callback, f"🛑 HALTED: {m['halt_reason']}")
+            elif m.get("frozen_accounts"):
+                self._emit_direct(gui_callback,
+                                  f"❄️ Frozen accounts: {', '.join(m['frozen_accounts'])}")
+        except Exception:
+            pass
+
+    def _reset_circuit_breakers(self):
+        """Clear freeze/halts — used on a deliberate owner restart after review."""
+        pf = self._load_portfolio()
+        pf["frozen"] = {}
+        pf["halted"] = False
+        pf["halt_reason"] = ""
+        self._save_portfolio()
+        try:
+            self._emit_direct(None, "🔓 Circuit breakers reset (owner restart).")
+        except Exception:
+            pass
+
+    # ── Cross-account correlation engine ────────────────────────────────
+    def _count_refusal(self, reason: str):
+        pf = self._load_portfolio()
+        pf["refused"] = int(pf.get("refused") or 0) + 1
+        r = pf["refused_reasons"]
+        r[reason] = int(r.get(reason) or 0) + 1
+        self._save_portfolio()
+
+    def _active_exposure(self, within_hours: float = None) -> dict:
+        """Scan open real bets and index them for correlation checks.
+        within_hours limits the window (default CLV_MAX_AGE_H)."""
+        within_h = float(within_hours or self.CLV_MAX_AGE_H)
+        cutoff = datetime.now().timestamp() - within_h * 3600.0
+        out = {"games": {}, "markets": {}, "leagues": {}}
+        for b in (getattr(self, "_bets", None) or []):
+            if str(b.get("status") or "") not in ("active", "", None):
+                continue
+            try:
+                if (b.get("placed_at") or "") and \
+                        datetime.fromisoformat(b.get("placed_at")).timestamp() < cutoff:
+                    continue
+            except Exception:
+                pass
+            ph = str(b.get("phone") or "")
+            for gid in (b.get("game_ids") or []):
+                out["games"].setdefault(str(gid), set()).add(ph)
+            for nm in (b.get("leg_names") or []):
+                lg = self._league_name(nm)
+                if lg and lg != "Unknown":
+                    out["leagues"].setdefault(lg, set()).add(ph)
+            for mk in (b.get("markets") or []):
+                out["markets"].setdefault(str(mk), set()).add(ph)
+        return out
+
+    def _correlation_verdict(self, phone: str, game_ids, leg_names, markets) -> tuple:
+        """Portfolio-level refusal test for a candidate slip.
+        Returns (allowed, reason). Rules:
+          * ONE game belongs to ONE account. If any game in this slip is already
+            on a sibling account, refuse — two accounts on one match is one
+            position with the margin counted twice.
+          * Cap a league to MAX_ACCOUNTS_PER_LEAGUE accounts.
+          * Cap one market type to MAX_ACCOUNTS_PER_MARKET accounts.
+        """
+        try:
+            exp = self._active_exposure()
+            ph = str(phone or "")
+            for gid in (game_ids or []):
+                owners = exp["games"].get(str(gid)) or set()
+                others = owners - {ph}
+                if others:
+                    self._count_refusal("game already on another account")
+                    return False, (f"game {gid} is already held by account(s) "
+                                   f"{', '.join(sorted(others))} — one game, one account")
+            lgs = {self._league_name(n) for n in (leg_names or [])}
+            lgs = {l for l in lgs if l and l != "Unknown"}
+            for lg in lgs:
+                others = (exp["leagues"].get(lg) or set()) - {ph}
+                if len(others) >= self.MAX_ACCOUNTS_PER_LEAGUE:
+                    self._count_refusal("league spread cap")
+                    return False, (f"league '{lg}' is already on {len(others)} accounts "
+                                   f"(cap {self.MAX_ACCOUNTS_PER_LEAGUE})")
+            for mk in set(markets or []):
+                others = (exp["markets"].get(str(mk)) or set()) - {ph}
+                if len(others) >= self.MAX_ACCOUNTS_PER_MARKET:
+                    self._count_refusal("market concentration cap")
+                    return False, (f"market '{mk}' is already on {len(others)} accounts "
+                                   f"(cap {self.MAX_ACCOUNTS_PER_MARKET})")
+        except Exception:
+            return True, ""
+        return True, ""
+
+    # ── Variance-scaled fractional Kelly sizing ─────────────────────────
+    def _account_variance(self, phone: str, lookback: int = 20) -> float:
+        """Std-dev of per-bet RETURN FRACTION (not KES) for this account over its
+        recent settled bets. Return-fraction keeps it scale-free, so an account
+        with KES 30 and one with KES 5,000 are comparable."""
+        pnls = []
+        for b in (getattr(self, "_bets", None) or []):
+            if str(b.get("phone") or "") != str(phone or ""):
+                continue
+            if b.get("status") not in ("won", "lost"):
+                continue
+            st = float(b.get("stake") or 0.0)
+            if st <= 0:
+                continue
+            win = float(b.get("won_amount") or 0.0) if b.get("status") == "won" else 0.0
+            pnls.append((win - st) / st)
+        pnls = pnls[-int(lookback):]
+        if len(pnls) < 3:
+            return 1.0  # not enough data — assume typical accumulator variance
+        mean = sum(pnls) / len(pnls)
+        var = sum((x - mean) ** 2 for x in pnls) / max(1, len(pnls) - 1)
+        return max(0.05, var ** 0.5)
+
+    def _kelly_stake(self, phone: str, balance: float, joint_prob: float,
+                     combined_odds: float, portfolio_total: float = None) -> float:
+        """Fractional-Kelly stake, scaled down by the account's own volatility and
+        hard-capped as a share of BOTH the account balance and the portfolio.
+
+        f* = (b*p - q) / b  with b = decimal odds - 1, p = weighted joint win
+        chance, q = 1 - p. The full-Kelly value is then multiplied by
+        KELLY_FRACTION (0.20) because the model's own calibration error is
+        material, and divided by the account's realised volatility so a
+        high-variance account automatically bets smaller.
+        """
+        try:
+            p = max(0.01, min(0.99, float(joint_prob or 0.0)))
+            o = max(1.01, float(combined_odds or 1.0))
+            b = o - 1.0
+            q = 1.0 - p
+            f = (b * p - q) / b
+            if f <= 0:
+                return 0.0
+            # Order matters. The cap is applied to the EDGE-DRIVEN size first, and
+            # volatility scaling comes after. Reversing these (scaling first, then
+            # capping) silently nullified the volatility adjustment: whenever the
+            # cap bound — which is most real edges — a high-variance account ended
+            # up staking exactly the same as a calm one, which is the opposite of
+            # the point. Capping first makes MAX_KELLY_SHARE a true safety rail on
+            # the maximum, and guarantees volatility always scales the stake down.
+            stake = float(balance or 0.0) * f * self.KELLY_FRACTION
+            cap = float(balance or 0.0) * self.MAX_KELLY_SHARE
+            if portfolio_total:
+                cap = min(cap, float(portfolio_total) * self.MAX_KELLY_SHARE)
+            stake = min(stake, cap)
+            stake /= self._account_variance(phone)
+            return max(0.0, stake)
+        except Exception:
+            return 0.0
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CLV — closing line value (2026-09-26)
+    # ══════════════════════════════════════════════════════════════════════
+    # Results alone cannot tell skill from luck: a bettor who always takes the
+    # pre-kickoff price can show a losing record while actually beating the
+    # closing line (and therefore earning in expectation over thousands of bets).
+    # So we snapshot the price we took, then re-read the same market's price
+    # shortly before kick-off. CLV = (bet_odds / closing_odds) - 1. Positive
+    # means the market moved against us, i.e. we took a better price than the
+    # final one — the actual measure of edge.
+    def _snapshot_clv(self, game_ids, markets, odds_by_market, phone: str = None):
+        """Record the prices we took so they can be compared to the closing line."""
+        try:
+            store = self._clv_store()
+            for gid, mk, o in (odds_by_market or []):
+                key = f"{gid}|{mk}"
+                store[key] = {
+                    "bet_odds": round(float(o), 3),
+                    "close_odds": None,
+                    "clv": None,
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                    "phone": str(phone or ""),
+                }
+            self._save_clv()
+        except Exception:
+            pass
+
+    def _clv_store(self) -> dict:
+        store = getattr(self, "_clv", None)
+        if store is None:
+            store = {}
+            try:
+                if self.CLV_PATH.exists():
+                    loaded = json.loads(self.CLV_PATH.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        store = loaded
+            except Exception:
+                store = {}
+            self._clv = store
+        return store
+
+    def _save_clv(self):
+        """Persist CLV records. CLV is measured over thousands of bets, so losing
+        it on every restart would make the whole metric useless."""
+        try:
+            self.CLV_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self.CLV_PATH.write_text(json.dumps(self._clv_store(), indent=2),
+                                     encoding="utf-8")
+        except Exception:
+            pass
+
+    def _record_closing_odds(self, gid, market, closing_odds):
+        """Update one market's closing price. Returns the CLV fraction, or None."""
+        try:
+            store = self._clv_store()
+            rec = store.get(f"{gid}|{market}")
+            if not rec or rec.get("close_odds") is not None:
+                return None
+            bo, co = float(rec.get("bet_odds") or 0), float(closing_odds or 0)
+            if bo <= 0 or co <= 0:
+                return None
+            clv = (bo / co) - 1.0
+            rec["close_odds"] = round(co, 3)
+            rec["clv"] = round(clv, 4)
+            self._save_clv()
+            return clv
+        except Exception:
+            return None
+
+    def _clv_summary(self) -> dict:
+        """Aggregate CLV per market so we can see whether the fleet is beating the
+        closing line anywhere at all — the honest measure of long-run edge."""
+        out = {}
+        for key, rec in (self._clv_store() or {}).items():
+            if rec.get("clv") is None:
+                continue
+            mk = str(key).split("|", 1)[1] if "|" in key else "?"
+            e = out.setdefault(mk, {"n": 0, "sum": 0.0})
+            e["n"] += 1
+            e["sum"] += float(rec["clv"])
+        for e in out.values():
+            e["avg"] = round(e["sum"] / e["n"], 4) if e["n"] else 0.0
+        return out
+
+    def _recipe_roi_tables(self) -> dict:
+        """Real-money recipe ROI table for learning decisions.
+
+        OWNER RULE (2026-09-26): shadow research slips no longer pollute the
+        learning signal. Pre-split, "recipes" mixed real bets with stake=0
+        shadow research, so a recipe's ROI was diluted by tickets that never
+        risked money and the "1465 settled" headline counted mostly homework.
+        Now "recipes" holds real bets only and "shadow_recipes" holds the
+        research. This returns the REAL table so the bandit and the veto learn
+        from money actually at risk. Legacy entries (recorded before the split)
+        that carry stake>0 are folded in automatically, because the split is
+        keyed on stake and old rows already have their real stake recorded.
+        """
+        self._load_stats()
+        real = dict(self._stats.get("recipes") or {})
+        # A legacy row with zero stake is shadow research; a row with stake>0 is
+        # real money and already sits in "recipes". Nothing else to migrate.
+        return real
+
+    def _recipe_vetoed(self, recipe_key: str) -> bool:
+        """True when a recipe has enough REAL bets and a clearly negative ROI.
+
+        OWNER RULE (2026-09-26): the learning loop had no way to say NO. The
+        bandit only steered the odds window, so losing recipes were re-bet
+        indefinitely (6L@gt6: 46 real bets, -100%). This is the refusal: with
+        VETO_MIN_TRIALS real bets behind it and ROI under VETO_ROI, the recipe
+        is blocked outright rather than merely down-weighted.
+        """
+        try:
+            recs = self._recipe_roi_tables()
+            v = recs.get(str(recipe_key))
+            if not v:
+                return False
+            trials = int(v.get("trials") or 0)
+            stake = float(v.get("stake") or 0.0)
+            if trials < self.VETO_MIN_TRIALS or stake <= 0:
+                return False
+            roi = ((v.get("ret") or 0.0) - stake) / stake
+            if roi <= self.VETO_ROI:
+                if not getattr(self, "_veto_logged", None):
+                    self._veto_logged = set()
+                if recipe_key not in self._veto_logged:
+                    self._veto_logged.add(recipe_key)
+                    self._emit_direct(None,
+                                      f"⛔ VETO recipe '{recipe_key}': {trials} real bets, "
+                                      f"ROI {roi:+.0%} — not betting this shape again")
+                return True
+        except Exception:
+            return False
+        return False
+
     def _bandit_target_range(self, default_lo: float, default_hi: float) -> tuple:
         """Steer the combined-odds window toward the top-ROI band once enough bets
         have settled.
@@ -8600,12 +9716,15 @@ return 'noicon';
            weight system can be further guided. No hard filtering — just transparency.
         """
         self._load_stats()
-        settled = int(self._stats.get("settled") or 0)
+        # Gate on the REAL-money sample only (2026-09-25). The bandit steers
+        # real stakes, so it must not be unlocked by thousands of free shadow
+        # slips — settled_real is the count that actually carries risk.
+        settled = int(self._stats.get("settled_real") or 0)
         if settled < self.MIN_BANDIT_SETTLED:
             return float(default_lo), float(default_hi)
         bands = {"3-4": (3.0, 4.0), "4-5": (4.0, 5.0), "5-6": (5.0, 6.0),
                  "6-8": (6.0, 8.0), "8-12": (8.0, 12.0), "12-15": (12.0, 15.0)}
-        recs = self._stats.get("recipes") or {}
+        recs = self._recipe_roi_tables()
         eligible = {}
         mix_roi: dict = {}
         leg_roi: dict = {}
@@ -9250,6 +10369,62 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
             pass
         return False
 
+    def _cashout_decision(self, offer: float, stake: float, possible_win: float,
+                          won: int, pending: int, bad: int,
+                          mins_to_last_ko=None) -> tuple:
+        """Systematic cash-out policy (2026-09-26). Returns (take, reason).
+
+        Ordered from most to least defensive. The governing quantity is the
+        STAKE, not the possible win:
+
+        1. Below CASHOUT_MIN_RECOVERY of the stake → never take it. Selling at a
+           70% loss to "stop the bleeding" converts a recoverable position into a
+           certain loss, and the ledger's largest ROI drains started exactly
+           this way.
+        2. Offer banks stake x CASHOUT_PROFIT_LOCK or better → take it. This is
+           the whole point of cash-out: a guaranteed profit on a bet that can
+           still lose, on an accumulator, at any time.
+        3. Last leg imminent and offer still returns most of the stake → take it.
+           With kick-off this close the remaining legs' variance dominates any
+           edge the model claims, so the risk premium we would demand is gone.
+        4. The bet is running and the offer is a large slice of what is still
+           achievable → bank it.
+        """
+        try:
+            o = float(offer or 0.0)
+            s = float(stake or 0.0)
+            if o <= 0 or s <= 0:
+                return False, "no value offered"
+            rec = o / s
+            if rec < self.CASHOUT_MIN_RECOVERY:
+                return False, (f"only {rec:.0%} of stake back — refusing to "
+                               f"crystallise a loss (floor "
+                               f"{self.CASHOUT_MIN_RECOVERY:.0%})")
+            if rec >= self.CASHOUT_PROFIT_LOCK:
+                return True, (f"banks {rec:.0%} of stake "
+                              f"(KES {o:,.2f} vs KES {s:,.2f}) — locked profit, "
+                              f"the remaining {pending} leg(s) cannot improve on this")
+            try:
+                late = mins_to_last_ko is not None and \
+                    float(mins_to_last_ko) <= self.CASHOUT_LATE_WINDOW_MIN
+            except (TypeError, ValueError):
+                late = False
+            if late and rec >= self.CASHOUT_LATE_RECOVERY:
+                return True, (f"last leg within {self.CASHOUT_LATE_WINDOW_MIN}m and "
+                              f"{rec:.0%} of stake back — variance now dominates, "
+                              f"locking {rec:.0%}")
+            pw = float(possible_win or 0.0)
+            if pw > 0:
+                wr = o / pw
+                if wr >= self.CASHOUT_WIN_FRACTION:
+                    return True, (f"{wr:.0%} of the remaining possible win "
+                                  f"(KES {o:,.2f}) with {won}/{won+pending+bad} legs won")
+            return False, (f"{rec:.0%} of stake back, below the "
+                           f"{self.CASHOUT_PROFIT_LOCK:.2f}x profit lock and not "
+                           f"running enough — holding")
+        except Exception:
+            return False, "cash-out decision failed, holding"
+
     def _auto_cashout_pass(self, driver, rows: list, gui_callback=None):
         """Smart cash-out pass: for each active ledger bet where the site offers
         a cash-out, read per-leg status, then decide under owner policy:
@@ -9320,25 +10495,43 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
                         f"{pending}) — retry next pass")
                     continue
                 ratio = offer / pw if pw else 0.0
-                if ratio >= self.cashout_threshold:
+                _stake = float(local_b.get("stake") or cr.get("stake") or 0.0)
+                # Time pressure on the surviving legs — the cash-out policy needs
+                # to know how close the last playable leg is, because near
+                # kick-off the right move is to stop holding.
+                _mins_left = None
+                try:
+                    _pend = [l for l in detail.get("leg_rows")
+                             if not (l.get("won") or l.get("finished"))]
+                    _ks = [l.get("ko_epoch") for l in _pend if l.get("ko_epoch")]
+                    if _ks:
+                        _mins_left = (min(float(k) for k in _ks) - time.time()) / 60.0
+                except Exception:
+                    _mins_left = None
+                _take, _why = self._cashout_decision(
+                    offer, _stake, pw, won, pending, bad, _mins_left)
+                if _take:
                     self._emit_direct(gui_callback,
-                        f"💱 AUTO CASH-OUT Bet #{lid}: KES {offer:,.2f} = {ratio:.0%} "
-                        f"of possible KES {pw:,.2f} (≥{self.cashout_threshold:.0%}) → confirming…")
+                        f"dY'� AUTO CASH-OUT Bet #{lid}: KES {offer:,.2f} on a KES {_stake:,.2f} "
+                        f"stake — {_why}")
                     if self._confirm_cashout(driver, lid):
                         local_b["status"] = "cashed_out"
                         local_b["settled_at"] = datetime.now().isoformat(timespec="seconds")
                         local_b["cashed_out_amount"] = offer
                         self._save_ledger()
+                        try:
+                            self._record_settled_stats(local_b)
+                        except Exception:
+                            pass
                         self._emit_direct(gui_callback,
-                            f"✅ CASHED OUT Bet #{lid}: +KES {offer:,.2f} banked "
+                            f"�o. CASHED OUT Bet #{lid}: +KES {offer:,.2f} banked "
                             f"after {won}/{total} legs won (left: {pending})")
                     else:
                         self._emit_direct(gui_callback,
-                            f"⚠️ Cash-out confirm on Bet #{lid} FAILED — check the app")
+                            f"�s��,? Cash-out confirm on Bet #{lid} FAILED — check the app")
                 else:
                     self._emit_direct(gui_callback,
-                        f"⏸ Bet #{lid}: cash-out KES {offer:,.2f} = {ratio:.0%} of "
-                        f"possible — under {self.cashout_threshold:.0%} threshold, holding")
+                        f"�?, Bet #{lid}: cash-out KES {offer:,.2f} — holding, {_why}")
         except Exception:
             pass
 
@@ -10984,6 +12177,30 @@ return 'clicked';
                             rec["last"][f] = v
                             changed = True
                 rec["last_ts"] = now
+                # ── CLV recheck (2026-09-26) ──────────────────────────
+                # This crawl sees the same market moments before kick-off. If we
+                # hold a snapshot for this game/market, the price in this crawl IS
+                # effectively the closing line, so settle the CLV right here.
+                # We deliberately take the FIRST price we see inside the recheck
+                # window and never overwrite it: the first sighting near kick-off
+                # is a fairer "closing" reference than a later in-play scramble.
+                try:
+                    ko = rec.get("kickoff")
+                    if ko and self._clv_store():
+                        mins_left = (float(ko) - now) / 60.0
+                        if 0.0 <= mins_left <= self.CLV_RECHECK_LEAD_MIN:
+                            for _key in list(self._clv_store().keys()):
+                                if not _key.startswith(f"{gid}|"):
+                                    continue
+                                _name = str(_mk).split("|", 1)[1]
+                                _field = self._MARK_ODDS_FIELD.get(_name)
+                                if not _field:
+                                    continue
+                                _v = g.get(_field)
+                                if isinstance(_v, (int, float)) and _v > 1.0:
+                                    self._record_closing_odds(gid, _name, float(_v))
+                except Exception:
+                    pass
                 # Prune: drop history for games that kicked off long ago
                 try:
                     if rec.get("kickoff") and rec["kickoff"] < now - 4 * 3600:
@@ -11038,7 +12255,8 @@ return 'clicked';
         try:
             pool = self._fishnet_pool_today()
             if len(pool) < 2:
-                return {"status": "aborted", "message": "Fishnet pool too small (need 2+ games bet today)"}
+                return {"status": "skipped", "skipped": True,
+                        "message": "Fishnet pool too small (need 2+ games bet today)"}
             self._ensure_bet_login(driver, phone, password, gui_callback=gui_callback)
             self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
             time.sleep(0.8)
@@ -11059,7 +12277,17 @@ return 'clicked';
                     continue  # about to kick off / in-play — skip
                 legs.append((float(odds), str(g.get("name") or ""), p["gid"], mk, p["prob"]))
             if len(legs) < 3:
-                return {"status": "aborted", "message": f"Only {len(legs)} pooled games still placeable"}
+                return {"status": "skipped", "skipped": True,
+                        "message": f"Only {len(legs)} pooled games still placeable"}
+            # Hard leg ceiling (2026-09-26) — the caller may ask for 14, but the
+            # 14/25-leg shapes came back -100% in the ledger, so the cap is
+            # applied here at the last possible moment, not in the scheduler.
+            if max_legs > self.MAX_SLIP_LEGS_HARD or max_legs <= 0:
+                max_legs = self.MAX_SLIP_LEGS_HARD
+            if len(legs) > max_legs:
+                self._emit_direct(gui_callback,
+                                  f"🐟 leg cap: {len(legs)} pooled games trimmed to "
+                                  f"{max_legs} (14+ leg slips returned -100%)")
             legs = legs[:max_legs]
             self._emit_direct(gui_callback,
                               f"🐟 {phone} FISHNET LOTTERY: {len(legs)} pooled games → one long slip")
@@ -11069,6 +12297,33 @@ return 'clicked';
             product = 1.0
             for o, _, _, _, _ in legs:
                 product *= o
+            # ── Portfolio gates on the fishnet too (2026-09-26) ─────────
+            # The fishnet pools games that were ALREADY bet on other accounts
+            # (_fishnet_pool_today reads the ledger), so it is by construction the
+            # most correlated slip the machine can build. Without this check it
+            # would stack one account's positions straight onto its siblings'.
+            _ok_c, _why_c = self._correlation_verdict(
+                phone, [str(l[2]) for l in legs], [l[1] for l in legs],
+                [l[3] for l in legs])
+            if not _ok_c:
+                self._count_refusal("cross-account correlation (fishnet)")
+                self._emit_direct(gui_callback,
+                                  f"🛑 portfolio refused the fishnet — {_why_c}")
+                return {"status": "skipped", "skipped": True,
+                        "circuit_breaker": True,
+                        "message": f"correlation: {_why_c or 'account/league/market overlap'}",
+                        "correlation_blocked": True}
+            _vkey_f = "{0}L@{1}/{2}/[{3}]".format(
+                len(legs), self._band_of(product), self._lead_bucket(None),
+                "-".join(sorted(set(l[3] for l in legs))) or "-")
+            if self._recipe_vetoed(_vkey_f):
+                self._count_refusal("vetoed losing recipe (fishnet)")
+                self._emit_direct(gui_callback,
+                                  f"⛔ fishnet vetoed by real-money ROI: {_vkey_f}")
+                return {"status": "skipped", "skipped": True,
+                        "recipe_vetoed": True,
+                        "message": f"vetoed recipe: {_vkey_f}",
+                        "recipe_vetoed": True}
             res = self._open_betslip_and_place(driver, stake, phone, password,
                                                gui_callback=gui_callback,
                                                before_balance=0.0)
@@ -11077,6 +12332,12 @@ return 'clicked';
                 self._clear_betslip(driver, gui_callback=gui_callback)
                 return {"status": "error", "message": "Fishnet slip did not place"}
             self._mark_legs_used(legs)
+            try:
+                self._snapshot_clv([str(l[2]) for l in legs], [l[3] for l in legs],
+                                   [(str(l[2]), l[3], l[0]) for l in legs],
+                                   phone=phone)
+            except Exception:
+                pass
             return {"status": "success", "message": "Fishnet placed",
                     "legs": len(legs), "stake": stake,
                     "odds": round(product, 2),
@@ -11084,6 +12345,7 @@ return 'clicked';
                     "markets": [l[3] for l in legs],
                     "probs": [round(l[4], 4) for l in legs],
                     "game_ids": [str(l[2]) for l in legs],
+                    "leg_names": [l[1] for l in legs],
                     "fishnet": True,
                     "placed_at": datetime.now().isoformat(timespec="seconds")}
         except Exception as exc:
@@ -11163,6 +12425,15 @@ return 'clicked';
         Returns (legs, product) where legs is a list of
         (odds, display_name, game_id, market, win_prob) tuples, or (None, 0.0).
         """
+        # Hard leg ceiling (2026-09-26). Applied HERE, inside the single selector
+        # every caller shares, so no scheduling path can request a 14-leg slip any
+        # more. The ledger showed 14-leg and 25-leg shapes returning -100%; beyond
+        # ~6 legs the per-leg edge is no longer measurable and the variance
+        # destroys any Kelly sizing applied afterwards.
+        if max_legs is None or int(max_legs) <= 0 or int(max_legs) > self.MAX_SLIP_LEGS_HARD:
+            max_legs = self.MAX_SLIP_LEGS_HARD
+        else:
+            max_legs = int(max_legs)
         # One most-likely selection per game (a game already bet today is SKIPPED
         # entirely — the same match must never appear again in a different slip.
         # Market types that beat prediction are weighted up; ones that keep losing
@@ -11175,6 +12446,14 @@ return 'clicked';
         # could still stack (BTTS fair prob ~55-60% got it picked every kick-off).
         # The slot must live OUTSIDE the games loop so a slip claims it exactly once.
         btts_used_in_slip = False
+        # OWNER RULE (per-SLIP, 2026-09-26): the O/U "death trap" cap. The 09-26
+        # ledger showed an all-"over" slip (4x over @ 0.93 confidence, 3.03 odds)
+        # that settled LOST — one correlated goal-stack, all four legs dead
+        # together. Goals legs are common in football and easy for the confidence
+        # model to overrate, so cap them per slip exactly like BTTS. This forces
+        # the machine to reach for 1X2 / Double Chance / BTTS legs too, so a slip
+        # spans the whole board instead of betting one market four times.
+        goals_used_in_slip = 0
         for g in games:
             gid = g.get("id", "")
             h3 = self._fair_win_probs(g.get("h3")) or []
@@ -11309,12 +12588,26 @@ return 'clicked';
                 ):
                     if dc_p < 0.55:
                         continue
-                    # Only include if scout has seen this game OR if real DC odds
-                    # were provided directly (from full-market cache)
+                    # Real DC odds come from the full-market page scrape. OWNER
+                    # LEARNING (2026-09-25): that scrape has been unreliable
+                    # ("renders 0 boxes"), so DC legs NEVER reached the selector —
+                    # the book's DC market never got drafted even though dc_12
+                    # (16/19) owns the best hit-rate in the stats table. When the
+                    # real odds are missing, derive an honest DC price from the
+                    # margin-corrected 1X2 probs with a small DC-market margin
+                    # (~6%) — the engine's own fair value, priced as a closing
+                    # line. Real scraped odds still win when present. The slip is
+                    # placed at whatever the book displays, so a small deviation
+                    # in our estimate only shifts the slip tail, never breaks it.
                     cached_odds = g.get(f"{dc_mk}_odds")
                     if cached_odds and isinstance(cached_odds, (int, float)):
-                        options.append((float(cached_odds), dc_p, dc_mk,
-                                        dc_suf, 1.0 + _dc_boost))
+                        dc_odds = float(cached_odds)
+                    else:
+                        _dc_margin = 0.06
+                        dc_odds = 1.0 / (dc_p * (1.0 + _dc_margin))
+                    if o := dc_odds:
+                        options.append((float(o), dc_p, dc_mk, dc_suf,
+                                        1.0 + _dc_boost))
             # ── Full-market expansion (DNB / FTTS / extra O-U lines) ──────
             # Every extra market the full-market scrape read off the game's
             # /markets page. Each already carries its margin-corrected probability,
@@ -11437,6 +12730,15 @@ return 'clicked';
                     # leg is skipped (never a bare-dice BTTS). One BTTS max/slip.
                     if btts_used_in_slip or float(p or 0.0) < self.BTTS_STRONG_FLOOR:
                         continue
+                # OWNER RULE (2026-09-26): O/U death-trap cap. Goals legs are the
+                # ones that keep stacking (see goals_used_in_slip). Past the cap a
+                # goals leg is skipped, which forces the next slot onto 1X2 / DC /
+                # BTTS so the slip spans the whole board. MAX_GOALS_LEGS_PER_SLIP
+                # is deliberately > 1: the owner wants O/U represented, just not
+                # four times in one ticket.
+                elif str(mk).startswith(("over", "under")):
+                    if goals_used_in_slip >= self.MAX_GOALS_LEGS_PER_SLIP:
+                        continue
                 # value weighting from the Opportunity Scout
                 v_k = 1.0
                 if hub is not None:
@@ -11460,26 +12762,78 @@ return 'clicked';
                 valid.append((o, base_w * jitter_mult, min(base_w, 0.98), mk, suf))
             if not valid:
                 continue
+            # ── OWNER LEARNING (2026-09-26): the over/under death-trap fix ──
+            # The slip was collapsing into 4x "over" every round. Two causes, both
+            # visible in the 09-26 ledger: every "over" leg carried prob 0.73-0.93
+            # at odds 1.22-1.54, and the selector then ranked legs PURELY by that
+            # confidence, so the most-inflated market won EVERY per-game slot and
+            # the slip became a correlated goal-stack that dies together.
+            #
+            # 1) Confidence must never be allowed to exceed what the book implies.
+            #    A leg at 1.22 cannot honestly be a 0.93 shot — that is the market
+            #    weight (1.22) multiplied on top of a fair prob, i.e. double
+            #    counting. Cap every leg's ranked confidence at its own implied
+            #    probability (fair value, margin removed) plus a small edge
+            #    allowance. Below that cap the market weights/form/league still
+            #    decide; they just can't manufacture a 0.93.
+            # 2) The slip must SPREAD across market groups. Even after the cap, a
+            #    hot O/U line can top several slots. Cap goals-market legs per slip
+            #    so 1X2, Double Chance, BTTS and O/U all get drafted — which is
+            #    exactly what the owner asked for: bet the whole board, not one
+            #    market. (BTTS already had a 1-per-slip cap; goals did not, and
+            #    that absence is what produced 4x "over".)
+            _implied_cap = {}
+            for _c in valid:
+                _oo = float(_c[0])
+                # 1/odds is the raw implied prob; the book overround means the true
+                # fair prob is slightly HIGHER, so allow a thin margin on top.
+                _implied_cap[(_c[2], _c[3])] = min(0.97, (1.0 / _oo) * 1.06 + 0.02)
+            valid = [(c[0], c[1], min(c[2], _implied_cap.get((c[2], c[3]), 0.97)), c[3], c[4])
+                     for c in valid]
             # Pick the market with the best DILIGENCE-WEIGHTED EDGE per game —
             # form, injuries, market hit-rate, scout EV and odds drift decide the
-            # winner, not raw price alone. We score each candidate by its
-            # expected value (p*odds - 1) and Kelly fraction (edge/(odds-1)):
-            # EV-only ranking loves low-probability long shots that meet the
-            # floor, while Kelly keeps the ranking honest about how much of the
-            # bankroll a given edge really deserves. Raw probability and account
-            # jitter are only tiebreaks.
+            # winner, not raw price alone. OWNER LEARNING (2026-09-25): this used
+            # to rank by KELLY FIRST (kelly = (p*odds-1)/(odds-1)), which divides by
+            # (odds-1) and therefore STRUCTURALLY ANNIHILATES low-odds legs: a
+            # "DC: 1X" at 1.18/p0.67 scored kelly ~ -1.16 while a 2.40/p0.42 home
+            # scored +0.006 — so Double Chance (dc_12 = 16/19 history, the single
+            # best market in the table) could NEVER be drafted, and the winning
+            # low-odds recipe btts-no/under likewise lost to long-shots. Kelly/EV
+            # decided staking, not leg choice. Now the RANKING KEY is the weighted
+            # confidence itself (base_w already folds in market hit-rate, form,
+            # injuries, scout EV, drift, time, league + the 09-25 underperform
+            # penalization), so the machine drafts the most-likely-to-win leg per
+            # game — the obvious win — and Kelly/EV only break ties between legs
+            # of equal confidence.
+            #
+            # OWNER NOTE (2026-09-26): ranking stays CONFIDENCE-primary on purpose.
+            # EV-primary was tried and is WRONG here: a Double Chance leg whose
+            # odds are derived from the fair 1X2 probability carries the ~6% DC
+            # margin, so its EV is always about -6% and it could never out-rank an
+            # over/under leg — the very bias the owner complained about. The
+            # over/under death-trap is instead fixed at the source: the implied
+            # cap above (no leg may be rated above what its own price implies) plus
+            # MAX_GOALS_LEGS_PER_SLIP, which forces 1X2 / DC / BTTS onto the rest
+            # of the slip. Confidence-primary then simply picks the most-likely
+            # leg within that already-diversified set.
             def _ev_kelly(c):
                 o = c[0]
-                p = c[2]
-                ev = p * o - 1.0
+                _k0 = c[2]  # weighted winning confidence (capped at market-implied)
+                ev = _k0 * o - 1.0
                 kelly = ev / (o - 1.0) if o > 1.01 else 0.0
-                return (kelly, ev, c[2], c[1], c[0])
+                return (_k0, ev, kelly, c[1], c[0])
             valid.sort(key=_ev_kelly, reverse=True)
             o, _w, p, mk, suf = valid[0]
             # Claim the slip's single BTTS slot only when a BTTS leg is actually
             # drafted for this game (walks the per-slip cap across games).
             if str(mk) in ("btts", "btts_no"):
                 btts_used_in_slip = True
+            # OWNER RULE (2026-09-26): O/U (goals) legs are capped per slip too.
+            # Before this, "over" took every slot (4x over @ 0.93 confidence) —
+            # a single correlated bet that dies all four legs at once. Spreading
+            # O/U across a slip keeps some 1X2/DC/BTTS legs in the mix.
+            elif str(mk).startswith(("over", "under")):
+                goals_used_in_slip += 1
             per_game[gid] = (o, f"{g.get('name', '')}{suf}", gid, mk, p)
 
         cands = list(per_game.values())

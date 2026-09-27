@@ -55,7 +55,7 @@ def set_windows_app_id(app_id: str):
         pass
 
 
-APP_VERSION = "5.6.0"
+APP_VERSION = "6.1.0"
 
 # ── Crash harness ─────────────────────────────────────────────────────
 # The GUI used to silently VANISH with no error message. These hooks make
