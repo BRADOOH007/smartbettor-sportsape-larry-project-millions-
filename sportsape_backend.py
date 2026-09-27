@@ -2634,6 +2634,11 @@ return m ? m[0] : '';
                     return {"status": "aborted", "message": "Balance unreadable — retry next round",
                             "balance_unreadable": True}
             self._emit_direct(gui_callback, f"Starting balance: KES {balance:,.2f}")
+            if self._agent_hub is not None:
+                try:
+                    self._agent_hub.supervisor.beat_balance_read(phone)
+                except Exception:
+                    pass
 
             # ── PORTFOLIO GATE (2026-09-26): drawdown circuit breakers ─────
             # Checked before any stake is sized or any slip is built. The

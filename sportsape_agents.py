@@ -1653,6 +1653,20 @@ class Fibi:
         self.state["consecutive_balance_unreadable"][k] = n
         return n
 
+    def beat_balance_read(self, phone: str):
+        """A successful balance read ends the unreadable streak.
+
+        The counter is about CONSECUTIVE unreadable rounds, so it has to clear
+        when a read succeeds — not only when a bet is placed. Otherwise an
+        account whose board is simply too thin to bet on keeps a stale streak
+        and Fibi nags about balance failures forever.
+        """
+        k = str(phone or "")
+        if int(self.state["consecutive_balance_unreadable"].get(k, 0) or 0):
+            self.state["consecutive_balance_unreadable"][k] = 0
+            self._save_state()
+        return 0
+
     def beat_abort(self, reason: str = ""):
         self.state["consecutive_aborts"] = int(self.state.get("consecutive_aborts", 0)) + 1
         self._save_state()
