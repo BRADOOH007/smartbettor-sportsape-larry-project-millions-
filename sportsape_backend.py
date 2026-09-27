@@ -2236,7 +2236,14 @@ return true;
                             # the floor — and never past LEG_FLOOR_ABSOLUTE. The hard
                             # vetoes (raw prob, leg odds, retired markets, per-slip
                             # BTTS/goals caps) are NOT relaxed by this.
-    LEG_FLOOR_ABSOLUTE = 0.38  # floor for the top-up pass, whatever the board looks like
+    LEG_FLOOR_ABSOLUTE = 0.30  # floor for the top-up pass, whatever the board looks
+                               # like. This is deliberately well below
+                               # RAW_LEG_VETO (0.50): the raw-probability veto is the
+                               # real quality guard and it is absolute, while
+                               # base_w is a ranking score that unfamiliar leagues
+                               # depress. A leg promoted from a near-miss has still
+                               # cleared the raw veto, the leg-odds floor, the
+                               # market whitelist and the implied-confidence cap.
     MIN_LEG_ODDS = 1.20  # owner rule: no leg under x1.20 (never 1.01/1.04 filler legs)
     RAW_LEG_VETO = 0.50  # hard veto: never bet a leg whose raw fair prob is below this
     BTTS_STRONG_FLOOR = 0.62  # OWNER RULE (2026-09-19, ENFORCED): a BTTS/GG leg may
@@ -12962,7 +12969,28 @@ return 'clicked';
             per_game[gid] = (o, f"{g.get('name', '')}{suf}", gid, mk, p)
 
         cands = list(per_game.values())
-        if len(cands) < min_legs and _near:
+
+        def _best_product(pool):
+            """Highest combined odds reachable from `pool` within max_legs.
+
+            This is the number that decides whether the round is buildable at all.
+            Counting legs is not enough: four x1.23 legs is a legal-looking pool of
+            four that can only ever reach x2.28, under the x2.50 minimum, so the
+            round dies in the combination search with a pool that looks healthy.
+            """
+            top = sorted((float(c[0]) for c in pool), reverse=True)[:max_legs]
+            p = 1.0
+            for o in top:
+                p *= o
+            return p
+
+        # Top up when the pool cannot REACH the combined-odds floor, not merely
+        # when it is short on legs. Both failure modes look identical from the
+        # log ("no bet this round") but need different fixes, and only this one
+        # is recoverable by adding a near-miss leg.
+        _need_more = (len(cands) < min_legs) or (
+            len(cands) > 0 and _best_product(cands) < self.MIN_COMBINED_ODDS)
+        if _need_more and _near:
             # The board is real (dozens of placeable games) but every leg lost the
             # weighted floor, usually because the fixtures are in leagues the
             # engine has no history for. Top up from the near-misses — best
@@ -13028,11 +13056,13 @@ return 'clicked';
             if _promoted:
                 self._emit_direct(
                     gui_callback,
-                    f"🪜 Topped up with {len(_promoted)} near-miss leg(s): every "
-                    f"candidate lost the weighted confidence floor "
-                    f"({float(floor):.2f}) on unfamiliar fixtures. Hard vetoes "
-                    f"(leg odds >= {self.MIN_LEG_ODDS:g}, raw prob >= "
-                    f"{self.RAW_LEG_VETO:g}) still applied.")
+                    f"🪜 Topped up with {len(_promoted)} near-miss leg(s): the pool "
+                    f"could not reach the x{self.MIN_COMBINED_ODDS:g} combined floor "
+                    f"(best was x{_best_product(cands):.2f}) because every remaining "
+                    f"candidate lost the weighted confidence floor ({float(floor):.2f}) "
+                    f"on unfamiliar fixtures. Hard vetoes (leg odds > "
+                    f"{self.MIN_LEG_ODDS:g}, raw prob >= {self.RAW_LEG_VETO:g}) "
+                    f"still applied.")
                 cands = list(per_game.values())
         if len(cands) < min_legs:
             # Never sacrifice quality for quantity: a half-decent product of a

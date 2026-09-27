@@ -551,6 +551,65 @@ check("a None reading is not counted as covered",
       set(e7._fleet_usable(_partial)) == {"0706719388"},
       str(e7._fleet_usable(_partial)))
 
+# A board whose best legs are all cheap Double Chance is the shape that actually
+# fails in production: the pool is NOT short (four legal legs exist) but four
+# x1.23 legs reach only x2.28, under the x2.50 floor, so the round dies in the
+# combination search while every leg-level count looks healthy. Counting legs is
+# not enough; the pool has to be able to REACH the floor.
+print("== A cheap-Double-Chance pool must still reach the combined floor ==")
+e8 = sb.SportsapeBackend.__new__(sb.SportsapeBackend)
+e8._bets = []
+e8._agent_hub = None
+e8._jev = None
+e8._start_balances = {}
+e8.LEDGER_PATH = _pl.Path(tmp) / "led8.json"
+e8._used_games_today = set()
+e8._market_type_weight = lambda mk: 1.0
+e8._enrichment_k = lambda enr, h, a: 1.0
+e8._drift_k = lambda gid, mk, o: 1.0
+e8._time_k = lambda g: 1.0
+e8._market_ok = lambda mk: True
+e8.is_market_retired = lambda mk: False
+e8._calibrated_goals_probs = lambda g, h, o: None
+e8._load_stats = lambda: None
+e8._band_of = lambda p: "mid"
+e8._lead_bucket = lambda g: 0
+e8._league_k = lambda mk, nm: 0.62   # obscure league, depresses every base_w
+e8._is_recent_enough = lambda g: True
+# Strong favourites whose Double Chance sits near x1.23, so confidence-primary
+# selection fills the pool with cheap legs.
+_CHEAP = [(1.30, 5.00, 9.00), (9.00, 5.00, 1.30), (1.35, 4.60, 7.50)]
+
+
+def _mk_cheap(i):
+    h, d, a = _CHEAP[i % len(_CHEAP)]
+    return {
+        "id": f"c{i}", "name": f"FC{i} ALPHA vs FC{i} BETA",
+        "home_odds": h, "draw_odds": d, "away_odds": a, "h3": [h, d, a],
+        "over_25": 1.28, "under_25": 3.20, "over_15": 1.24, "ou": [1.28, 3.20],
+        "btts_yes": 1.26, "btts_no": 3.10, "btts": [1.26, 3.10],
+        "start": sb.datetime.now() + sb.timedelta(hours=5),
+    }
+
+
+_cheap_board = [_mk_cheap(i) for i in range(14)]
+_cl, _cp = e8._select_football_legs(
+    _cheap_board, target_min=2.5, target_max=4.0, max_legs=4, min_legs=2)
+check("a cheap-leg pool still yields a slip", bool(_cl),
+      f"legs={None if not _cl else len(_cl)}")
+check("the cheap-leg pool reaches the x2.50 combined floor",
+      bool(_cl) and _cp >= 2.5, f"product={_cp}")
+if _cl:
+    check("cheap-pool legs still clear the raw-probability veto",
+          all(l[4] >= sb.SportsapeBackend.RAW_LEG_VETO for l in _cl),
+          str([round(l[4], 3) for l in _cl]))
+    check("cheap-pool legs still clear the leg-odds floor",
+          all(l[0] > sb.SportsapeBackend.MIN_LEG_ODDS for l in _cl),
+          str([l[0] for l in _cl]))
+    check("cheap-pool slip respects the leg cap", len(_cl) <= 4, str(len(_cl)))
+    check("cheap-pool slip uses one leg per game",
+          len({l[2] for l in _cl}) == len(_cl), str([l[2] for l in _cl]))
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: {fails}")
