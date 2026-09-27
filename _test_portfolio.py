@@ -429,6 +429,80 @@ if _place is not None:
     check("no unguarded skipped-return can discard an approved slip",
           not loose, f"unguarded at lines {loose}")
 
+# ── The weighted floor must not silently delete the whole board (2026-09-27).
+# A leg's ranked score is a PRODUCT of probability x market weight x form x
+# scout value x enrichment x drift x time x league. On fixtures from leagues the
+# engine has no history for, the league/time factors push a genuinely likely leg
+# under MIN_LEG_CONF, EVERY game is filtered out, and the round reports "Not
+# enough qualifying games" while the census shows dozens of placeable games.
+print("== A heavy-penalty board must still produce a slip ==")
+e6 = sb.SportsapeBackend.__new__(sb.SportsapeBackend)
+e6._bets = []
+e6._agent_hub = None
+e6._jev = None
+e6._start_balances = {}
+e6.LEDGER_PATH = _pl.Path(tmp) / "led6.json"
+e6._used_games_today = set()
+# Neutralise every multiplicative factor so ONLY the league penalty remains.
+e6._market_type_weight = lambda mk: 1.0
+e6._enrichment_k = lambda enr, h, a: 1.0
+e6._drift_k = lambda gid, mk, o: 1.0
+e6._time_k = lambda g: 1.0
+e6._market_ok = lambda mk: True
+e6.is_market_retired = lambda mk: False
+e6._calibrated_goals_probs = lambda g, h, o: None
+e6._load_stats = lambda: None
+e6._band_of = lambda p: "mid"
+e6._lead_bucket = lambda g: 0
+e6._league_k = lambda mk, nm: 0.70   # unknown league -> this empties the pool
+e6._is_recent_enough = lambda g: True
+
+# Realistic strong favourites. The live failure showed 78-83% legs losing the
+# floor purely to the league factor, so the fixtures here are genuine favourites.
+_PROFILES = [(1.30, 5.00, 8.00), (8.00, 5.00, 1.30), (1.60, 4.20, 6.50)]
+
+
+def _mk_game(i):
+    h, d, a = _PROFILES[i % len(_PROFILES)]
+    # h3 / ou / btts hold ODDS (the engine runs them through _fair_win_probs).
+    return {
+        "id": f"g{i}", "name": f"TEAM{i} ALPHA vs TEAM{i} BETA",
+        "home_odds": h, "draw_odds": d, "away_odds": a,
+        "h3": [h, d, a],
+        "over_25": 1.75, "under_25": 2.05, "over_15": 1.32, "ou": [1.75, 2.05],
+        "btts_yes": 1.80, "btts_no": 1.95, "btts": [1.80, 1.95],
+        "start": sb.datetime.now() + sb.timedelta(hours=6),
+    }
+
+
+_board = [_mk_game(i) for i in range(12)]
+_legs, _prod = e6._select_football_legs(
+    _board, target_min=2.5, target_max=4.0, max_legs=4, min_legs=3)
+check("heavy-penalty board still yields a slip", bool(_legs),
+      f"legs={None if not _legs else len(_legs)}")
+check("slip reaches the x2.50 combined floor",
+      bool(_legs) and _prod >= 2.5, f"product={_prod}")
+if _legs:
+    check("every promoted leg clears the x1.20 leg floor",
+          all(l[0] > 1.20 for l in _legs), str([l[0] for l in _legs]))
+    check("no promoted leg exceeds the implied-confidence cap",
+          all(l[4] <= min(0.97, (1.0 / l[0]) * 1.06 + 0.02) + 1e-9 for l in _legs),
+          str([(l[0], l[4]) for l in _legs]))
+    check("one leg per game", len({l[2] for l in _legs}) == len(_legs),
+          str([l[2] for l in _legs]))
+
+# The same board must NOT slip through when the raw probability is genuinely weak.
+print("== A genuinely weak board must still be refused ==")
+_weak = []
+for _g in _board:
+    _c = dict(_g)
+    _c.update({"home_odds": 1.01, "draw_odds": 20.0, "away_odds": 40.0})
+    _weak.append(_c)
+_wl, _wp = e6._select_football_legs(
+    _weak, target_min=2.5, target_max=4.0, max_legs=4, min_legs=3)
+check("a board of x1.01 filler legs is refused, not promoted",
+      not _wl, f"legs={_wl}")
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: {fails}")

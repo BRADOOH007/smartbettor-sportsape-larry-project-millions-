@@ -2223,6 +2223,20 @@ return true;
     ENRICH_TTL_SECONDS = 6 * 3600  # game enrichment (injuries, weather) valid 6h
     ODDS_HISTORY_PATH = Path(writable_path("sportsape_odds_history.json"))
     MIN_LEG_CONF = 0.55  # minimum fair probability per leg — only markets with a genuine shot
+    LEG_FLOOR_RELAX = 0.72  # (2026-09-27) A leg's ranked score is a PRODUCT of
+                            # probability x market weight x form x scout value x
+                            # enrichment x drift x time x league. On a board made of
+                            # unfamiliar fixtures (third-tier leagues, reserves) the
+                            # league/time factors alone push a genuinely 78%-likely
+                            # leg under MIN_LEG_CONF, EVERY game is filtered out, and
+                            # the round reports "Not enough qualifying games" with 65
+                            # placeable games on the tab. That is a filter artefact,
+                            # not a thin board. When the pool comes up short we may
+                            # top it up from near-miss legs down to this fraction of
+                            # the floor — and never past LEG_FLOOR_ABSOLUTE. The hard
+                            # vetoes (raw prob, leg odds, retired markets, per-slip
+                            # BTTS/goals caps) are NOT relaxed by this.
+    LEG_FLOOR_ABSOLUTE = 0.38  # floor for the top-up pass, whatever the board looks like
     MIN_LEG_ODDS = 1.20  # owner rule: no leg under x1.20 (never 1.01/1.04 filler legs)
     RAW_LEG_VETO = 0.50  # hard veto: never bet a leg whose raw fair prob is below this
     BTTS_STRONG_FLOOR = 0.62  # OWNER RULE (2026-09-19, ENFORCED): a BTTS/GG leg may
@@ -12460,6 +12474,10 @@ return 'clicked';
         used_set = set(used) if used else set()
         self._load_stats()
         per_game = {}
+        # Legs that cleared every hard veto but missed the weighted floor. Only
+        # used by the top-up pass below, and only when the board would otherwise
+        # produce no slip at all.
+        _near = []
         # OWNER RULE (per-SLIP, 2026-09-19): max ONE BTTS/GG leg per slip. The
         # old engine re-armed this cap inside the per-game loop, so 3-4 GG legs
         # could still stack (BTTS fair prob ~55-60% got it picked every kick-off).
@@ -12769,6 +12787,11 @@ return 'clicked';
                           v_k * e_k * self._drift_k(gid, mk, o) * self._time_k(g) *
                           self._league_k(mk, nm))
                 if base_w < float(floor):
+                    # Near-miss: passed every hard veto above but lost the weighted
+                    # floor. Kept aside so a top-up pass can still build a slip when
+                    # the whole board lands under the floor (see LEG_FLOOR_RELAX).
+                    if base_w >= self.LEG_FLOOR_ABSOLUTE:
+                        _near.append((gid, g.get("name", ""), o, base_w, p, mk, suf))
                     continue
                 # Per-account spread factor — deterministic (no Python hash salt).
                 # Used ONLY as a tiebreak so parallel accounts don't all bet the
@@ -12856,6 +12879,78 @@ return 'clicked';
             per_game[gid] = (o, f"{g.get('name', '')}{suf}", gid, mk, p)
 
         cands = list(per_game.values())
+        if len(cands) < min_legs and _near:
+            # The board is real (dozens of placeable games) but every leg lost the
+            # weighted floor, usually because the fixtures are in leagues the
+            # engine has no history for. Top up from the near-misses — best
+            # ranked first — so the round can still produce a slip. The odds floor,
+            # the raw-probability veto, retired markets and the per-slip BTTS/goals
+            # caps all still apply, and the implied-confidence cap is re-applied so
+            # a promoted leg is never rated above its own price.
+            _rel = self.LEG_FLOOR_RELAX
+            _abs_lo = self.LEG_FLOOR_ABSOLUTE
+            _pool = [c for c in _near if c[3] >= max(_abs_lo, float(floor) * _rel)]
+            # Spread the top-up across market GROUPS instead of taking the global
+            # top-N by confidence. Ranking purely by confidence reproduces the very
+            # bias already documented above: Double Chance always carries the
+            # highest weighted confidence, so a top-N fill promotes x1.23 DC legs
+            # only (4 x 1.23 = x2.28, still under the x2.50 floor) while the
+            # higher-priced 1X2 and goals options that would actually build the
+            # slip sit below them. Round-robin over groups so each pass takes the
+            # best remaining leg of a DIFFERENT market.
+            _by_grp = {}
+            for _c in _pool:
+                _by_grp.setdefault(_mk_group(_c[5]), []).append(_c)
+            for _v in _by_grp.values():
+                _v.sort(key=lambda c: c[3], reverse=True)
+            _order = []
+            _r = 0
+            while True:
+                _added = False
+                for _k in list(_by_grp):
+                    if _r < len(_by_grp[_k]):
+                        _order.append(_by_grp[_k][_r])
+                        _added = True
+                if not _added:
+                    break
+                _r += 1
+            _claimed = set(per_game.keys())
+            _promoted = []
+            for _gid2, _nm2, _o2, _bw2, _p2, _mk2, _suf2 in _order:
+                # Fill to max_legs, NOT min_legs. Promoting just enough to satisfy
+                # the leg count still can leave the slip short of the combined-odds
+                # floor (three x1.30 legs = x2.20, under the x2.50 minimum), which
+                # is the same dead end one layer down. The builder picks the best
+                # subset from a deeper pool; every leg in it still cleared the hard
+                # vetoes above.
+                if len(per_game) >= max_legs:
+                    break
+                if _gid2 in _claimed:
+                    continue
+                if str(_mk2) in ("btts", "btts_no"):
+                    if btts_used_in_slip:
+                        continue
+                elif str(_mk2).startswith(("over", "under")):
+                    if goals_used_in_slip >= self.MAX_GOALS_LEGS_PER_SLIP:
+                        continue
+                if str(_mk2) in ("btts", "btts_no"):
+                    btts_used_in_slip = True
+                elif str(_mk2).startswith(("over", "under")):
+                    goals_used_in_slip += 1
+                _cap2 = min(0.97, (1.0 / float(_o2)) * 1.06 + 0.02) if _o2 else 0.97
+                per_game[_gid2] = (float(_o2), f"{_nm2}{_suf2}", _gid2, _mk2,
+                                   min(float(_p2), _cap2))
+                _claimed.add(_gid2)
+                _promoted.append(_gid2)
+            if _promoted:
+                self._emit_direct(
+                    gui_callback,
+                    f"🪜 Topped up with {len(_promoted)} near-miss leg(s): every "
+                    f"candidate lost the weighted confidence floor "
+                    f"({float(floor):.2f}) on unfamiliar fixtures. Hard vetoes "
+                    f"(leg odds >= {self.MIN_LEG_ODDS:g}, raw prob >= "
+                    f"{self.RAW_LEG_VETO:g}) still applied.")
+                cands = list(per_game.values())
         if len(cands) < min_legs:
             # Never sacrifice quality for quantity: a half-decent product of a
             # weak board is a donation. Skip the round instead of dropping the
