@@ -2599,7 +2599,8 @@ return m ? m[0] : '';
             except Exception:
                 pass
 
-            balance, balance_confirmed = self._read_balance_confirmed(driver, wait=20.0)
+            balance, balance_confirmed = self._read_balance_confirmed(
+                driver, wait=20.0, phone=phone, password=password)
             if balance_confirmed:
                 self._balance_cache = getattr(self, "_balance_cache", None) or self._load_balance_cache()
                 self._balance_cache[str(phone)] = {"balance": balance, "confirmed": True,
@@ -2662,8 +2663,12 @@ return m ? m[0] : '';
                             f"peak={_pf.get('peaks', {}).get(phone)})")
                 self._count_refusal(_why.split(":")[0][:40])
                 self._emit_direct(gui_callback, f"🛑 {phone}: {_why} — no bet this round.")
-            return {"status": "skipped", "skipped": True, "message": _why,
-                    "circuit_breaker": True}
+                # Inside the guard on purpose. When the breaker ALLOWS, _why is
+                # '' — returning here unconditionally made every healthy round
+                # report a skip with an empty reason and circuit_breaker=True,
+                # and no bet was ever placed.
+                return {"status": "skipped", "skipped": True, "message": _why,
+                        "circuit_breaker": True}
 
             # Stake is fixed — always use exactly the base stake passed in.
             # Risk manager and compounding are disabled: the owner wants KES 10
@@ -2724,8 +2729,10 @@ return m ? m[0] : '';
                                         gui_callback=gui_callback)
                                 except Exception:
                                     pass
-            return {"status": "skipped", "skipped": True,
-                    "message": "Insufficient balance",
+                        # Inside `if balance < stake`. Returning here made every
+                        # round claim "Insufficient balance" regardless of funds.
+                        return {"status": "skipped", "skipped": True,
+                                "message": "Insufficient balance",
                                 "deposit_needed": deposit_needed,
                                 "balance": balance,
                                 "stake": float(stake)}
@@ -3288,10 +3295,15 @@ return { real: real, h: h };
             _gate_ok, _gate_why = _portfolio_gates(used_legs, used_product)
             if not _gate_ok:
                 self._emit_direct(gui_callback, f"🛑 portfolio refused this slip — {_gate_why}")
-            return {"status": "skipped", "skipped": True, "message": _gate_why,
-                    "circuit_breaker": "HALT" in _gate_why.upper(),
-                    "correlation_blocked": "correlation" in _gate_why,
-                    "recipe_vetoed": "vetoed recipe" in _gate_why}
+                # ONLY a refused gate may return. When the gates PASS, control must
+                # fall through to the placement loop below. This return used to sit
+                # at the same indent as the `if`, so it fired unconditionally and
+                # silently discarded every approved slip — the engine reported "no
+                # bet" forever, with an empty reason, and placed nothing at all.
+                return {"status": "skipped", "skipped": True, "message": _gate_why,
+                        "circuit_breaker": "HALT" in _gate_why.upper(),
+                        "correlation_blocked": "correlation" in _gate_why,
+                        "recipe_vetoed": "vetoed recipe" in _gate_why}
             for rebuild_round in range(1, 4):
                 res = self._open_betslip_and_place(driver, stake, phone, password,
                                                    gui_callback=gui_callback,
@@ -3350,10 +3362,12 @@ return { real: real, h: h };
                 if not _gate_ok:
                     self._emit_direct(gui_callback,
                                       f"🛑 portfolio refused the rebuilt slip — {_gate_why}")
-            return {"status": "skipped", "skipped": True, "message": _gate_why,
-                    "circuit_breaker": "HALT" in _gate_why.upper(),
-                    "correlation_blocked": "correlation" in _gate_why,
-                    "recipe_vetoed": "vetoed recipe" in _gate_why}
+                    # Same rule as the pre-loop gate: only a refusal returns. A
+                    # passing re-gate must continue to the submit path.
+                    return {"status": "skipped", "skipped": True, "message": _gate_why,
+                            "circuit_breaker": "HALT" in _gate_why.upper(),
+                            "correlation_blocked": "correlation" in _gate_why,
+                            "recipe_vetoed": "vetoed recipe" in _gate_why}
 
             possible = round(float(stake) * used_product, 2)
             if placed:
@@ -13463,7 +13477,8 @@ return '';
                 continue
         return 0.0
 
-    def _read_balance_confirmed(self, driver, wait: float = 20.0) -> tuple:
+    def _read_balance_confirmed(self, driver, wait: float = 20.0,
+                                phone: str = None, password: str = None) -> tuple:
         """Authoritative balance read. Returns (balance: float, confirmed: bool).
 
         confirmed=True  -> the SportPesa API or page definitively returned a figure
@@ -13472,29 +13487,45 @@ return '';
                            stale DOM). The caller MUST NOT treat this as 'no funds'
                            — it should retry later without triggering deposit alerts.
 
-        Tries the /api/wallets/balance endpoint first (authoritative, fast,
-        immune to Angular header lag), then falls back to the patient page-text
-        re-anchor loop, and finishes with one last API try.
+        Tiers, cheapest first:
+          1) in-page /api/wallets/balance fetch (needs a live browser session)
+          2) direct API login with the account's own credentials — the SAME tier
+             the GUI's "check balance" button uses, and the only tier that works
+             when the browser session is stale, the wallet widget is absent, or
+             the driver is parked on a sub-page. Without it a single failed
+             read at startup permanently blocks an account from betting.
+          3) patient page-text read (re-anchor + reload)
+          4) DOM wallet-snapshot extractor
+          5) one last in-page API try
         """
-        # 1) API endpoint — instant, authoritative, skip all DOM lag
+        # 1) in-page API endpoint — instant when the session is live
         try:
             snap = self._extract_wallet_snapshot_from_sportpesa_api(driver)
             if snap is not None:
                 return float(snap.get("balance") or 0), True
         except Exception:
             pass
-        # 2) Page-text patient read (re-anchor + reload logic)
+        # 2) direct API login (browser-independent, authoritative)
+        if phone and password:
+            try:
+                api = self._api_login(self._format_sportsape_login_phone(phone),
+                                      password, retries=2)
+                if api and api.get("ok"):
+                    return float(api.get("balance") or 0), True
+            except Exception:
+                pass
+        # 3) Page-text patient read (re-anchor + reload logic)
         balance = self._read_balance_patient(driver, wait=wait)
         if balance:
             return balance, True
-        # 2b) DOM wallet-snapshot extractor (targets the balance widget labels)
+        # 4) DOM wallet-snapshot extractor (targets the balance widget labels)
         try:
             snap = self._extract_wallet_snapshot_from_page(driver)
             if snap and snap.get("balance") is not None:
                 return float(snap["balance"]), True
         except Exception:
             pass
-        # 3) One last API try after patient wait (page may have settled)
+        # 5) One last API try after patient wait (page may have settled)
         try:
             snap = self._extract_wallet_snapshot_from_sportpesa_api(driver)
             if snap is not None:
@@ -13595,7 +13626,15 @@ return '';
         Returns {phone: {"balance": float, "confirmed": bool}}."""
         results = {}
         self._balance_cache = getattr(self, "_balance_cache", None) or self._load_balance_cache()
-        pending = [p for p in acc_list if self._cached_balance_for(p) is None]
+
+        def _fresh_confirmed(p):
+            """Only a CONFIRMED entry counts as 'already known'. A failed read
+            (balance 0.0 / confirmed False) must never suppress a retry, or one
+            bad sweep at startup disables that account for the whole session."""
+            ent = self._cached_balance_for(p)
+            return bool(ent and ent.get("confirmed"))
+
+        pending = [p for p in acc_list if not _fresh_confirmed(p)]
         if not pending:
             self._emit_direct(gui_callback,
                               "💳 Balances already cached (fresh <5 min) — skipping re-check.")
@@ -13622,21 +13661,23 @@ return '';
         try:
             for i, p in enumerate(pending, start=1):
                 ent = self._cached_balance_for(p)
-                if ent is not None:
+                if ent is not None and ent.get("confirmed"):
                     results[p] = {"balance": float(ent.get("balance") or 0),
-                                  "confirmed": bool(ent.get("confirmed"))}
+                                  "confirmed": True}
                     continue
                 bal = 0.0
                 ok = False
                 try:
                     self._ensure_bet_login(sweep_driver, p, password, gui_callback=None)
-                    bal, ok = self._read_balance_confirmed(sweep_driver, wait=10.0)
+                    bal, ok = self._read_balance_confirmed(
+                        sweep_driver, wait=10.0, phone=p, password=password)
                     if not ok:
                         try:
                             self._force_clear_session(sweep_driver)
                         except Exception:
                             pass
-                        bal, ok = self._read_balance_confirmed(sweep_driver, wait=12.0)
+                        bal, ok = self._read_balance_confirmed(
+                            sweep_driver, wait=12.0, phone=p, password=password)
                 except Exception as e:
                     self._emit_direct(gui_callback,
                                       f"⚠️ Sweep {p}: {str(e)[:70]}")

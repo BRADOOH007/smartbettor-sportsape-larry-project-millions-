@@ -396,6 +396,39 @@ e5._bets = [{"phone": "A", "stake": 40.0, "status": "lost",
              "ts": time.time() - 60}]
 check("settled row never counts", e5._active_stake_for("A") == 0.0)
 
+# ── Structural guard: an "if refused: return skipped" must actually be
+# conditional (2026-09-27). The portfolio-gate return sat at the same indent as
+# its `if`, so it fired on EVERY round — including the rounds where the gates
+# PASSED. `_open_betslip_and_place` was unreachable, so the engine reported
+# "no bet this round ()" forever and placed nothing. A behavioural test needs a
+# live browser, so assert the structure instead: every skipped-return in the bet
+# path must live inside a negation guard.
+print("== A refusal may only return from inside its guard ==")
+import ast
+
+_tree = ast.parse((_pl.Path(__file__).parent / "sportsape_backend.py").read_text(encoding="utf-8"))
+_place = next((n for n in ast.walk(_tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "_place_one_bet"), None)
+check("found _place_one_bet for structural check", _place is not None)
+if _place is not None:
+    guarded = set()
+    for node in ast.walk(_place):
+        if isinstance(node, ast.If):
+            for sub in ast.walk(node):
+                guarded.add(id(sub))
+    loose = []
+    for node in ast.walk(_place):
+        if not isinstance(node, ast.Return) or id(node) in guarded:
+            continue
+        v = node.value
+        if not isinstance(v, ast.Dict):
+            continue
+        keys = [k.value for k in v.keys if isinstance(k, ast.Constant)]
+        if "skipped" in keys and "message" in keys:
+            loose.append(node.lineno)
+    check("no unguarded skipped-return can discard an approved slip",
+          not loose, f"unguarded at lines {loose}")
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: {fails}")
