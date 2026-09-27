@@ -9216,6 +9216,25 @@ return 'noicon';
             b = 0.0
         return max(0.0, b) + self._active_stake_for(phone)
 
+    def _fleet_usable(self, balances: dict) -> dict:
+        """The subset of `balances` that is actually a usable equity reading.
+
+        _engine_state["balances"] stores None for a round that failed to read an
+        account, and a stale/zeroed last_equity entry looks the same. Treating
+        either as a real 0.0 makes a missing account indistinguishable from a
+        bankrupt one, which manufactures a fleet-wide drawdown and latches the
+        portfolio halt on nothing. Only positive numbers count as readings.
+        """
+        out = {}
+        for phone, bal in (balances or {}).items():
+            try:
+                v = float(bal)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                out[str(phone)] = v
+        return out
+
     def _fleet_equity(self, balances: dict) -> float:
         """Total equity across the WHOLE fleet.
 
@@ -9224,23 +9243,58 @@ return 'noicon';
         as zero. Without that, a single-account round reads as if every other
         account had vanished, which manufactures a huge fake drawdown and halts
         the fleet for no reason.
+
+        A last-known equity that is missing, None, zero or negative is UNKNOWN,
+        not zero: it is skipped rather than added. Adding it as 0.0 was the bug
+        that latched this fleet at "-87% portfolio drawdown" while the real
+        balances were exactly at their peaks.
         """
         pf = self._load_portfolio()
         last = pf.get("last_equity") or {}
         total = 0.0
         seen = set()
-        for phone, bal in (balances or {}).items():
-            key = str(phone)
-            seen.add(key)
-            total += self._equity_for(key, bal)
+        for phone, bal in self._fleet_usable(balances).items():
+            seen.add(phone)
+            total += self._equity_for(phone, bal)
         for key, eq in last.items():
-            if key in seen:
+            if str(key) in seen:
                 continue
             try:
-                total += float(eq or 0.0)
+                v = float(eq)
             except (TypeError, ValueError):
                 continue
+            if v <= 0:
+                # Unknown equity, not a zero balance. Counting it as 0.0 is what
+                # made the fleet look -87% down and pinned the halt on forever.
+                continue
+            total += v
         return total
+
+    def _fleet_unknown(self, balances: dict) -> set:
+        """Tracked accounts with no usable equity reading this round.
+
+        The fleet drawdown cannot be judged while any tracked account is
+        unpriced, because portfolio_peak includes that account's peak. Callers
+        use this to refuse to HALT on an incomplete picture, and to refuse to
+        trust a lift computed from one.
+        """
+        pf = self._load_portfolio()
+        last = pf.get("last_equity") or {}
+        peaks = pf.get("peaks") or {}
+        usable = self._fleet_usable(balances)
+        tracked = {str(k) for k in (list(last.keys()) + list(peaks.keys()))}
+        tracked |= {str(p) for p in (balances or {}).keys()}
+        unknown = set()
+        for key in tracked:
+            if key in usable:
+                continue
+            try:
+                if float(last.get(key) or 0.0) > 0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            unknown.add(key)
+        return unknown
 
     def _note_balances(self, balances: dict):
         """Update peak-EQUITY tracking for the drawdown breakers. `balances` maps
@@ -9311,6 +9365,22 @@ return 'noicon';
         if pf.get("halted"):
             _bal_map = balances if isinstance(balances, dict) and balances else None
             if _bal_map:
+                # A lift may only be trusted when every tracked account has a real
+                # reading this round. Judging the fleet from a partial picture
+                # re-derives the same fake drawdown that set the halt, so it would
+                # pin the latch on forever: the halt suppresses balance reads, and
+                # without reads the picture never completes. Money sits idle with
+                # "PORTFOLIO HALT" in the log and no way out but a manual edit.
+                _unk = self._fleet_unknown(_bal_map)
+                if _unk:
+                    self._emit_direct(
+                        None,
+                        f"ℹ PORTFOLIO HALT still latched — {len(_unk)} account(s) "
+                        f"have no usable balance this round ({', '.join(sorted(_unk))}), "
+                        f"so the fleet drawdown cannot be re-checked. Waiting for a "
+                        f"full reading to lift it honestly.")
+                    return False, (f"PORTFOLIO HALT: {pf.get('halt_reason') or 'drawdown limit hit'} "
+                                   f"(awaiting full balance reading)")
                 _live_dd = self._portfolio_drawdown(_bal_map)
                 if _live_dd < self.PORTFOLIO_DRAWDOWN_HALT:
                     _was = pf.get("halt_reason") or ""
@@ -9347,15 +9417,13 @@ return 'noicon';
             # to fall back on and the result is a fraction of the real fleet.
             # Require the total to be a genuine majority of the tracked fleet,
             # otherwise treat it as "not enough data" and do not halt.
-            _tracked = set((self._load_portfolio().get("last_equity") or {}).keys())
-            _tracked |= {str(p) for p in balances.keys()}
-            _covered = len({str(p) for p in balances.keys()} & _tracked)
-            if _tracked and _covered * 2 <= len(_tracked):
+            _unk = self._fleet_unknown(balances)
+            if _unk:
                 self._emit_direct(
                     None,
-                    f"ℹ Portfolio drawdown check skipped — only {_covered} of "
-                    f"{len(_tracked)} accounts read this round; not enough data "
-                    f"to judge the fleet safely (no halt).")
+                    f"ℹ Portfolio drawdown check skipped — {len(_unk)} account(s) "
+                    f"have no usable balance this round ({', '.join(sorted(_unk))}); "
+                    f"not enough data to judge the fleet safely (no halt).")
             else:
                 pdd = self._portfolio_drawdown(balances)
                 if pdd >= self.PORTFOLIO_DRAWDOWN_HALT:

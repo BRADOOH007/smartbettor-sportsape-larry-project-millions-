@@ -503,6 +503,54 @@ _wl, _wp = e6._select_football_legs(
 check("a board of x1.01 filler legs is refused, not promoted",
       not _wl, f"legs={_wl}")
 
+# ── A missing account must not read as a bankrupt one (2026-09-27).
+# _engine_state["balances"] stores None for a round that failed to read an
+# account, and _fleet_equity added such an account as 0.0. Combined with a
+# last_equity of 0.0, the fleet total collapsed to one account's balance and
+# the portfolio breaker latched a real "-87% drawdown" while both accounts sat
+# exactly at their peaks. The halt then suppressed balance reads, so the bad
+# picture never completed and the latch could never lift: permanent idle halt
+# with the money sitting there.
+print("== An unpriced account must not halt the fleet ==")
+e7 = sb.SportsapeBackend.__new__(sb.SportsapeBackend)
+e7._bets = []
+e7.PORTFOLIO_PATH = _pl.Path(tmp) / "pf7.json"
+e7._portfolio = {
+    "peaks": {"0706719388": 15.40, "0798810080": 104.14},
+    "portfolio_peak": 119.54, "frozen": {}, "halted": False, "halt_reason": "",
+    "refused": 0, "refused_reasons": {},
+    # 0798810080 has never been priced: exactly the poisoned 0.0 entry.
+    "last_equity": {"0706719388": 15.40, "0798810080": 0.0},
+}
+e7._save_portfolio = lambda: None
+# A round that could only read ONE account: the other came back None.
+_partial = {"0706719388": 15.40, "0798810080": None}
+ok7, why7 = e7._circuit_breaker_check("0706719388", 15.40, _partial)
+check("one unpriced account does NOT halt the fleet", ok7, why7)
+check("no halt was latched on a partial reading",
+      not e7._portfolio.get("halted"), str(e7._portfolio.get("halt_reason")))
+check("the unpriced account is reported as unknown",
+      e7._fleet_unknown(_partial) == {"0798810080"},
+      str(e7._fleet_unknown(_partial)))
+# Once the real reading arrives, equity is the true fleet total, not 15.40.
+_full = {"0706719388": 15.40, "0798810080": 104.14}
+check("a full reading prices the whole fleet",
+      abs(e7._fleet_equity(_full) - 119.54) < 0.01, f"{e7._fleet_equity(_full)}")
+check("a full reading is at 0% drawdown", e7._portfolio_drawdown(_full) < 0.001,
+      f"{e7._portfolio_drawdown(_full)}")
+# And a latch set on the bad picture lifts on the first complete reading.
+e7._portfolio["halted"] = True
+e7._portfolio["halt_reason"] = "portfolio -87% from combined peak (limit -20%)"
+ok7b, why7b = e7._circuit_breaker_check("0706719388", 15.40, _full)
+check("a stale halt lifts once a full reading proves recovery", ok7b, why7b)
+check("halt flag cleared", not e7._portfolio.get("halted"))
+check("halt reason cleared", not e7._portfolio.get("halt_reason"))
+# A None balance must never be counted as a coverage credit.
+check("a None reading is not counted as covered",
+      e7._fleet_usable(_partial) == {"0706719388": "15.4"} or
+      set(e7._fleet_usable(_partial)) == {"0706719388"},
+      str(e7._fleet_usable(_partial)))
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: {fails}")
