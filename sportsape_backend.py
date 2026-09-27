@@ -5066,6 +5066,21 @@ agent_cfg: dict = None,
         longshot_odds_max = float(cfg.get("longshot_odds_max", 60) or 2)
         longshot_odds_cap = float(cfg.get("longshot_odds_cap", 0) or 0)
         longshot_legs = int(cfg.get("longshot_legs", 10) or 2)
+        # The long-shot leg count is hard-capped at MAX_SLIP_LEGS_HARD inside the
+        # selector, so a configured 14 could only ever build 6. Clamp it HERE, at
+        # the point of use, so every downstream announcement, log line and odds
+        # target describes the ticket that can actually be built. Promising a
+        # 14-leg ticket and then betting 6 is a promise the engine cannot keep,
+        # and the operator is left deciding whether the machine is broken.
+        if longshot_legs > self.MAX_SLIP_LEGS_HARD or longshot_legs <= 0:
+            _requested_legs = longshot_legs
+            longshot_legs = self.MAX_SLIP_LEGS_HARD if _requested_legs > 0 else 2
+            if _requested_legs > self.MAX_SLIP_LEGS_HARD:
+                self._emit_direct(
+                    gui_callback,
+                    f"ℹ Long-shot leg count {_requested_legs} reduced to "
+                    f"{longshot_legs}: a slip can never carry more than "
+                    f"{self.MAX_SLIP_LEGS_HARD} legs (MAX_SLIP_LEGS_HARD).")
         auto_withdraw = bool(cfg.get("auto_withdraw", True))
         withdraw_amount = float(cfg.get("withdraw_amount", 200) or 0)
         stake_percent = float(cfg.get("stake_percent") or 0.0)
