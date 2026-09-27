@@ -55,7 +55,7 @@ def set_windows_app_id(app_id: str):
         pass
 
 
-APP_VERSION = "6.1.0"
+APP_VERSION = "6.2.0"
 
 # ── Crash harness ─────────────────────────────────────────────────────
 # The GUI used to silently VANISH with no error message. These hooks make
@@ -502,6 +502,13 @@ class BetFlowProGUI:
         if now - getattr(self, "_last_mem_watch", 0.0) > 60.0:
             self._last_mem_watch = now
             self._watch_memory()
+        # The Fleet State tab is the operator's answer to "is my money safe and
+        # what is each account doing". Refresh it on its own cadence so a halt or
+        # a freeze is visible within a couple of seconds rather than only after
+        # the operator reads the log.
+        if now - getattr(self, "_last_fleet_refresh", 0.0) > 2.0:
+            self._last_fleet_refresh = now
+            self._refresh_fleet_panel_safe()
 
     def _process_mem_mb(self):
         """Current process RAM in MB (Windows). Returns 0 if unavailable."""
@@ -638,11 +645,23 @@ class BetFlowProGUI:
         self.ready_lbl.config(text="  ".join(parts),
                               fg="#5fd06b" if worst_age <= 5 else "#d9a441")
 
+    # Lines worth interrupting the operator for. Everything else — a considered
+    # decline, a research note, a retry, a top-up — stays in the log and in the
+    # round table, because a machine that declines 9 rounds out of 10 is working,
+    # and a notification for each one trains the owner to ignore notifications.
+    _NOTIFY_WORDS = (
+        "BET PLACED", "PLACED ✅", "🏆", "WON", "🛑", "HALT", "FROZEN",
+        "FATAL", "Traceback", "CRITICAL",
+    )
+
     def _notify_from_log(self, text):
         if not getattr(self, "notify_var", None) or not self.notify_var.get():
             return
         try:
-            kind, title, msg = notify.classify(text) or (None, None, None)
+            t = str(text or "")
+            if not any(w in t or w in t.upper() for w in self._NOTIFY_WORDS):
+                return
+            kind, title, msg = notify.classify(t) or (None, None, None)
             if kind:
                 notify.sound(kind)
                 notify.toast(title, msg)
@@ -706,10 +725,480 @@ class BetFlowProGUI:
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=6, pady=4)
         self._build_dashboard_tab()
+        self._build_fleet_tab()
         self._build_ledger_tab()
         self._build_markets_tab()
         self._build_learning_tab()
         self._build_tools_tab()
+
+    # ── Fleet State tab ─────────────────────────────────────────────────
+    # The dashboard terminal is a wall of text: it records WHAT happened but
+    # never answers the three questions an operator actually has, which are
+    # "is my money safe right now", "what is each account doing", and "is this
+    # strategy profitable". This tab answers all three at a glance, from the
+    # same state the breakers themselves read, so what is shown here is what is
+    # actually gating the next bet rather than a log line that may be stale.
+    def _build_fleet_tab(self):
+        c = self.colors
+        tab = tk.Frame(self.nb, bg=c["bg"], padx=12, pady=10)
+        self.nb.add(tab, text="  🚦 Fleet State  ")
+
+        # ── Risk banner: the single most important line in the app ──────
+        self.fleet_banner = tk.Label(
+            tab, text="⚪ Fleet state unknown — engine not reporting yet",
+            bg=c["panel"], fg=c["muted"], anchor="w", justify="left",
+            font=("Segoe UI", 11, "bold"), padx=12, pady=10, wraplength=980)
+        self.fleet_banner.pack(fill="x", pady=(0, 8))
+
+        # ── ROI / CLV strip ─────────────────────────────────────────────
+        mrow = tk.Frame(tab, bg=c["bg"])
+        mrow.pack(fill="x", pady=(0, 8))
+        self._metric_labels = {}
+        for key, title in (("bets", "Real bets"), ("staked", "Staked"),
+                           ("returned", "Returned"), ("roi", "ROI"),
+                           ("clv", "Avg CLV"), ("refused", "Refused")):
+            cell = tk.Frame(mrow, bg=c["panel"], padx=10, pady=6)
+            cell.pack(side="left", padx=(0, 8))
+            tk.Label(cell, text=title, bg=c["panel"], fg=c["muted"],
+                     font=("Segoe UI", 8)).pack(anchor="w")
+            val = tk.Label(cell, text="—", bg=c["panel"], fg=c["fg"],
+                           font=("Consolas", 12, "bold"))
+            val.pack(anchor="w")
+            self._metric_labels[key] = val
+
+        # ── Per-account cards ───────────────────────────────────────────
+        ak = tk.Label(tab, text="  Accounts  ", bg=c["bg"], fg=c["muted"],
+                      font=("Segoe UI", 9, "bold"), anchor="w")
+        ak.pack(fill="x")
+        ak2 = tk.Label(
+            tab,
+            text=("START / STOP on the Dashboard runs or stops the whole fleet — "
+                  "there is one machine, not one per account. The button on each "
+                  "card below freezes or unfreezes that single account against "
+                  "the drawdown breaker, without touching the others."),
+            bg=c["bg"], fg=c["muted"], font=("Segoe UI", 8), anchor="w",
+            justify="left", wraplength=980)
+        ak2.pack(fill="x", pady=(0, 4))
+        self.fleet_cards = tk.Frame(tab, bg=c["bg"])
+        self.fleet_cards.pack(fill="x", pady=(0, 8))
+        self._fleet_card_widgets = {}
+        self.fleet_empty = tk.Label(
+            self.fleet_cards, text="No accounts loaded yet.",
+            bg=c["bg"], fg=c["muted"], font=("Segoe UI", 9))
+        self.fleet_empty.pack(anchor="w", pady=4)
+
+        # ── Round history, aligned to the ledger ───────────────────────
+        hk = tk.Label(tab, text="  Recent rounds  ", bg=c["bg"], fg=c["muted"],
+                      font=("Segoe UI", 9, "bold"), anchor="w")
+        hk.pack(fill="x")
+        cols = ("when", "account", "outcome", "detail", "stake", "odds")
+        wrap = tk.Frame(tab, bg=c["bg"])
+        wrap.pack(fill="both", expand=True)
+        self.round_tree = ttk.Treeview(wrap, columns=cols, show="headings", height=12)
+        _st = ttk.Style()
+        try:
+            _st.theme_use("clam")
+        except Exception:
+            pass
+        heads = {"when": "Time", "account": "Account", "outcome": "Outcome",
+                 "detail": "Detail", "stake": "Stake", "odds": "Odds"}
+        widths = {"when": 80, "account": 100, "outcome": 96, "detail": 520,
+                  "stake": 76, "odds": 70}
+        for col in cols:
+            self.round_tree.heading(col, text=heads[col])
+            self.round_tree.column(col, width=widths[col],
+                                   anchor="w" if col == "detail" else "center")
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.round_tree.yview)
+        self.round_tree.configure(yscrollcommand=vsb.set)
+        self.round_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        # Green = a bet actually went on. Blue-grey = a considered decline,
+        # which is the machine working, not a fault. Red = a real fault the
+        # operator must act on.
+        self.round_tree.tag_configure("placed", foreground=c["ok"])
+        self.round_tree.tag_configure("declined", foreground=c["muted"])
+        self.round_tree.tag_configure("fault", foreground=c["err"])
+        self.round_tree.tag_configure("won", foreground=c["ok"])
+        self.round_tree.tag_configure("lost", foreground=c["err"])
+
+        self._round_events = []
+        self._note_round_event = getattr(self, "_note_round_event", None)
+
+    _PHONE_RE = re.compile(r"\b(\d{10})\b")
+    _STAKE_RE = re.compile(r"KES\s*([\d,]+(?:\.\d+)?)", re.I)
+    _ODDS_RE = re.compile(r"(?:@|\bat\s+odds\s+|odds\s+x?)\s*x?(\d+(?:\.\d+)?)", re.I)
+
+    def _note_round_event(self, text, tag):
+        """Classify a log line into a round outcome for the history table.
+
+        Driven off the same lines the terminal shows, so the table can never
+        disagree with the log. Only three buckets matter to the operator:
+        a bet went on, the machine considered and declined, or something
+        actually broke.
+        """
+        t = str(text or "")
+        up = t.upper()
+        kind = None
+        if ("BET PLACED" in up) or ("BETSLIP EMPTIED" in up) \
+                or ("✅" in t and "PLACED" in up):
+            kind = "placed"
+        elif "🏆" in t or ("WON" in up and "LOST" not in up):
+            kind = "won"
+        elif "LOST" in up:
+            kind = "lost"
+        elif any(k in t for k in ("🛑", "⛔", "HALT", "FROZEN", "FAULT")) \
+                or "FATAL" in up or "TRACEBACK" in up or "CRITICAL" in up:
+            kind = "fault"
+        elif any(k in t for k in ("no bet this round", "No accumulator combination",
+                                  "Not enough qualifying", "skipped", "declined",
+                                  "🪜", "⏭", "ℹ", "no combo", "refused",
+                                  "no bet placed", "Could not")):
+            kind = "declined"
+        if not kind:
+            return
+        outcome = {"placed": "PLACED", "won": "WON", "lost": "LOST",
+                   "fault": "FAULT", "declined": "DECLINED"}[kind]
+        phone = ""
+        m = self._PHONE_RE.search(t)
+        if m:
+            phone = "…" + m.group(1)[-4:]
+        elif kind in ("placed", "won", "lost"):
+            # Placement lines carry no phone of their own; they belong to
+            # whichever account the engine says is betting right now.
+            try:
+                ap = str((getattr(self.backend, "_engine_state", {}) or {})
+                         .get("active_phone") or "")
+                phone = ("…" + ap[-4:]) if ap else ""
+            except Exception:
+                phone = ""
+        stake = odds = ""
+        ms = self._STAKE_RE.search(t)
+        if ms and kind in ("placed", "lost", "won"):
+            stake = f"{float(ms.group(1).replace(',', '')):,.0f}"
+        mo = self._ODDS_RE.search(t)
+        if mo and kind in ("placed", "lost", "won"):
+            odds = f"x{mo.group(1)}"
+        detail = t.strip()
+        if len(detail) > 150:
+            detail = detail[:147] + "..."
+        try:
+            self._round_events.append({
+                "when": datetime.now().strftime("%H:%M:%S"),
+                "account": phone,
+                "outcome": outcome,
+                "detail": detail,
+                "stake": stake,
+                "odds": odds,
+                "kind": kind,
+            })
+            if len(self._round_events) > 300:
+                del self._round_events[: len(self._round_events) - 300]
+        except Exception:
+            pass
+
+    def _refresh_round_history(self):
+        try:
+            tree = getattr(self, "round_tree", None)
+            if tree is None:
+                return
+            tree.delete(*tree.get_children())
+            for ev in list(self._round_events)[-120:][::-1]:
+                tree.insert("", tk.END, values=(
+                    ev.get("when", ""), ev.get("account", "—"),
+                    ev.get("outcome", ""), ev.get("detail", ""),
+                    ev.get("stake", ""), ev.get("odds", "")), tags=(ev.get("kind", ""),))
+        except Exception:
+            pass
+
+    def _fleet_state_snapshot(self):
+        """Read the same state the breakers gate on, so the panel cannot lie."""
+        snap = {"phones": [], "balances": {}, "workers": {}, "peaks": {},
+                "frozen": {}, "halted": False, "halt_reason": "",
+                "portfolio_peak": 0.0, "fleet_equity": 0.0, "drawdown": 0.0,
+                "open_stake": 0.0, "open_n": 0, "refused": 0,
+                "refused_reasons": {}, "metrics": {}, "error": ""}
+        try:
+            be = getattr(self, "backend", None)
+            if be is None:
+                snap["error"] = "backend not attached"
+                return snap
+            es = dict(getattr(be, "_engine_state", {}) or {})
+            snap["balances"] = {str(k): v for k, v in (es.get("balances") or {}).items()}
+            snap["workers"] = dict(es.get("workers") or {})
+            snap["active_phone"] = str(es.get("active_phone") or "")
+            ph = [str(p).strip() for p in (es.get("phones") or []) if str(p).strip()]
+            if not ph:
+                try:
+                    ph = [p for p in self._phone_list() if p]
+                except Exception:
+                    ph = []
+            snap["phones"] = ph
+            pf = be._load_portfolio()
+            snap["peaks"] = dict(pf.get("peaks") or {})
+            snap["frozen"] = dict(pf.get("frozen") or {})
+            snap["halted"] = bool(pf.get("halted"))
+            snap["halt_reason"] = str(pf.get("halt_reason") or "")
+            snap["portfolio_peak"] = float(pf.get("portfolio_peak") or 0.0)
+            snap["refused"] = int(pf.get("refused") or 0)
+            snap["refused_reasons"] = dict(pf.get("refused_reasons") or {})
+            try:
+                snap["fleet_equity"] = be._fleet_equity(snap["balances"])
+            except Exception:
+                snap["fleet_equity"] = sum(
+                    float(v or 0) for v in snap["balances"].values())
+            pk = snap["portfolio_peak"]
+            snap["drawdown"] = max(0.0, (pk - snap["fleet_equity"]) / pk) if pk > 0 else 0.0
+            try:
+                snap["open_stake"] = sum(
+                    float(be._active_stake_for(p) or 0.0) for p in ph)
+            except Exception:
+                snap["open_stake"] = 0.0
+            for b in (getattr(be, "_bets", None) or []):
+                if str(b.get("status") or "") in ("active", ""):
+                    snap["open_n"] += 1
+            try:
+                snap["metrics"] = be._portfolio_metrics() or {}
+            except Exception:
+                snap["metrics"] = {}
+        except Exception as _e:
+            # Never swallow this silently. A status panel that quietly shows zeros
+            # when its read failed is indistinguishable from a status panel
+            # reporting a dead fleet, which is how a real -87% halt stayed
+            # invisible. Surface the error in the banner instead.
+            snap["error"] = f"{type(_e).__name__}: {_e}"
+        return snap
+
+    def _refresh_fleet_panel(self):
+        c = self.colors
+        snap = self._fleet_state_snapshot()
+        be = getattr(self, "backend", None)
+        try:
+            pk = snap["portfolio_peak"]
+            eq = snap["fleet_equity"]
+            dd = snap["drawdown"]
+            lim = 0.20
+            try:
+                lim = float(getattr(be, "PORTFOLIO_DRAWDOWN_HALT", 0.20))
+            except Exception:
+                pass
+            if snap.get("error"):
+                # A panel that cannot read the fleet must say so. Showing
+                # "healthy" here would be a lie in the exact direction that hurts
+                # most: an invisible halt.
+                self.fleet_banner.config(
+                    text=(f"⚠️  FLEET STATE UNREADABLE — {snap['error']}\n"
+                          f"        The numbers below may be stale or zero. This is "
+                          f"a fault in the app, not a verdict on the account."),
+                    bg="#3a2f10", fg="#ffd75e")
+            elif snap["halted"]:
+                self.fleet_banner.config(
+                    text=(f"🛑  FLEET HALTED — {snap['halt_reason']}\n"
+                          f"        No account will bet until the fleet drawdown is "
+                          f"inside -{lim:.0%}.  Current: KES {eq:,.2f} against a peak "
+                          f"of KES {pk:,.2f} ({dd:.0%} down)."),
+                    bg="#3a1414", fg="#ff8a80")
+            elif snap["frozen"]:
+                _who = ", ".join(sorted(snap["frozen"])[0:3])
+                self.fleet_banner.config(
+                    text=(f"❄️  {len(snap['frozen'])} ACCOUNT(S) FROZEN by the "
+                          f"drawdown breaker ({_who})\n"
+                          f"        The rest of the fleet is live.  Fleet equity "
+                          f"KES {eq:,.2f} of KES {pk:,.2f} peak ({dd:.0%} down, "
+                          f"limit -{lim:.0%})."),
+                    bg="#3a2f10", fg="#ffd75e")
+            elif dd > 0:
+                self.fleet_banner.config(
+                    text=(f"🟡  Fleet live — drawdown {dd:.0%} of the "
+                          f"-{lim:.0%} limit\n"
+                          f"        Equity KES {eq:,.2f} against peak KES "
+                          f"{pk:,.2f}."),
+                    bg="#2f2a10", fg=c["warn"])
+            else:
+                self.fleet_banner.config(
+                    text=(f"🟢  Fleet healthy — at peak equity, no account frozen\n"
+                          f"        Equity KES {eq:,.2f} of KES {pk:,.2f} peak.  "
+                          f"Halts below -{lim:.0%}."),
+                    bg="#12301f", fg="#7ee2a8")
+        except Exception:
+            pass
+
+        # ── metric strip ────────────────────────────────────────────────
+        m = snap.get("metrics") or {}
+        try:
+            def _set(k, txt, col=None):
+                w = self._metric_labels.get(k)
+                if w is None:
+                    return
+                w.config(text=txt)
+                if col:
+                    w.config(fg=col)
+            _set("bets", f"{m.get('real_bets', 0)}")
+            _set("staked", f"{m.get('real_staked', 0):,.0f}")
+            _set("returned", f"{m.get('real_returned', 0):,.0f}")
+            roi = float(m.get("real_roi") or 0.0)
+            _set("roi", f"{roi:+.1%}", c["ok"] if roi > 0 else (c["err"] if roi < 0 else c["fg"]))
+            cav = m.get("clv_avg")
+            if cav is None:
+                _set("clv", "no closes", c["muted"])
+            else:
+                _set("clv", f"{float(cav):+.2%}",
+                     c["ok"] if float(cav) > 0 else (c["err"] if float(cav) < 0 else c["fg"]))
+            _set("refused", f"{snap.get('refused', 0)}", c["muted"])
+        except Exception:
+            pass
+
+        # ── per-account cards ───────────────────────────────────────────
+        try:
+            self._render_fleet_cards(snap)
+        except Exception:
+            pass
+        try:
+            self._refresh_round_history()
+        except Exception:
+            pass
+
+    def _render_fleet_cards(self, snap):
+        c = self.colors
+        host = getattr(self, "fleet_cards", None)
+        if host is None:
+            return
+        phones = snap.get("phones") or []
+        if not phones:
+            return
+        try:
+            self.fleet_empty.pack_forget()
+        except Exception:
+            pass
+        existing = getattr(self, "_fleet_card_widgets", {}) or {}
+        seen = set()
+        for phone in phones:
+            seen.add(phone)
+            w = existing.get(phone)
+            bal = snap["balances"].get(phone)
+            peak = float(snap["peaks"].get(phone) or 0.0)
+            usable = isinstance(bal, (int, float)) and float(bal) > 0
+            dd = max(0.0, (peak - float(bal)) / peak) if (usable and peak > 0) else 0.0
+            frozen = bool(snap["frozen"].get(phone))
+            wk = (snap.get("workers") or {}).get(phone) or {}
+            status = str(wk.get("status") or "")
+            if not usable:
+                state, col = "UNPRICED", c["muted"]
+            elif snap.get("halted"):
+                state, col = "HALTED", c["err"]
+            elif frozen:
+                state, col = "FROZEN", c["warn"]
+            elif status == "success":
+                state, col = "BET PLACED", c["ok"]
+            elif status:
+                state, col = str(status).upper()[:12], c["fg"]
+            else:
+                state, col = "IDLE", c["muted"]
+            if w is None:
+                w = self._make_fleet_card(phone)
+                existing[phone] = w
+            self._update_fleet_card(w, phone, snap, state, col, bal, peak, dd,
+                                    frozen, status, wk)
+        for phone in list(existing.keys()):
+            if phone not in seen:
+                try:
+                    existing[phone]["frame"].destroy()
+                except Exception:
+                    pass
+                del existing[phone]
+        self._fleet_card_widgets = existing
+
+    def _make_fleet_card(self, phone):
+        c = self.colors
+        frame = tk.LabelFrame(self.fleet_cards, text=f"  …{str(phone)[-4:]}  ",
+                              bg=c["panel"], fg=c["accent"],
+                              font=("Segoe UI", 9, "bold"), bd=1,
+                              relief=tk.GROOVE, padx=10, pady=6)
+        frame.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        head = tk.Frame(frame, bg=c["panel"])
+        head.pack(fill="x")
+        chip = tk.Label(head, text="IDLE", bg=c["panel"], fg=c["muted"],
+                        font=("Consolas", 10, "bold"))
+        chip.pack(side="left")
+        bal = tk.Label(head, text="—", bg=c["panel"], fg=c["fg"],
+                       font=("Consolas", 11, "bold"))
+        bal.pack(side="right")
+        dd = tk.Label(frame, text="", bg=c["panel"], fg=c["muted"],
+                      font=("Consolas", 9))
+        dd.pack(anchor="w")
+        info = tk.Label(frame, text="", bg=c["panel"], fg=c["muted"],
+                        font=("Segoe UI", 8), justify="left", anchor="w")
+        info.pack(anchor="w", fill="x")
+        btn = tk.Button(frame, text="❄️ Freeze", relief=tk.FLAT, cursor="hand2",
+                        bg=c["button_bg"], fg=c["button_fg"],
+                        font=("Segoe UI", 8, "bold"),
+                        command=lambda p=phone: self._toggle_account_freeze(p))
+        btn.pack(anchor="w", pady=(4, 0))
+        return {"frame": frame, "chip": chip, "bal": bal, "dd": dd,
+                "info": info, "btn": btn, "phone": phone}
+
+    def _update_fleet_card(self, w, phone, snap, state, col, bal, peak, dd,
+                           frozen, status, wk):
+        c = self.colors
+        try:
+            w["chip"].config(text=state, fg=col)
+            if isinstance(bal, (int, float)) and float(bal) > 0:
+                w["bal"].config(text=f"KES {float(bal):,.2f}", fg=c["fg"])
+                w["dd"].config(
+                    text=(f"peak KES {peak:,.2f} · drawdown {dd:.0%}"
+                          if peak > 0 else "peak not established"),
+                    fg=c["err"] if dd >= 0.40 else (c["warn"] if dd > 0 else c["muted"]))
+            else:
+                w["bal"].config(text="no reading", fg=c["muted"])
+                w["dd"].config(text="equity unknown this round", fg=c["muted"])
+            bits = []
+            if wk.get("last_ts"):
+                try:
+                    bits.append("last round " +
+                                datetime.fromtimestamp(float(wk["last_ts"])).strftime("%H:%M:%S"))
+                except Exception:
+                    pass
+            if wk.get("round_attempt"):
+                bits.append(f"round #{wk['round_attempt']}")
+            if wk.get("longshot"):
+                bits.append("long-shot")
+            bits.append(f"open bets {snap.get('open_n', 0)}")
+            if snap.get("open_stake"):
+                bits.append(f"staked KES {snap['open_stake']:,.0f}")
+            w["info"].config(text=" · ".join(bits) if bits else "no rounds yet")
+            w["btn"].config(
+                text="▶ Unfreeze" if frozen else "❄️ Freeze",
+                bg=c["ok"] if frozen else c["button_bg"],
+                fg="#04110a" if frozen else c["button_fg"])
+        except Exception:
+            pass
+
+    def _toggle_account_freeze(self, phone):
+        """Per-account freeze, read and written through the same portfolio file the
+        breaker uses, so the panel can never disagree with the gate."""
+        try:
+            be = getattr(self, "backend", None)
+            if be is None:
+                return
+            pf = be._load_portfolio()
+            fro = pf.setdefault("frozen", {})
+            if fro.get(str(phone)):
+                fro.pop(str(phone), None)
+                self._append_log(f"▶ {phone}: drawdown freeze lifted by owner.")
+            else:
+                fro[str(phone)] = True
+                self._append_log(
+                    f"❄️ {phone}: frozen by owner — the drawdown breaker will "
+                    f"refuse this account until it is unfrozen.")
+            be._save_portfolio()
+            self._refresh_fleet_panel()
+        except Exception:
+            pass
+
+    def _refresh_fleet_panel_safe(self):
+        try:
+            self._refresh_fleet_panel()
+        except Exception:
+            pass
 
     def _styled_button(self, parent, text, command, fg=None, bg=None, width=16,
                        font=("Segoe UI", 10, "bold")):
@@ -1554,6 +2043,13 @@ class BetFlowProGUI:
         try:
             # Auto-detect tag from content if caller didn't specify one
             effective_tag = tag or self._auto_tag(text)
+
+            # Feed the Fleet State round table from the same line the terminal
+            # shows, so the two can never disagree about what happened.
+            try:
+                self._note_round_event(text, effective_tag)
+            except Exception:
+                pass
 
             # "Show only important" filter: skip noise lines until 'Show all' is on
             if not self._log_line_visible(text, effective_tag):
