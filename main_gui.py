@@ -1509,6 +1509,10 @@ class BetFlowProGUI:
         self.ledger_tree.tag_configure("won", foreground=c["ok"])
         self.ledger_tree.tag_configure("lost", foreground=c["err"])
         self.ledger_tree.tag_configure("active", foreground=c["warn"])
+        # A slip the bookmaker has not acknowledged yet, or a phantom the
+        # reconciler retired. Muted so a screen full of "active" rows can't
+        # disguise rows that are not actually confirmed bets.
+        self.ledger_tree.tag_configure("unconfirmed", foreground=c["muted"])
 
     # ── Markets tab ───────────────────────────────────────────────────
     def _build_markets_tab(self):
@@ -2655,6 +2659,11 @@ class BetFlowProGUI:
                     tag = "won"
                 elif st == "lost":
                     tag = "lost"
+                elif st in ("unconfirmed", "not_placed", "phantom"):
+                    # Surface both new terminal/pending states so the user can
+                    # see at a glance that a slip is not yet confirmed by the
+                    # bookmaker, or that a phantom was retired.
+                    tag = "unconfirmed"
                 markets = ",".join(list(b.get("markets") or [])[:5]) or "—"
                 rec = b.get("recipe") or {}
                 recipe = f"{rec.get('legs','?')}L@{rec.get('band','-')}/{rec.get('lead','-')}"

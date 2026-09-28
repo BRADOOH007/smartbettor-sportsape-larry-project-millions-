@@ -3801,7 +3801,7 @@ return { real: real, h: h };
         total = 0.0
         try:
             for b in (self._bets or []):
-                if (b.get("status") or "").lower() in ("active", "pending", ""):
+                if (b.get("status") or "").lower() in ("active", "unconfirmed", "pending", ""):
                     count += 1
                     total += float(b.get("possible_win") or 0)
         except Exception:
@@ -4032,7 +4032,7 @@ return { real: real, h: h };
                             t.is_alive() for t in (getattr(self, "_worker_threads", []) or []))
                         _active_bets = sum(
                             1 for b in (getattr(self, "_bets", None) or [])
-                            if b.get("status") == "active"
+                            if (b.get("status") or "") in ("active", "unconfirmed")
                             and not str(b.get("status", "")).startswith("shadow"))
                         _phones = list((self._engine_state or {}).get("phones") or [])
                         _pw     = str((self._engine_state or {}).get("password") or "")
@@ -5427,8 +5427,11 @@ agent_cfg: dict = None,
                 # Win-sync catch-up: settle bets that finished while away/stopped.
                 # Check more frequently when there are active bets that could settle.
                 _active_count = sum(1 for b in (getattr(self, "_bets", None) or [])
-                                    if b.get("status") == "active"
+                                    if (b.get("status") or "") in ("active", "unconfirmed")
                                     and not str(b.get("status", "")).startswith("shadow"))
+                # Poll faster while a slip is still awaiting confirmation — that
+                # is exactly the window in which a phantom would otherwise sit
+                # unnoticed inflating exposure.
                 _sync_interval = 180.0 if _active_count > 0 else max(60.0, monitor / 4)
                 if driver is not None and (time.time() - last_sync) >= _sync_interval:
                     try:
@@ -8409,10 +8412,16 @@ return 'noicon';
     def _record_bet_from_result(self, res: dict, phone: str = None):
         if getattr(self, "_bets", None) is None:
             self._bets = []
+        # A placement is not a bet until the bookmaker confirms it. Writing
+        # "active" here made every unconfirmed slip look like real exposure
+        # forever — overnight this invented 2 of 12 "bets" (KES 20) that never
+        # existed. `unconfirmed` counts toward risk but settles either way: the
+        # sync promotes it with the site id, or the reaper retires it.
+        _placed_at = res.get("placed_at") or datetime.now().isoformat(timespec="seconds")
         self._bets.append({
             "id": None,
             "phone": phone or "",
-            "placed_at": res.get("placed_at") or datetime.now().isoformat(timespec="seconds"),
+            "placed_at": _placed_at,
             "legs": int(res.get("legs") or 0),
             "stake": round(float(res.get("stake") or 0), 2),
             "odds": round(float(res.get("odds") or 0), 2),
@@ -8421,7 +8430,8 @@ return 'noicon';
             "probs": [round(float(p), 4) for p in (res.get("probs") or [])],
             "game_ids": list(res.get("game_ids") or []),   # per-leg game IDs for analyst feedback
             "leg_names": list(res.get("leg_names") or []), # per-leg game name+suffix for league volatility
-            "status": "active",
+            "status": "unconfirmed",
+            "unconfirmed_at": _placed_at,
             "settled_at": None,
             "won_amount": None,
             "recipe": {
@@ -8445,6 +8455,20 @@ return 'noicon';
 
     # ── Day / night betting split (user-approved: 10 day + 10 night) ─────────
     DAY_NIGHT_SPLIT_HOUR = 18
+
+    # How long a placement may stay unconfirmed on the bookmaker before the
+    # ledger stops treating it as real money. The site is polled roughly every
+    # 2 min and bet history can lag a few minutes behind a submission, so this
+    # is generous enough never to retire a bet that genuinely landed, and short
+    # enough that a phantom cannot inflate exposure for the rest of the day.
+    UNCONFIRMED_GRACE_SEC = 25 * 60
+
+    # How close a local placement time must be to a site bet time before we let
+    # the reconciliation attach a site id to it. The site timestamp has minute
+    # resolution and can lag a submission by a couple of minutes, so this stays
+    # comfortably wide for a genuine bet while refusing to bind a bet to a
+    # neighbour that merely shares its stake (e.g. two KES 10 slips 34 min apart).
+    LEDGER_MATCH_WINDOW_SEC = 15 * 60
 
     def _today_placed_split(self, phone: str, today: str = None,
                             include_orphans: bool = False) -> dict:
@@ -8511,7 +8535,7 @@ return 'noicon';
         return max(0, night_cap - split["night"]), "night", night_cap, split["night"]
 
     def _ledger_summary(self, phone: str = None) -> dict:
-        active = won = lost = void = 0
+        active = won = lost = void = unplaced = 0
         won_return = 0.0
         staked = 0.0
         if phone is not None:
@@ -8533,6 +8557,12 @@ return 'noicon';
             # Shadow bets are learning-only entries — never count toward real stats
             if str(st).startswith("shadow"):
                 continue
+            # A reaped phantom was never accepted by the bookmaker: it counts as
+            # neither settled nor live, and it must not inflate `active` (which
+            # reads as "money at risk") or "placed".
+            if st in ("not_placed", "phantom"):
+                unplaced += 1
+                continue
             staked += float(b.get("stake") or 0)
             if st == "won":
                 won += 1
@@ -8542,12 +8572,15 @@ return 'noicon';
             elif st == "void":
                 void += 1
                 won_return += float(b.get("stake") or 0)
+            elif st in ("unconfirmed", "active", ""):
+                active += 1
             else:
                 active += 1
         net_profit = round(won_return - staked, 2)
         return {"placed": len(self._bets),
                 "active": active, "won": won,
-                "lost": lost, "void": void, "won_return": round(won_return, 2),
+                "lost": lost, "void": void, "unplaced": unplaced,
+                "won_return": round(won_return, 2),
                 "staked": round(staked, 2), "net_profit": net_profit,
                 "per_phone": {
                     p: self._ledger_summary_phone(p)
@@ -9192,7 +9225,12 @@ return 'noicon';
         for b in (getattr(self, "_bets", None) or []):
             if str(b.get("phone") or "") != str(phone or ""):
                 continue
-            if str(b.get("status") or "") not in ("active", ""):
+            # "unconfirmed" counts as at-risk on purpose. A slip we asked the
+            # bookmaker for but have not yet seen acknowledged is, until proven
+            # otherwise, money that may already be gone. Under-counting it here
+            # would flatter equity exactly when a bet is silently missing —
+            # and "not_placed" (reaped phantom) is excluded, which is the point.
+            if str(b.get("status") or "") not in ("active", "unconfirmed", ""):
                 continue
             # A bet that is still "active" long after kickoff is not money in
             # play, it is a row the settlement sync failed to close. Counting it
@@ -10006,14 +10044,21 @@ return out;
         return "active"
 
     def _match_ledger_bet(self, row: dict, placed_at_iso: str, stake, possible_win):
-        """Return the seconds between the site row time and our placement time when
-        the row plausibly IS our placed bet (same legs/stake/possible win), else None.
+        """Return a match score (lower is better) when the site row plausibly IS
+        our placed bet, else None.
 
         Time tolerance is 2 hours — the site timestamp has no seconds and can lag
         by several minutes; bets from yesterday that weren't synced yet may be
-        several hours off from the local clock.  The stake + possible-win match
-        is the primary discriminator; the time window just prevents false matches
-        between different bets with identical amounts.
+        several hours off from the local clock.  Stake is the primary hard
+        discriminator; the time window just prevents false matches between
+        different bets with identical amounts.
+
+        possible_win is deliberately a SOFT signal, not a gate. On a settled bet
+        the site reports the RETURN (what actually came back), not the
+        pre-settlement potential the slip was priced with, so demanding equality
+        here permanently blocked id assignment for exactly the bets that had
+        already settled — which is how 8 of 10 real bets sat in the ledger with
+        no site id forever.
         """
         try:
             # Try primary date format, then alternate formats
@@ -10041,9 +10086,12 @@ return out;
         row_win   = row.get("win")   if row.get("win")   is not None else 0
         if abs(float(row_stake) - float(stake)) > 0.05:
             return None
-        if abs(float(row_win) - float(possible_win)) > 0.10:
-            return None
-        return diff
+        # Soft penalty: prefer a row whose win agrees with what we priced, but
+        # never exclude the candidate outright.
+        penalty = 0.0
+        if possible_win:
+            penalty = 0.0 if abs(float(row_win) - float(possible_win)) <= 0.10 else 600.0
+        return diff + penalty
 
     def _backfill_bet_ids(self, driver, gui_callback=None) -> int:
         """Resolve real platform Bet IDs for freshly-placed ledger bets (id=None)
@@ -10090,23 +10138,56 @@ return out;
             if r["id"]:
                 site[r["id"]] = r
         changed = False
-        for b in getattr(self, "_bets", []) or []:
-            # attach id to freshly-placed bets by (legs, date, stake, possible win)
-            if not b.get("id"):
-                best_id = None
-                best_diff = None
-                for r in rows:
-                    if b.get("legs") != r.get("legs"):
-                        continue
-                    diff = self._match_ledger_bet(r, b.get("placed_at", ""),
-                                                  b.get("stake") or 0,
-                                                  b.get("possible_win") or 0)
-                    if diff is not None and (best_diff is None or diff < best_diff):
-                        best_id = r["id"]
-                        best_diff = diff
-                if best_id:
-                    b["id"] = best_id
-                    changed = True
+        # A site bet may back at most ONE local row. Without this reservation
+        # two local rows happily claimed the same site id (00:47 was stamped
+        # with 8860, which actually belonged to the 01:45 bet), corrupting every
+        # later status update for that id. Starts EMPTY and is filled as rows
+        # below claim their match.
+        claimed_site_ids = set()
+        # Resolve ids GLOBALLY rather than row-by-row. A greedy per-row pass is
+        # order-dependent: the 00:04 phantom grabbed the 00:38 site bet (both
+        # KES 10, 34 min apart) purely by being processed first, which shifted
+        # every later id by one and put 8860 on the wrong local row. Collect all
+        # (local, site) candidates, then take the tightest pairs first so exact
+        # matches always beat near-misses.
+        pending = []
+        for _i, _b in enumerate(getattr(self, "_bets", None) or []):
+            if _b.get("id") or _b.get("status") not in ("unconfirmed", "active", None, ""):
+                continue
+            for _r in rows:
+                _rid = str(_r.get("id") or "")
+                if not _rid:
+                    continue
+                _score = self._match_ledger_bet(_r, _b.get("placed_at", ""),
+                                               _b.get("stake") or 0,
+                                               _b.get("possible_win") or 0)
+                if _score is not None and _score <= self.LEDGER_MATCH_WINDOW_SEC:
+                    pending.append((_score, _i, _rid))
+        pending.sort(key=lambda t: (t[0], t[1], t[2]))
+        _taken_local = set()
+        for _score, _i, _rid in pending:
+            if _i in _taken_local or _rid in claimed_site_ids:
+                continue
+            b = self._bets[_i]
+            b["id"] = _rid
+            _taken_local.add(_i)
+            claimed_site_ids.add(_rid)
+            # The SITE is authoritative about the slip that actually exists.
+            # Adopt its leg count so a leg the site dropped is reflected locally
+            # instead of being remembered forever, and align the payout field.
+            _srow = next((r for r in rows if str(r.get("id")) == _rid), None)
+            if _srow is not None:
+                try:
+                    if _srow.get("legs") is not None:
+                        b["legs"] = int(_srow["legs"])
+                except (TypeError, ValueError):
+                    pass
+                if _srow.get("win") is not None and not b.get("settled_at"):
+                    b["possible_win"] = _srow.get("win")
+            b.pop("unconfirmed_at", None)
+            b.pop("reconcile_note", None)
+            changed = True
+        for b in getattr(self, "_bets", None) or []:
             row = site.get(str(b.get("id"))) if b.get("id") else None
             if not row:
                 continue
@@ -10173,6 +10254,33 @@ return out;
             elif new_status == "void":
                 self._emit_direct(gui_callback,
                                   f"♻️ {row.get('status')} Bet #{b.get('id')} (stake returned)")
+        # ── Phantom reaper ───────────────────────────────────────────────
+        # A placement we never saw confirmed on the site is NOT a live bet. If it
+        # has stayed unconfirmed past the grace window (and the site history we
+        # just read covers its timestamp), retire it as `not_placed` and release
+        # the stake instead of counting it as exposure forever.
+        if changed or rows:
+            for b in getattr(self, "_bets", None) or []:
+                if b.get("id") or b.get("status") not in ("unconfirmed", "active"):
+                    continue
+                stamp = b.get("unconfirmed_at") or b.get("placed_at") or ""
+                try:
+                    age = (datetime.now() - datetime.fromisoformat(stamp)).total_seconds()
+                except Exception:
+                    continue
+                if age < self.UNCONFIRMED_GRACE_SEC:
+                    continue
+                b["status"] = "not_placed"
+                b["reconcile_note"] = ("no matching bet on the bookmaker after "
+                                       f"{self.UNCONFIRMED_GRACE_SEC // 60} min")
+                try:
+                    b["stake"] = 0.0
+                except (TypeError, ValueError):
+                    pass
+                changed = True
+                self._emit_direct(gui_callback,
+                                  f"🧹 UNCONFIRMED → NOT PLACED (stake released): "
+                                  f"KES {(b.get('stake') or 0):,.2f} at {b.get('placed_at', '')[:16]}")
         if changed:
             getattr(self, "_daily_bucket_cache", {}).clear()
             self._save_ledger()
@@ -10570,7 +10678,7 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
                                  for r in cashout_rows}.items())[:6]:
                 local_b = next((b for b in (getattr(self, "_bets", None) or [])
                                 if str(b.get("id") or "") == lid), None)
-                if local_b is None or (local_b.get("status") or "") not in ("active",):
+                if local_b is None or (local_b.get("status") or "") not in ("active", "unconfirmed"):
                     continue
                 if now - (self._cashout_probed.get(lid, 0.0)) < 600:
                     continue     # don't hammer the account faster than once/10 min
@@ -10930,7 +11038,7 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
             for b in getattr(self, "_bets", []) or []:
                 if str(b.get("status") or "").startswith("shadow"):
                     continue
-                if b.get("status") not in ("active", None, ""):
+                if b.get("status") not in ("active", "unconfirmed", None, ""):
                     continue
                 try:
                     placed = datetime.fromisoformat(b.get("placed_at") or "")
@@ -13701,25 +13809,33 @@ return '';
                            — it should retry later without triggering deposit alerts.
 
         Tiers, cheapest first:
-          1) in-page /api/wallets/balance fetch (needs a live browser session)
-          2) direct API login with the account's own credentials — the SAME tier
-             the GUI's "check balance" button uses, and the only tier that works
-             when the browser session is stale, the wallet widget is absent, or
-             the driver is parked on a sub-page. Without it a single failed
-             read at startup permanently blocks an account from betting.
+          1) direct API login with the account's own credentials — the SAME tier
+             the GUI's "check balance" button uses, and the only tier that is
+             guaranteed to belong to `phone` (see the session guard below)
+          2) in-page /api/wallets/balance fetch (needs a live browser session)
           3) patient page-text read (re-anchor + reload)
           4) DOM wallet-snapshot extractor
           5) one last in-page API try
+
+        ACCOUNT SAFETY: tiers 2-5 are all session-scoped — they report whatever
+        account the driver happens to be logged into. When the caller names a
+        different `phone`, trusting them returns ANOTHER ACCOUNT's balance as
+        `confirmed=True`, which silently poisons fleet equity and every drawdown
+        decision downstream. So when a specific account is requested we prove the
+        session identity first and fall back to the per-account API rather than
+        reporting the wrong number.
         """
-        # 1) in-page API endpoint — instant when the session is live
-        try:
-            snap = self._extract_wallet_snapshot_from_sportpesa_api(driver)
-            if snap is not None:
-                return float(snap.get("balance") or 0), True
-        except Exception:
-            pass
-        # 2) direct API login (browser-independent, authoritative)
-        if phone and password:
+        want = "".join(ch for ch in str(phone or "") if ch.isdigit())
+        session_ok = True
+        if want:
+            who = ""
+            try:
+                who = self._who_is_logged_in(driver)
+            except Exception:
+                who = ""
+            session_ok = bool(who) and who[-9:] == want[-9:]
+        # 1) direct API login (browser-independent, authoritative, account-correct)
+        if want and password:
             try:
                 api = self._api_login(self._format_sportsape_login_phone(phone),
                                       password, retries=2)
@@ -13727,6 +13843,18 @@ return '';
                     return float(api.get("balance") or 0), True
             except Exception:
                 pass
+        if not session_ok:
+            # Refuse to answer for an account the session cannot prove it owns.
+            # A false balance is worse than an unconfirmed one: the caller can
+            # retry a "not confirmed" read, but cannot detect a wrong number.
+            return 0.0, False
+        # 2) in-page API endpoint — instant when the session is live
+        try:
+            snap = self._extract_wallet_snapshot_from_sportpesa_api(driver)
+            if snap is not None:
+                return float(snap.get("balance") or 0), True
+        except Exception:
+            pass
         # 3) Page-text patient read (re-anchor + reload logic)
         balance = self._read_balance_patient(driver, wait=wait)
         if balance:
@@ -13803,7 +13931,10 @@ return '';
             float(b.get("stake") or 0)
             for b in (getattr(self, "_bets", None) or [])
             if (b.get("phone") or "") == phone
-            and (b.get("status") or "active") == "active"
+            # "unconfirmed" is money that may already be gone from the wallet,
+            # so the estimate must subtract it too — otherwise an unconfirmed
+            # slip makes the projected balance read HIGH by its stake.
+            and (b.get("status") or "active") in ("active", "unconfirmed")
             and not str(b.get("status") or "").startswith("shadow"))
         est = max(0.0, base - active_staked)
         return round(est, 2), source
