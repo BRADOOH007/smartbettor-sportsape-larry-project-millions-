@@ -2650,10 +2650,35 @@ return m ? m[0] : '';
                     self._emit_direct(gui_callback,
                                       f"ℹ️ Estimated balance for {phone}: KES {balance:,.2f}")
                 else:
+                    # OWNER RULE (2026-09-28): no readable balance means the
+                    # account is PARKED for this round — never bet it. Parking is
+                    # a skip, not a shutdown: the next account in the list still
+                    # gets its turn, so one unreadable number cannot stall the
+                    # whole fleet.
+                    # Park it the same way the rest of the engine does: a
+                    # _parked_until entry the scheduler already understands, plus
+                    # the supervisor beat so Fleet State shows it resting.
+                    try:
+                        if not hasattr(self, "_parked_until"):
+                            self._parked_until = {}
+                        self._parked_until[str(phone)] = time.time() + 1800.0
+                    except Exception:
+                        pass
+                    if self._agent_hub is not None:
+                        try:
+                            self._agent_hub.supervisor.beat_parked(phone)
+                        except Exception:
+                            pass
                     self._emit_direct(gui_callback,
-                                      "⚠️ No base balance known — skipping this round.")
-                    return {"status": "aborted", "message": "Balance unreadable — retry next round",
-                            "balance_unreadable": True}
+                                      f"🅿️ PARKED {phone} — no balance on record. "
+                                      f"Skipping to the next account.")
+                    # "skipped", not "aborted": an unreadable balance is a benign
+                    # decline, not a broken session. Reporting it as aborted made
+                    # the supervisor rebuild drivers for a parked account, which
+                    # was itself causing the renderer hangs.
+                    return {"status": "skipped", "skipped": True,
+                            "message": "Parked — balance unreadable",
+                            "balance_unreadable": True, "parked": True}
             self._emit_direct(gui_callback, f"Starting balance: KES {balance:,.2f}")
             if self._agent_hub is not None:
                 try:
@@ -5694,9 +5719,19 @@ agent_cfg: dict = None,
                             reserve_pool=0,
                             jitter_seed=jitter_seed)
                     else:
-                        lo, hi = self._bandit_target_range(
-                            self._gov('target_odds_min', 5.0),
-                            self._gov('target_odds_max', 6.0))
+                        # OWNER FLOOR (2026-09-28): the live band is
+                        # self.MIN_COMBINED_ODDS (2.5) up to _gov('target_odds_max'),
+                        # NOT a hardcoded x5-x6. A KES 10 bet at the 2.5 floor
+                        # returns at least KES 20, which is what the owner asked
+                        # for. The old x5-x6 default demanded roughly double that
+                        # and, with the retry ladder already degraded to x3-x4,
+                        # could not be filled even from a 62-game placeable board —
+                        # so the engine sat refusing to bet on a healthy account.
+                        # The 2.5 floor stays absolute; only the band above it moved.
+                        _hi = float(self._gov('target_odds_max', 6.0) or 6.0)
+                        lo = max(float(self.MIN_COMBINED_ODDS),
+                                 float(self._gov('target_odds_min', 0.0) or 0.0))
+                        hi = max(lo, _hi)
                         res = self._place_one_bet(driver, active_phone, password, stake=stake,
                                                   visible=cfg["visible"],
                                                   gui_callback=gui_callback,
