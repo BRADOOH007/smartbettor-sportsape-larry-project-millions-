@@ -13079,9 +13079,27 @@ return 'clicked';
                           v_k * e_k * self._drift_k(gid, mk, o) * self._time_k(g) *
                           self._league_k(mk, nm))
                 if base_w < float(floor):
-                    # Near-miss: passed every hard veto above but lost the weighted
-                    # floor. Kept aside so a top-up pass can still build a slip when
-                    # the whole board lands under the floor (see LEG_FLOOR_RELAX).
+                    # Per-game judgment (OWNER RULE 2026-09-28). Every HARD gate has
+                    # already been applied above: the raw-probability veto, the
+                    # x1.20 odds floor, the market whitelist, retired markets, the
+                    # injury/suspension veto, the today+tomorrow window, and the
+                    # implied-confidence cap. A leg reaching here has been judged on
+                    # its own merits and passed.
+                    #
+                    # base_w is a RANKING score, not a verdict: it multiplies seven
+                    # sub-unity factors (form, scout value, enrichment, drift, time,
+                    # league), so a genuine favourite in a league the engine has no
+                    # history for lands under it purely from unfamiliarity. The old
+                    # code treated that as disqualification and starved a healthy
+                    # board to 3 legs priced 1.21-1.47 (best product x2.49 against an
+                    # x2.50 floor), so the engine refused for an hour.
+                    #
+                    # A near-miss is therefore still held aside, but the top-up pass
+                    # below may promote it on the strength of the RAW-probability
+                    # veto alone — the genuine quality guard, applied per game. The
+                    # weighted score only decides the ORDER in which vetted legs are
+                    # used, and the implied-confidence cap still rates each promoted
+                    # leg no higher than its own price allows.
                     if base_w >= self.LEG_FLOOR_ABSOLUTE:
                         _near.append((gid, g.get("name", ""), o, base_w, p, mk, suf))
                     _DIAG["near"] += 1
@@ -13203,7 +13221,29 @@ return 'clicked';
             # a promoted leg is never rated above its own price.
             _rel = self.LEG_FLOOR_RELAX
             _abs_lo = self.LEG_FLOOR_ABSOLUTE
-            _pool = [c for c in _near if c[3] >= max(_abs_lo, float(floor) * _rel)]
+            # Per-game judgment (OWNER RULE 2026-09-28): a near-miss has already
+            # cleared every hard gate on its own merits — the raw-probability veto
+            # (>= RAW_LEG_VETO), the x1.20 odds floor, the market whitelist, retired
+            # markets, the injury/suspension veto and the today+tomorrow window. The
+            # weighted score is a RANKING signal, not a quality verdict, so it must
+            # not also be an admission bar.
+            #
+            # The old expression was max(0.30, 0.55 * 0.72) = 0.396, i.e. it
+            # demanded a HIGHER score than the leg was being excused from, so the
+            # top-up promoted almost nothing and the round died with 3 legs priced
+            # 1.21-1.47 (best product x2.49 against the x2.50 floor).
+            #
+            # Now: a near-miss qualifies on the raw-probability veto alone, still
+            # requiring the x1.20 odds floor so 1.01/1.04 filler legs can never be
+            # promoted, and still subject to LEG_FLOOR_ABSOLUTE so a leg the model
+            # rates as genuinely negligible is left out entirely. The weighted score
+            # orders the promotion; the implied-confidence cap re-rates each promoted
+            # leg no higher than its own price allows.
+            _pool = [c for c in _near
+                     if float(c[4]) >= self.RAW_LEG_VETO
+                     and float(c[2]) > self.MIN_LEG_ODDS
+                     and c[3] >= _abs_lo]
+            _pool.sort(key=lambda c: c[3], reverse=True)
             # Spread the top-up across market GROUPS instead of taking the global
             # top-N by confidence. Ranking purely by confidence reproduces the very
             # bias already documented above: Double Chance always carries the

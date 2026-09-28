@@ -493,15 +493,51 @@ if _legs:
 
 # The same board must NOT slip through when the raw probability is genuinely weak.
 print("== A genuinely weak board must still be refused ==")
+# 2026-09-28: this fixture used to overwrite ONLY the 1X2 markets, which left the
+# board's Double Chance and O/U lines at legitimate prices (DC 12 @1.23, O/U @1.75).
+# Per-game judgment (see the near-miss top-up) then correctly promoted those — they
+# clear the raw veto, the x1.20 odds floor and the implied-confidence cap, exactly as
+# the module documents — so the assertion below could not pass for the right reason.
+# It never actually tested a board of filler legs. Every market is now filler, so
+# the board really is the junk board the test claims to be.
 _weak = []
 for _g in _board:
     _c = dict(_g)
-    _c.update({"home_odds": 1.01, "draw_odds": 20.0, "away_odds": 40.0})
+    _c.update({
+        "home_odds": 1.01, "draw_odds": 20.0, "away_odds": 40.0,
+        "over_25": 1.02, "under_25": 1.02,
+        "btts_yes": 1.02, "btts_no": 1.02,
+        "over_15": 1.02,
+    })
     _weak.append(_c)
 _wl, _wp = e6._select_football_legs(
     _weak, target_min=2.5, target_max=4.0, max_legs=4, min_legs=3)
 check("a board of x1.01 filler legs is refused, not promoted",
       not _wl, f"legs={_wl}")
+
+# The real safety property behind that test, asserted directly: per-game judgment
+# may relax the WEIGHTED ranking score, but it must never admit a leg that fails a
+# hard gate. A leg under the x1.20 odds floor stays out even when the board is
+# otherwise healthy and the round desperately needs legs to clear x2.50.
+print("== Hard gates survive per-game judgment ==")
+_filler = []
+for _g in _board:
+    _c = dict(_g)
+    # Healthy 1X2 and O/U, but a sub-1.20 filler market added alongside.
+    _c.update({"home_odds": 1.30, "draw_odds": 5.0, "away_odds": 9.0,
+               "over_25": 1.90, "under_25": 1.90,
+               "btts_yes": 1.04, "btts_no": 1.04})
+    _filler.append(_c)
+_fl, _fp = e6._select_football_legs(
+    _filler, target_min=2.5, target_max=4.0, max_legs=4, min_legs=3)
+if _fl:
+    check("no sub-1.20 filler leg ever reaches a slip",
+          all(l[0] > 1.20 for l in _fl), str([l[0] for l in _fl]))
+    check("no slip leg is rated above what its own price implies",
+          all(l[4] <= min(0.97, (1.0 / l[0]) * 1.06 + 0.02) + 1e-9 for l in _fl),
+          str([(l[0], l[4]) for l in _fl]))
+else:
+    check("no sub-1.20 filler leg ever reaches a slip", True, "no slip built")
 
 # ── A missing account must not read as a bankrupt one (2026-09-27).
 # _engine_state["balances"] stores None for a round that failed to read an
