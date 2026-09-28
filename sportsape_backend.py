@@ -12768,7 +12768,10 @@ return 'clicked';
         # the machine to reach for 1X2 / Double Chance / BTTS legs too, so a slip
         # spans the whole board instead of betting one market four times.
         goals_used_in_slip = 0
+        _DIAG = {"games": 0, "veto": 0, "used": 0, "stale": 0, "no_opts": 0,
+                 "cand": 0, "near": 0}
         for g in games:
+            _DIAG["games"] += 1
             gid = g.get("id", "")
             h3 = self._fair_win_probs(g.get("h3")) or []
             btts = self._fair_win_probs(g.get("btts")) or []
@@ -12800,6 +12803,7 @@ return 'clicked';
             # key absence is dropped ENTIRELY — never bet, never even considered.
             _veto = self._enrichment_veto(_enr or {})
             if _veto:
+                _DIAG["veto"] += 1
                 self._emit_direct(gui_callback,
                                   f"⛔ {g.get('name','')}: skipped — {_veto}")
                 continue
@@ -12807,6 +12811,7 @@ return 'clicked';
             # earlier slip — on this number or any other — is dropped ENTIRELY here,
             # before any market for it is even considered.
             if str(gid) in used_set:
+                _DIAG["used"] += 1
                 self._emit_direct(gui_callback,
                                   f"⏭ {g.get('name', '')}: already bet today — "
                                   "no match repeats across numbers")
@@ -12815,6 +12820,7 @@ return 'clicked';
             # suspends/voids the line before kick-off, so far-future legs just
             # burn the round with 'Not valid (selection suspended/removed)'.
             if not self._is_recent_enough(g):
+                _DIAG["stale"] += 1
                 continue
             e_k = self._enrichment_k(_enr or {}, home_n, away_n)
             options = []
@@ -13078,6 +13084,7 @@ return 'clicked';
                     # the whole board lands under the floor (see LEG_FLOOR_RELAX).
                     if base_w >= self.LEG_FLOOR_ABSOLUTE:
                         _near.append((gid, g.get("name", ""), o, base_w, p, mk, suf))
+                    _DIAG["near"] += 1
                     continue
                 # Per-account spread factor — deterministic (no Python hash salt).
                 # Used ONLY as a tiebreak so parallel accounts don't all bet the
@@ -13291,7 +13298,17 @@ return 'clicked';
                 self._emit_direct(gui_callback,
                                   f"🧠 JEV blend error (ignored): {str(_je)[:70]}")
         cands.sort(key=lambda c: c[0])
-        pool = cands[: min(len(cands), max_legs + 5)]
+        _DIAG["cand"] = len(cands)
+        # Keep a working pool that spans the WHOLE odds range, not just the
+        # cheapest few. The builder searches combinations for a product at or
+        # above target_min, so it needs the higher-priced legs available: taking
+        # only the max_legs+5 CHEAPEST candidates (9 legs at max_legs=4) meant a
+        # board of 64 qualified games still could not reach the x2.50 floor,
+        # because every leg it was allowed to combine was a short one. The pool
+        # is now the full qualifying set, trimmed from the top-priced end so the
+        # cheapest (least useful) legs drop first.
+        _pool_cap = max(60, (int(max_legs) + 5) * 8)
+        pool = cands[-_pool_cap:] if len(cands) > _pool_cap else list(cands)
         mid = (target_min + target_max) / 2.0
         # Use exactly the target window — no hard x3 floor since the window
         # itself is now x5-x15 which is always a decent payout.
@@ -13299,6 +13316,20 @@ return 'clicked';
         hi = target_max * 1.10
 
         import itertools
+
+        self._emit_direct(gui_callback,
+                          f"🔬 SEL DIAG: {games.__len__()} games in | "
+                          f"dropped veto={_DIAG['veto']} used={_DIAG['used']} "
+                          f"stale={_DIAG['stale']} | qualifying legs={_DIAG['cand']} "
+                          f"(near-miss pool={_DIAG['near']}) | builder pool={len(pool)} "
+                          f"| window x{lo:.2f}-x{target_max:.2f} | "
+                          f"leg odds {pool[0][0]:.2f}..{pool[-1][0]:.2f}"
+                          if pool else
+                          f"🔬 SEL DIAG: {games.__len__()} games in | "
+                          f"dropped veto={_DIAG['veto']} used={_DIAG['used']} "
+                          f"stale={_DIAG['stale']} | qualifying legs=0 "
+                          f"(near-miss={_DIAG['near']}) | NO POOL — "
+                          f"nothing cleared the gates")
 
         def _joint(combo):
             prod_o = 1.0
