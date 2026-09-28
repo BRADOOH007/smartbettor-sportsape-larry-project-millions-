@@ -12818,8 +12818,17 @@ return 'clicked';
                 continue
             e_k = self._enrichment_k(_enr or {}, home_n, away_n)
             options = []
+            # h3[0] is a PRICE (e.g. 1.20), not a probability. Passing it as the
+            # leg's fair prob made the raw veto compare 1.20 >= 0.50, so every
+            # home favourite cleared the veto on its PRICE while the draw/away legs
+            # built right beside it (which use h3_probs) were judged on a real
+            # probability. The two branches were not measuring the same thing, and
+            # the un-vetoed home legs were then the cheapest picks in the pool.
+            # Use the margin-stripped fair probability, exactly as draw/away do.
             if h3 and isinstance(g.get("home_odds"), (int, float)):
-                options.append((g["home_odds"], h3[0], "home", "", 1.0 + tilt))
+                _h3p = self._fair_win_probs(h3) or []
+                options.append((g["home_odds"], _h3p[0] if _h3p else h3[0],
+                                "home", "", 1.0 + tilt))
             if btts and isinstance(g.get("btts_yes"), (int, float)):
                 options.append((g["btts_yes"], btts[0], "btts", " BTTS:YES", 1.0 + 0.5 * tilt))
             # ── Goals markets with Poisson/O-U calibration (#5, 2026-09-24) ──
