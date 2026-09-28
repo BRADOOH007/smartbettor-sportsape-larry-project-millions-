@@ -2668,7 +2668,22 @@ return m ? m[0] : '';
             # bleeding at once. Per-account, an account down 40% from its own
             # peak is frozen and must be reviewed by the owner.
             _fleet = dict(getattr(self, "_engine_state", {}).get("balances") or {})
-            _fleet[phone] = balance
+            # Only a positive, readable figure may enter the fleet equity picture.
+            # A 0.0 here means "we could not read this account" — feeding it in
+            # records an equity of just the open stake, which reads as a ~50%
+            # drawdown and latches a portfolio halt against a healthy account.
+            try:
+                _own = float(balance)
+            except (TypeError, ValueError):
+                _own = 0.0
+            if _own > 0.0:
+                _fleet[phone] = _own
+            else:
+                self._emit_direct(
+                    gui_callback,
+                    f"ℹ️ Not folding a zero/unreadable balance for {phone} into the "
+                    f"fleet equity — the breakers treat it as unknown until a real "
+                    f"reading arrives.")
             # NOTE: the whole fleet is passed, never just {phone: balance}. Peaks
             # and drawdown are both fleet-level quantities, so feeding one account
             # makes the others look like they vanished and manufactures a fake
@@ -9359,20 +9374,49 @@ return 'noicon';
     def _note_balances(self, balances: dict):
         """Update peak-EQUITY tracking for the drawdown breakers. `balances` maps
         phone -> current cash balance. Peaks only ever rise, so the reference
-        point survives losses and a restart."""
+        point survives losses and a restart.
+
+        A cash reading of exactly 0.0 is treated as UNKNOWN, not as an account
+        that went broke. _read_balance_confirmed returns (0.0, False) when it
+        cannot read an account or cannot prove which account the session belongs
+        to, and a caller that re-checks with an estimate can still land on 0.0.
+        Recording that 0.0 would write an equity of just the open stake (e.g.
+        KES 15.00 for an account holding KES 70), which then reads as a ~50%
+        fleet drawdown and latches a portfolio halt on a perfectly healthy
+        account. The breakers already ignore unreadable accounts; this makes the
+        recorded EQUITY agree with them instead of poisoning the peak reference.
+        """
         try:
             pf = self._load_portfolio()
             last = pf.setdefault("last_equity", {})
+            skipped_zero = 0
             for phone, bal in (balances or {}).items():
                 key = str(phone)
                 try:
-                    eq = self._equity_for(key, bal)
+                    fbal = float(bal)
+                except (TypeError, ValueError):
+                    continue
+                if fbal <= 0.0:
+                    # Keep the previously recorded equity for this account rather
+                    # than overwriting it with a false zero.
+                    if key not in last:
+                        skipped_zero += 1
+                    continue
+                try:
+                    eq = self._equity_for(key, fbal)
                 except Exception:
                     continue
                 last[key] = round(eq, 2)
                 prev = float(pf["peaks"].get(key) or 0.0)
                 if eq > prev:
                     pf["peaks"][key] = round(eq, 2)
+            if skipped_zero:
+                self._emit_direct(
+                    None,
+                    f"⚠️ Ignored {skipped_zero} zero/unreadable balance reading(s) for "
+                    f"equity tracking — kept the last known equity instead of "
+                    f"recording a false zero (a false zero reads as a total loss "
+                    f"and halts the fleet).")
             # The portfolio peak must be the peak of the FLEET total, and must be
             # compared against a fleet total computed the same way every time.
             # Only ratchet the peak up from a reading that actually covered the
