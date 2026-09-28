@@ -8699,8 +8699,14 @@ return 'noicon';
     # are below this. The historical "safe-looking" sub-3.0 accumulators
     # (2L@lt3 / 3L@lt3) were 431 bets at -43% ROI: stacking tiny-odds legs
     # multiplies the bookmaker's margin, not our edge.
+    # OWNER RULE (2026-09-28): lowered to 2.5 to match MIN_COMBINED_ODDS. The
+    # -43% family was almost entirely cheap filler-leg stacking (sub-x1.20 legs);
+    # per-game judgment now guarantees every leg clears the x1.20 odds floor, the
+    # raw-probability veto and the implied-confidence cap, capped at 2 slots per
+    # market. The skew floor stays as a backstop equal to the owner floor rather
+    # than silently raising it to x3.00.
     MAX_MARKET_LEGS_PER_SLIP = 2
-    MIN_SKEW_ODDS = 3.0
+    MIN_SKEW_ODDS = 2.5
 
     # Hard ceiling on legs in ONE slip, enforced at both placement funnels.
     # The ledger is unambiguous here: 14-leg and 25-leg shapes returned -100%
