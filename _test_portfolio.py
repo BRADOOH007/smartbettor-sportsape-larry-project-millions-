@@ -636,9 +636,44 @@ check("a cheap-leg pool still yields a slip", bool(_cl),
 check("the cheap-leg pool reaches the x2.50 combined floor",
       bool(_cl) and _cp >= 2.5, f"product={_cp}")
 if _cl:
-    check("cheap-pool legs still clear the raw-probability veto",
-          all(l[4] >= sb.SportsapeBackend.RAW_LEG_VETO for l in _cl),
-          str([round(l[4], 3) for l in _cl]))
+    # The raw-probability veto is a HARD admission gate on each market's
+    # MARGIN-STRIPPED fair probability (enforced before base_w is even computed).
+    # The weighted confidence stored on a leg (l[4]) is base_w, which takes the
+    # league penalty (0.62 here) — so it is expected to sit BELOW the veto even
+    # when the market itself cleared it. Recompute the market's fair prob from
+    # the fixture odds and assert THAT cleared the veto.
+    _fair = sb.SportsapeBackend._fair_win_probs
+    _g_ou = lambda g: g.get("ou")
+    _g_ou15 = lambda g: g.get("ou15")
+    _g_btts = lambda g: g.get("btts")
+    _g_h3 = lambda g: g.get("h3")
+
+    def _fair_of(g, mk):
+        if str(mk) == "over":
+            return (_fair(_g_ou(g)) or [0, 1])[0]
+        if str(mk) == "under":
+            return (_fair(_g_ou(g)) or [0, 1])[1]
+        if str(mk) == "over15":
+            return (_fair(_g_ou15(g)) or [0, 1])[0]
+        if str(mk) in ("btts", "btts_no"):
+            return (_fair(_g_btts(g)) or [0, 1])[0 if str(mk) == "btts" else 1]
+        if str(mk) in ("home", "draw", "away"):
+            i = {"home": 0, "draw": 1, "away": 2}[str(mk)]
+            return (_fair(_g_h3(g)) or [0, 0, 1])[i]
+        if str(mk) in ("dc_12", "dc_1x", "dc_x2"):
+            ps = _fair(_g_h3(g)) or [0, 0, 1]
+            if str(mk) == "dc_12":
+                return ps[0] + ps[2]
+            if str(mk) == "dc_1x":
+                return ps[0] + ps[1]
+            return ps[1] + ps[2]
+        return 0.0
+
+    check("cheap-pool markets still clear the raw-probability veto",
+          all(_fair_of(next(g for g in _cheap_board if g["id"] == l[2]), l[3])
+              >= sb.SportsapeBackend.RAW_LEG_VETO - 1e-9 for l in _cl),
+          str([round(_fair_of(next(g for g in _cheap_board if g["id"] == l[2]), l[3]), 3)
+               for l in _cl]))
     check("cheap-pool legs still clear the leg-odds floor",
           all(l[0] > sb.SportsapeBackend.MIN_LEG_ODDS for l in _cl),
           str([l[0] for l in _cl]))

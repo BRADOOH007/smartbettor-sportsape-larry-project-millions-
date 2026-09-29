@@ -12757,10 +12757,10 @@ return 'clicked';
         used_set = set(used) if used else set()
         self._load_stats()
         per_game = {}
-        # Legs that cleared every hard veto but missed the weighted floor. Only
-        # used by the top-up pass below, and only when the board would otherwise
-        # produce no slip at all.
-        _near = []
+        _DIAG = {"games": 0, "veto": 0, "used": 0, "stale": 0, "no_opts": 0,
+                 "cand": 0, "near": 0, "below_abs": 0, "trunc": 0,
+                 "no_options": 0, "no_home": 0, "all_sub120": 0, "all_raw": 0,
+                 "only_btts_cap": 0, "res_only": 0}
         # OWNER RULE (per-SLIP, 2026-09-19): max ONE BTTS/GG leg per slip. The
         # old engine re-armed this cap inside the per-game loop, so 3-4 GG legs
         # could still stack (BTTS fair prob ~55-60% got it picked every kick-off).
@@ -12774,8 +12774,12 @@ return 'clicked';
         # the machine to reach for 1X2 / Double Chance / BTTS legs too, so a slip
         # spans the whole board instead of betting one market four times.
         goals_used_in_slip = 0
-        _DIAG = {"games": 0, "veto": 0, "used": 0, "stale": 0, "no_opts": 0,
-                 "cand": 0, "near": 0}
+        # Threshold census (2026-09-28): how many GAMES reach each gate, so the
+        # live log can show WHY the board collapses to 3 legs instead of guessing.
+        # Each game may contribute several market legs; we count a game ONCE per
+        # threshold when at least one of its legs passes that threshold.
+        _census = {"any_leg": 0}
+        _seen_census_games = set()
         for g in games:
             _DIAG["games"] += 1
             gid = g.get("id", "")
@@ -12980,6 +12984,7 @@ return 'clicked';
                         options.append((o_a, prob_a, mk_a, " BRAIN", 1.0))
             # Researched-only mode: only games with a fresh analyst pick qualify.
             if researched_only and not pick_ok:
+                _DIAG["res_only"] += 1
                 continue
             valid = []
             floor = self.MIN_LEG_CONF if conf_floor is None else float(conf_floor)
@@ -13026,6 +13031,7 @@ return 'clicked';
             for o, p, mk, suf, form_k in options:
                 # Owner rule: never a leg below x1.20 (drop 1.01/1.04 filler legs).
                 if not (self.MIN_LEG_ODDS < o):
+                    _DIAG["all_sub120"] += 1
                     continue
                 # Owner's market whitelist toggles (Over 1.5 / Over 2.5 / BTTS / 1X2).
                 if not self._market_ok(mk):
@@ -13038,6 +13044,7 @@ return 'clicked';
                 # tickets stay buildable, but 0.136/0.21 garbage never enters.
                 raw_veto = 0.40 if prefer_more_legs else self.RAW_LEG_VETO
                 if float(p) < raw_veto:
+                    _DIAG["all_raw"] += 1
                     continue
                 # Block if this market's GROUP was already used for this game
                 _grp_here = _mk_group(mk)
@@ -13084,32 +13091,33 @@ return 'clicked';
                 base_w = (float(p) * self._market_type_weight(mk) * form_k *
                           v_k * e_k * self._drift_k(gid, mk, o) * self._time_k(g) *
                           self._league_k(mk, nm))
-                if base_w < float(floor):
-                    # Per-game judgment (OWNER RULE 2026-09-28). Every HARD gate has
-                    # already been applied above: the raw-probability veto, the
-                    # x1.20 odds floor, the market whitelist, retired markets, the
-                    # injury/suspension veto, the today+tomorrow window, and the
-                    # implied-confidence cap. A leg reaching here has been judged on
-                    # its own merits and passed.
-                    #
-                    # base_w is a RANKING score, not a verdict: it multiplies seven
-                    # sub-unity factors (form, scout value, enrichment, drift, time,
-                    # league), so a genuine favourite in a league the engine has no
-                    # history for lands under it purely from unfamiliarity. The old
-                    # code treated that as disqualification and starved a healthy
-                    # board to 3 legs priced 1.21-1.47 (best product x2.49 against an
-                    # x2.50 floor), so the engine refused for an hour.
-                    #
-                    # A near-miss is therefore still held aside, but the top-up pass
-                    # below may promote it on the strength of the RAW-probability
-                    # veto alone — the genuine quality guard, applied per game. The
-                    # weighted score only decides the ORDER in which vetted legs are
-                    # used, and the implied-confidence cap still rates each promoted
-                    # leg no higher than its own price allows.
-                    if base_w >= self.LEG_FLOOR_ABSOLUTE:
-                        _near.append((gid, g.get("name", ""), o, base_w, p, mk, suf))
-                    _DIAG["near"] += 1
-                    continue
+                # Per-game census: the HARD gates (raw veto + odds floor + market
+                # whitelist + not retired) decide whether a game is bettable at all.
+                # The weighted score base_w only ranks. Count how many games reach
+                # the ranking step at all, so the live SEL DIAG shows where the
+                # board actually thins out. (2026-09-28: every leg reaching here
+                # has already cleared the raw veto and the odds floor, so the old
+                # floor055/abs030 census split was noise — near-misses are admitted
+                # like everyone else now.)
+                if gid not in _seen_census_games:
+                    _seen_census_games.add(gid)
+                    _census["any_leg"] += 1
+                # base_w is a RANKING score only. Every HARD gate has already been
+                # applied above (raw-probability veto, x1.20 odds floor, market
+                # whitelist, retired markets, injury/suspension, today+tomorrow
+                # window, implied-confidence cap), so a leg reaching here has been
+                # judged on its own merits and passed. base_w must NOT also bar
+                # admission: multiplying sub-unity factors (form, scout value,
+                # enrichment, drift, time, league) would delete a genuine favourite
+                # in an unfamiliar league purely from unfamiliarity.
+                #
+                # (2026-09-28, simplification): the earlier near-miss ladder — hold
+                # legs below MIN_LEG_CONF, then a top-up pass re-promotes them on the
+                # raw veto alone — turned out to be dead weight. Every near-miss was
+                # a sibling market of an already-claimed game, so the top-up could
+                # never widen the pool; the raw-veto gate on the board is the real
+                # constraint. Removed: every leg that clears the hard gates is a
+                # candidate, and base_w only orders them.
                 # Per-account spread factor — deterministic (no Python hash salt).
                 # Used ONLY as a tiebreak so parallel accounts don't all bet the
                 # identical slip when two options are truly equal.
@@ -13118,8 +13126,10 @@ return 'clicked';
                     h = (int(hashlib.sha256(
                         f"{seed}|{gid}|{mk}".encode("utf-8")).hexdigest(), 16) % 1000)
                     jitter_mult = 1.0 + ((h / 1000.0) - 0.5) * 0.06
+                # base_w is a RANKING score only.
                 valid.append((o, base_w * jitter_mult, min(base_w, 0.98), mk, suf))
             if not valid:
+                _DIAG["no_options"] += 1
                 continue
             # ── OWNER LEARNING (2026-09-26): the over/under death-trap fix ──
             # The slip was collapsing into 4x "over" every round. Two causes, both
@@ -13211,108 +13221,6 @@ return 'clicked';
                 p *= o
             return p
 
-        # Top up when the pool cannot REACH the combined-odds floor, not merely
-        # when it is short on legs. Both failure modes look identical from the
-        # log ("no bet this round") but need different fixes, and only this one
-        # is recoverable by adding a near-miss leg.
-        _need_more = (len(cands) < min_legs) or (
-            len(cands) > 0 and _best_product(cands) < self.MIN_COMBINED_ODDS)
-        if _need_more and _near:
-            # The board is real (dozens of placeable games) but every leg lost the
-            # weighted floor, usually because the fixtures are in leagues the
-            # engine has no history for. Top up from the near-misses — best
-            # ranked first — so the round can still produce a slip. The odds floor,
-            # the raw-probability veto, retired markets and the per-slip BTTS/goals
-            # caps all still apply, and the implied-confidence cap is re-applied so
-            # a promoted leg is never rated above its own price.
-            _rel = self.LEG_FLOOR_RELAX
-            _abs_lo = self.LEG_FLOOR_ABSOLUTE
-            # Per-game judgment (OWNER RULE 2026-09-28): a near-miss has already
-            # cleared every hard gate on its own merits — the raw-probability veto
-            # (>= RAW_LEG_VETO), the x1.20 odds floor, the market whitelist, retired
-            # markets, the injury/suspension veto and the today+tomorrow window. The
-            # weighted score is a RANKING signal, not a quality verdict, so it must
-            # not also be an admission bar.
-            #
-            # The old expression was max(0.30, 0.55 * 0.72) = 0.396, i.e. it
-            # demanded a HIGHER score than the leg was being excused from, so the
-            # top-up promoted almost nothing and the round died with 3 legs priced
-            # 1.21-1.47 (best product x2.49 against the x2.50 floor).
-            #
-            # Now: a near-miss qualifies on the raw-probability veto alone, still
-            # requiring the x1.20 odds floor so 1.01/1.04 filler legs can never be
-            # promoted, and still subject to LEG_FLOOR_ABSOLUTE so a leg the model
-            # rates as genuinely negligible is left out entirely. The weighted score
-            # orders the promotion; the implied-confidence cap re-rates each promoted
-            # leg no higher than its own price allows.
-            _pool = [c for c in _near
-                     if float(c[4]) >= self.RAW_LEG_VETO
-                     and float(c[2]) > self.MIN_LEG_ODDS
-                     and c[3] >= _abs_lo]
-            _pool.sort(key=lambda c: c[3], reverse=True)
-            # Spread the top-up across market GROUPS instead of taking the global
-            # top-N by confidence. Ranking purely by confidence reproduces the very
-            # bias already documented above: Double Chance always carries the
-            # highest weighted confidence, so a top-N fill promotes x1.23 DC legs
-            # only (4 x 1.23 = x2.28, still under the x2.50 floor) while the
-            # higher-priced 1X2 and goals options that would actually build the
-            # slip sit below them. Round-robin over groups so each pass takes the
-            # best remaining leg of a DIFFERENT market.
-            _by_grp = {}
-            for _c in _pool:
-                _by_grp.setdefault(_mk_group(_c[5]), []).append(_c)
-            for _v in _by_grp.values():
-                _v.sort(key=lambda c: c[3], reverse=True)
-            _order = []
-            _r = 0
-            while True:
-                _added = False
-                for _k in list(_by_grp):
-                    if _r < len(_by_grp[_k]):
-                        _order.append(_by_grp[_k][_r])
-                        _added = True
-                if not _added:
-                    break
-                _r += 1
-            _claimed = set(per_game.keys())
-            _promoted = []
-            for _gid2, _nm2, _o2, _bw2, _p2, _mk2, _suf2 in _order:
-                # Fill to max_legs, NOT min_legs. Promoting just enough to satisfy
-                # the leg count still can leave the slip short of the combined-odds
-                # floor (three x1.30 legs = x2.20, under the x2.50 minimum), which
-                # is the same dead end one layer down. The builder picks the best
-                # subset from a deeper pool; every leg in it still cleared the hard
-                # vetoes above.
-                if len(per_game) >= max_legs:
-                    break
-                if _gid2 in _claimed:
-                    continue
-                if str(_mk2) in ("btts", "btts_no"):
-                    if btts_used_in_slip:
-                        continue
-                elif str(_mk2).startswith(("over", "under")):
-                    if goals_used_in_slip >= self.MAX_GOALS_LEGS_PER_SLIP:
-                        continue
-                if str(_mk2) in ("btts", "btts_no"):
-                    btts_used_in_slip = True
-                elif str(_mk2).startswith(("over", "under")):
-                    goals_used_in_slip += 1
-                _cap2 = min(0.97, (1.0 / float(_o2)) * 1.06 + 0.02) if _o2 else 0.97
-                per_game[_gid2] = (float(_o2), f"{_nm2}{_suf2}", _gid2, _mk2,
-                                   min(float(_p2), _cap2))
-                _claimed.add(_gid2)
-                _promoted.append(_gid2)
-            if _promoted:
-                self._emit_direct(
-                    gui_callback,
-                    f"🪜 Topped up with {len(_promoted)} near-miss leg(s): the pool "
-                    f"could not reach the x{self.MIN_COMBINED_ODDS:g} combined floor "
-                    f"(best was x{_best_product(cands):.2f}) because every remaining "
-                    f"candidate lost the weighted confidence floor ({float(floor):.2f}) "
-                    f"on unfamiliar fixtures. Hard vetoes (leg odds > "
-                    f"{self.MIN_LEG_ODDS:g}, raw prob >= {self.RAW_LEG_VETO:g}) "
-                    f"still applied.")
-                cands = list(per_game.values())
         if len(cands) < min_legs:
             # Never sacrifice quality for quantity: a half-decent product of a
             # weak board is a donation. Skip the round instead of dropping the
@@ -13367,15 +13275,24 @@ return 'clicked';
                           f"🔬 SEL DIAG: {games.__len__()} games in | "
                           f"dropped veto={_DIAG['veto']} used={_DIAG['used']} "
                           f"stale={_DIAG['stale']} | qualifying legs={_DIAG['cand']} "
-                          f"(near-miss pool={_DIAG['near']}) | builder pool={len(pool)} "
+                          f"| builder pool={len(pool)} "
                           f"| window x{lo:.2f}-x{target_max:.2f} | "
                           f"leg odds {pool[0][0]:.2f}..{pool[-1][0]:.2f}"
+                          f" | games_reached_rank={_census['any_leg']} "
+                          f"sub120_calls={_DIAG['all_sub120']} "
+                          f"rawveto_calls={_DIAG['all_raw']} "
+                          f"no_opts_games={_DIAG['no_options']} "
+                          f"res_only_games={_DIAG['res_only']})"
                           if pool else
                           f"🔬 SEL DIAG: {games.__len__()} games in | "
                           f"dropped veto={_DIAG['veto']} used={_DIAG['used']} "
                           f"stale={_DIAG['stale']} | qualifying legs=0 "
-                          f"(near-miss={_DIAG['near']}) | NO POOL — "
-                          f"nothing cleared the gates")
+                          f"| NO POOL — nothing cleared the gates"
+                          f" | games_reached_rank={_census['any_leg']} "
+                          f"sub120_calls={_DIAG['all_sub120']} "
+                          f"rawveto_calls={_DIAG['all_raw']} "
+                          f"no_opts_games={_DIAG['no_options']} "
+                          f"res_only_games={_DIAG['res_only']})")
 
         def _joint(combo):
             prod_o = 1.0
