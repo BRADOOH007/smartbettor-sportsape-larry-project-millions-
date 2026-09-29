@@ -2223,29 +2223,16 @@ return true;
     ENRICH_TTL_SECONDS = 6 * 3600  # game enrichment (injuries, weather) valid 6h
     ODDS_HISTORY_PATH = Path(writable_path("sportsape_odds_history.json"))
     MIN_LEG_CONF = 0.55  # minimum fair probability per leg — only markets with a genuine shot
-    LEG_FLOOR_RELAX = 0.72  # (2026-09-27) A leg's ranked score is a PRODUCT of
-                            # probability x market weight x form x scout value x
-                            # enrichment x drift x time x league. On a board made of
-                            # unfamiliar fixtures (third-tier leagues, reserves) the
-                            # league/time factors alone push a genuinely 78%-likely
-                            # leg under MIN_LEG_CONF, EVERY game is filtered out, and
-                            # the round reports "Not enough qualifying games" with 65
-                            # placeable games on the tab. That is a filter artefact,
-                            # not a thin board. When the pool comes up short we may
-                            # top it up from near-miss legs down to this fraction of
-                            # the floor — and never past LEG_FLOOR_ABSOLUTE. The hard
-                            # vetoes (raw prob, leg odds, retired markets, per-slip
-                            # BTTS/goals caps) are NOT relaxed by this.
-    LEG_FLOOR_ABSOLUTE = 0.30  # floor for the top-up pass, whatever the board looks
-                               # like. This is deliberately well below
-                               # RAW_LEG_VETO (0.50): the raw-probability veto is the
-                               # real quality guard and it is absolute, while
-                               # base_w is a ranking score that unfamiliar leagues
-                               # depress. A leg promoted from a near-miss has still
-                               # cleared the raw veto, the leg-odds floor, the
-                               # market whitelist and the implied-confidence cap.
     MIN_LEG_ODDS = 1.20  # owner rule: no leg under x1.20 (never 1.01/1.04 filler legs)
-    RAW_LEG_VETO = 0.50  # hard veto: never bet a leg whose raw fair prob is below this
+    RAW_LEG_VETO = 0.45  # hard veto: never bet a leg whose raw fair prob is below this.
+                         # (2026-09-28, OWNER decision): relaxed 0.50 -> 0.45. The 0.50
+                         # bar combined with the x1.20 odds floor to leave only 3 of
+                         # 25-32 games qualifying on an overnight board (rawveto_calls
+                         # 83-96 per round), which could never build an x2.50 slip.
+                         # 0.45 still admits only genuine near-favourites (>= 45% at
+                         # margin-stripped fair prob) and still blocks the 0.136/0.21
+                         # garbage the veto was created for; a 2.2 favourite (fair ~45%)
+                         # should supply the legs the board was withholding.
     BTTS_STRONG_FLOOR = 0.62  # OWNER RULE (2026-09-19, ENFORCED): a BTTS/GG leg may
                               # join a slip ONLY when the model's weighted confidence
                               # clears 0.62 — GG's fair prob is ~55-60% (a coin-flip),
