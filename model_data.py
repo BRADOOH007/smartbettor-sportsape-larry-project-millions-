@@ -388,28 +388,6 @@ def fetch_basketball_results_on(day: str, force: bool = False) -> list:
         return []
 
 
-def fetch_all_results_on(day: str) -> list:
-    """Football + basketball results for a day, merged.
-
-    The per-leg scorer and the shadow settler both need to grade legs from
-    every sport the engine drafts. find_result() already requires an
-    UNAMBIGUOUS match, so a basketball pairing that collides with a
-    football one on the same day is left undecidable rather than guessed -
-    merging the two feeds is safe. A merged miss simply yields None (no
-    trial recorded), which is the honest outcome.
-    """
-    out = []
-    try:
-        out.extend(fetch_results_on(day) or [])
-    except Exception:
-        pass
-    try:
-        out.extend(fetch_basketball_results_on(day) or [])
-    except Exception:
-        pass
-    return out
-
-
 def find_result(home: str, away: str, rows: list):
     """The feed row for a pairing, exact first then unambiguous-fuzzy.
 
@@ -982,3 +960,116 @@ def lineup_ok(fixture_id: int) -> bool:
         if len(lu.get("startXI") or []) < 10:
             return False  # incomplete = something wrong
     return True
+
+# -- Tennis results (ESPN, free, no quota) ----------------------------------
+_TENNIS_TTL = 6.0 * 3600.0
+
+
+def _fetch_tennis_for_date(day: str) -> list:
+    """Fetch tennis results from ESPN for a specific date. Returns rows."""
+    rows = []
+    seen = set()
+    dstr = day.replace("-", "")
+    for slug in ("atp", "wta"):
+        url = ("https://site.api.espn.com/apis/site/v2/sports/tennis/%s/scoreboard"
+               "?dates=%s" % (slug, dstr))
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception:
+            continue
+        for event in (body.get("events") or []):
+            for grouping in (event.get("groupings") or []):
+                for comp in (grouping.get("competitions") or []):
+                    try:
+                        status = (comp.get("status") or {}).get("type") or {}
+                        if status.get("name") not in ("STATUS_FINAL", "STATUS_RETIRED"):
+                            continue
+                        if comp.get("date", "")[:10] != day:
+                            continue
+                        competitors = comp.get("competitors") or []
+                        if len(competitors) != 2:
+                            continue
+                        home = next((c for c in competitors
+                                     if c.get("homeAway") == "home"), None)
+                        away = next((c for c in competitors
+                                     if c.get("homeAway") == "away"), None)
+                        if not home or not away:
+                            # fallback: order by 'order' field
+                            competitors_sorted = sorted(competitors,
+                                                        key=lambda c: c.get("order", 0))
+                            home, away = competitors_sorted[0], competitors_sorted[1]
+                        hn = (home.get("athlete") or {}).get("displayName", "")
+                        an = (away.get("athlete") or {}).get("displayName", "")
+                        if not hn or not an:
+                            continue
+                        hn_n, an_n = norm(hn), norm(an)
+                        if not hn_n or not an_n:
+                            continue
+                        key = (hn_n, an_n)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        home_won = home.get("winner") is True
+                        away_won = away.get("winner") is True
+                        if home_won:
+                            hg, ag = 1, 0
+                        elif away_won:
+                            hg, ag = 0, 1
+                        else:
+                            continue  # no winner (walkover without result)
+                        rows.append({
+                            "hn": hn_n, "an": an_n,
+                            "hg": hg, "ag": ag,
+                            "hth": None, "hta": None,
+                            "status": "FT",
+                            "_sport": "tennis",
+                        })
+                    except Exception:
+                        continue
+    return rows
+
+
+def fetch_tennis_results_today(force: bool = False) -> list:
+    cache = _load_cache()
+    tr = cache.setdefault("tennis_results", {})
+    day = date.today().isoformat()
+    if not force:
+        ent = tr.get(day)
+        if ent and time.time() - ent.get("at", 0) < _TENNIS_TTL:
+            return ent.get("rows") or []
+    rows = _fetch_tennis_for_date(day)
+    tr[day] = {"at": time.time(), "rows": rows}
+    cache["tennis_results"] = tr
+    _save_cache(cache)
+    log("tennis results: %d fixture(s) on the day feed" % len(rows))
+    return rows
+
+
+def fetch_tennis_results_on(day: str, force: bool = False) -> list:
+    today = date.today().isoformat()
+    if not day:
+        day = today
+    if force or day == today:
+        return fetch_tennis_results_today(force=force) if (force or day == today) else fetch_tennis_results_today()
+    try:
+        cache = _load_cache()
+        ent = (cache.get("tennis_results") or {}).get(day) or {}
+        return ent.get("rows") or []
+    except Exception:
+        return []
+
+
+# Update fetch_all_results_on to include tennis
+
+
+def fetch_all_results_on(day: str) -> list:
+    """Football + basketball + tennis results for a day, merged."""
+    out = []
+    for fn in (fetch_results_on, fetch_basketball_results_on, fetch_tennis_results_on):
+        try:
+            out.extend(fn(day) or [])
+        except Exception:
+            pass
+    return out
