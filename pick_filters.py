@@ -215,6 +215,37 @@ def odds_underpaid(sig: dict, market: str, book_odds: float | None) -> bool:
     return consensus > book * 1.10          # 10% underpaid = suspicious (was 5%)
 
 
+def odds_drifted(sig: dict, market: str) -> bool:
+    """True when the market has moved AGAINST our selection since first sight.
+
+    Movement is the signed % change (now/base - 1). A positive movement on
+    our side means the price has drifted up - the market is less confident
+    than when we first looked, i.e. money is moving away from our pick. A
+    drift beyond 5% is a sharp signal that we should not take the price.
+
+    Missing movement data (first sight, or live/finished match) = no opinion.
+    """
+    o = (sig or {}).get("odds") or {}
+    mv = o.get("movement") or {}
+    if not mv:
+        return False
+    m = str(market)
+    if m in ("home", "ml_home", "ht_home"):
+        side = "home"
+    elif m in ("away", "ml_away", "ht_away"):
+        side = "away"
+    elif m == "draw":
+        side = "draw"
+    else:
+        return False
+    try:
+        drift = float(mv.get(side, 0.0))
+    except (TypeError, ValueError):
+        return False
+    # drifted up by more than 5% = market against us
+    return drift > 0.05
+
+
 def flash_prob(market: str, home: str, away: str):
     """Evidence-based probability for `market`, or None when we have none.
 
@@ -408,6 +439,9 @@ def apply_gates(cands: list, log=print, ai: bool = True) -> tuple:
         except Exception:
             pass
         if odds_underpaid(sig, c.get("market"), c.get("odds")):
+            odds_blocked_n += 1
+            continue
+        if odds_drifted(sig, c.get("market")):
             odds_blocked_n += 1
             continue
         if p is None:

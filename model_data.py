@@ -541,3 +541,183 @@ def score_games(games: list) -> dict:
     except Exception as exc:
         log(f"scoring disabled this round - {str(exc)[:80]}")
     return out
+# ── Form + injury helpers (API-Football, quota-aware) ───────────────────────
+import urllib.parse as _up
+
+
+def _find_team_id(team_name: str):
+    if not team_name:
+        return None
+    cache = _load_cache()
+    tmap = cache.setdefault("team_ids", {})
+    n = norm(team_name)
+    if n in tmap:
+        return tmap[n]
+    if 0 <= _quota_left() < 2:
+        return None
+    try:
+        body = _get(f"{API_HOST}/teams?search={_up.quote(team_name)}")
+    except Exception:
+        return None
+    if not body or not body.get("response"):
+        tmap[n] = None
+        _save_cache(cache)
+        return None
+    try:
+        tid = int(body["response"][0]["team"]["id"])
+    except (KeyError, ValueError, IndexError, TypeError):
+        tid = None
+    tmap[n] = tid
+    _save_cache(cache)
+    return tid
+
+
+def fetch_team_form(team_name: str):
+    if not team_name:
+        return None
+    cache = _load_cache()
+    forms = cache.setdefault("team_form", {})
+    n = norm(team_name)
+    ent = forms.get(n)
+    if ent and time.time() - ent.get("at", 0) < (24.0 * 3600.0):
+        return ent.get("data")
+    tid = _find_team_id(team_name)
+    if not tid:
+        forms[n] = {"at": time.time(), "data": None}
+        cache["team_form"] = forms
+        _save_cache(cache)
+        return None
+    if 0 <= _quota_left() < 2:
+        return None
+    try:
+        body = _get(f"{API_HOST}/fixtures?team={tid}&last=5&status=FT")
+    except Exception:
+        body = None
+    if not body or not body.get("response"):
+        forms[n] = {"at": time.time(), "data": None}
+        cache["team_form"] = forms
+        _save_cache(cache)
+        return None
+    w = d = l = gf = ga = 0
+    last5 = []
+    for fx in body["response"]:
+        try:
+            goals = fx.get("goals") or {}
+            hg = goals.get("home")
+            ag = goals.get("away")
+            if hg is None or ag is None:
+                continue
+            hg, ag = int(hg), int(ag)
+            home_id = (fx.get("teams", {}).get("home") or {}).get("id")
+            is_home = (home_id == tid)
+            if is_home:
+                gf += hg; ga += ag
+                if hg > ag: w += 1; last5.append("W")
+                elif hg == ag: d += 1; last5.append("D")
+                else: l += 1; last5.append("L")
+            else:
+                gf += ag; ga += hg
+                if ag > hg: w += 1; last5.append("W")
+                elif ag == hg: d += 1; last5.append("D")
+                else: l += 1; last5.append("L")
+        except Exception:
+            continue
+    data = {"w": w, "d": d, "l": l, "gf": gf, "ga": ga,
+            "last5": "".join(last5)}
+    forms[n] = {"at": time.time(), "data": data}
+    cache["team_form"] = forms
+    _save_cache(cache)
+    return data
+
+
+def form_ok(team_name: str) -> bool:
+    data = fetch_team_form(team_name)
+    if not data:
+        return True
+    last5 = data.get("last5") or ""
+    if last5.count("L") >= 3:
+        return False
+    return True
+
+
+def fetch_fixture_injuries(fixture_id: int):
+    if not fixture_id:
+        return None
+    cache = _load_cache()
+    injs = cache.setdefault("fixture_injuries", {})
+    key = str(fixture_id)
+    ent = injs.get(key)
+    if ent and time.time() - ent.get("at", 0) < (24.0 * 3600.0):
+        return ent.get("data")
+    if 0 <= _quota_left() < 2:
+        return None
+    try:
+        body = _get(f"{API_HOST}/injuries?fixture={fixture_id}")
+    except Exception:
+        body = None
+    if not body or not body.get("response"):
+        injs[key] = {"at": time.time(), "data": []}
+        cache["fixture_injuries"] = injs
+        _save_cache(cache)
+        return []
+    players = []
+    for item in body["response"]:
+        try:
+            p = item.get("player") or {}
+            t = item.get("team") or {}
+            players.append({
+                "player": p.get("name"),
+                "type": item.get("type") or item.get("reason") or "injury",
+                "team": t.get("name"),
+            })
+        except Exception:
+            continue
+    injs[key] = {"at": time.time(), "data": players}
+    cache["fixture_injuries"] = injs
+    _save_cache(cache)
+    return players
+
+
+def has_key_injury(fixture_id: int) -> bool:
+    players = fetch_fixture_injuries(fixture_id)
+    if not players:
+        return False
+    for p in players:
+        t = str(p.get("type") or "").lower()
+        if any(w in t for w in ("injur", "suspend", "red card", "out", "miss")):
+            return True
+    return False
+
+
+def _quota_left() -> int:
+    try:
+        cache = _load_cache()
+        return int(cache.get("quota_left", -1))
+    except Exception:
+        return -1
+
+
+def deep_check(cand: dict) -> tuple:
+    try:
+        fid = None
+        try:
+            fixtures = fetch_fixtures_today()
+            for fx in (fixtures or []):
+                if (norm(fx.get("hn") or "") == norm(cand.get("home") or "")
+                        and norm(fx.get("an") or "") == norm(cand.get("away") or "")):
+                    fid = fx.get("id")
+                    break
+        except Exception:
+            fid = None
+        home = cand.get("home") or ""
+        away = cand.get("away") or ""
+        if not form_ok(home):
+            return False, "bad form: " + str(home)
+        if not form_ok(away):
+            return False, "bad form: " + str(away)
+        if fid and has_key_injury(fid):
+            return False, "key injury on fixture " + str(fid)
+        return True, "ok"
+    except Exception as e:
+        return True, "deep_check error: " + str(e)[:60]
+

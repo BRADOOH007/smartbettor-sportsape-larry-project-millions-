@@ -1685,6 +1685,34 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
         lw = {}
     legs = _draft_legs(cands, order, want, league_w=lw)
 
+    # ── DEEP CHECK (form + injuries) on the anchor leg ────────────────
+    # Only the top leg is checked (quota: ~5 req per leg). Cached 24h so
+    # repeated rounds on the same fixture cost nothing. A failure drops the
+    # whole slip - "no BS" means a bad anchor kills the bet.
+    if legs:
+        try:
+            import model_data as _mdq
+            _left = _mdq._quota_left()
+            _ok = (_left < 0 or _left >= 5)
+        except Exception:
+            _ok = True
+        if _ok:
+            try:
+                import model_data as _md
+                ok, reason = _md.deep_check(legs[0])
+                if not ok:
+                    try:
+                        log(f"  DEEP CHECK failed: {reason} - slip dropped")
+                    except Exception:
+                        pass
+                    return []
+                try:
+                    log(f"  DEEP CHECK ok: {reason}")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
     # ── THINK BEFORE PLACING (owner 2026-10-18): deliberation gate ────────
     # Before a slip leaves the picker it must pass a final sanity check: at
     # least two distinct market classes (no all-same-market accumulators), and
