@@ -32,7 +32,11 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
 if not single_instance.acquire():
     single_instance.notify_and_exit()
 
-from sportsape_backend import SportsapeBackend
+# The engine behind this GUI. betflow_adapter presents the same surface the GUI
+# already expects, but routes the actual BETTING through betflow.py (the fast
+# engine that completes a round in ~60s) while balances, jackpot, bet history
+# and the caches still fall through to the original SportsapeBackend.
+from betflow_adapter import Backend as SportsapeBackend
 from resource_path import writable_path
 import notify
 
@@ -55,17 +59,30 @@ def set_windows_app_id(app_id: str):
         pass
 
 
-APP_VERSION = "6.2.0"
+APP_VERSION = "6.5.0"
 
 # ── Crash harness ─────────────────────────────────────────────────────
 # The GUI used to silently VANISH with no error message. These hooks make
 # sure ANY uncaught exception — main thread, worker thread, or a Tk
 # callback — is dumped to gui_crash.log next to this file so the cause is
 # never lost again.
-CRASH_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_crash.log")
+#
+# FROZEN-BUILD FIX (2026-10-05). These used to anchor on __file__, which in a
+# PyInstaller ONE-FILE build points into the temporary _MEIPASS extraction
+# folder. That folder is wiped when the app exits, so the frozen app wrote its
+# whole diagnostic history into a scratch directory and left nothing behind —
+# the log we depend on to diagnose the app simply did not exist.
+# writable_path() resolves to the live workspace in BOTH dev and frozen modes.
+try:
+    from resource_path import writable_path as _writable_path
+except Exception:                                    # pragma: no cover
+    def _writable_path(rel):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
+
+CRASH_LOG = _writable_path("gui_crash.log")
 # Every terminal line is also appended verbatim to this file so runs can be
 # reviewed/inspected after the fact (same diagnostic intent as CRASH_LOG).
-TERMINAL_TEE_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_terminal.log")
+TERMINAL_TEE_LOG = _writable_path("gui_terminal.log")
 
 
 def _log_failure(source, exc):
@@ -252,6 +269,12 @@ class BetFlowProGUI:
         # closed. Fires 3 s after launch so the UI has time to fully render first.
         # Only runs if phone + password are already saved in settings.
         root.after(3000, self._startup_sync)
+        # Keep-awake watchdog: polls every 30 s and holds the system awake only
+        # while the engine is actually running, then releases it on stop.
+        try:
+            root.after(5000, self._keep_awake_tick)
+        except Exception:
+            pass
 
     def _center_geometry(self, w, h):
         sw = self.root.winfo_screenwidth()
@@ -438,6 +461,68 @@ class BetFlowProGUI:
         self._workers[name] = t
         t.start()
 
+    # ── KEEP-AWAKE GUARD ──────────────────────────────────────────
+    # The engine is a long-running unattended process: a Windows sleep or a
+    # hibernate transition kills the Chrome workers mid-bet, and the tool has
+    # to rebuild every session on wake. The power plan alone is not enough
+    # because it can be re-applied by a profile update, a "Balanced" reset, or
+    # a docked/undocked charger change, so we ALSO hold the process in the
+    # system-required state while betting is running.
+    #
+    # ES_CONTINUOUS | ES_SYSTEM_REQUIRED keeps the machine awake but still
+    # ALLOWS the screen to go dark, which is exactly the behaviour asked for:
+    # lights out, machine stays on, tool keeps working.
+    _ES_CONTINUOUS = 0x80000000
+    _ES_SYSTEM_REQUIRED = 0x00000001
+    _ES_DISPLAY_REQUIRED = 0x00000002
+    _keep_awake_on = False
+
+    def _set_keep_awake(self, on: bool) -> bool:
+        """Hold the system awake (screen may still blank). True on success."""
+        if sys.platform != "win32" or not _HAS_CTYPES:
+            return False
+        try:
+            import ctypes as _c
+            flags = self._ES_CONTINUOUS
+            flags |= (self._ES_SYSTEM_REQUIRED if on else 0)
+            # We deliberately do NOT set ES_DISPLAY_REQUIRED, so the monitor
+            # still powers down on its own timer.
+            rc = _c.windll.kernel32.SetThreadExecutionState(flags)
+            self._keep_awake_on = bool(on)
+            return bool(rc)
+        except Exception:
+            return False
+
+    def _keep_awake_tick(self):
+        """Re-assert the keep-awake request periodically while betting runs.
+
+        Windows can drop the request (e.g. on a power-source transition), so
+        we refresh it on the same cadence as the other periodic work. Cheap,
+        and it makes the machine resilient to a charger being pulled.
+        """
+        try:
+            # The engine's authoritative run flag lives on the backend, not on
+            # AppState, so read it from there (and treat a missing backend as
+            # "not running" so we never hold the machine awake for nothing).
+            _be = getattr(self, "backend", None)
+            _engine_on = bool(getattr(_be, "running", False))
+            if _engine_on and not self._keep_awake_on:
+                if self._set_keep_awake(True):
+                    self._append_log(
+                        "\u26a1 Keep-awake engaged — the machine will stay on while "
+                        "betting runs (screen may still blank).")
+            elif not _engine_on and self._keep_awake_on:
+                # Betting stopped: release the claim so the PC can sleep normally.
+                if self._set_keep_awake(False):
+                    self._append_log(
+                        "\u23f9 Keep-awake released — normal sleep behaviour restored.")
+        except Exception:
+            pass
+        try:
+            self.root.after(30000, self._keep_awake_tick)
+        except Exception:
+            pass
+
     def _pump(self):
         try:
             for kind, payload in self.bus.drain():
@@ -543,8 +628,26 @@ class BetFlowProGUI:
     def _watch_memory(self):
         """Memory creep is the classic cause of the window silently vanishing
         (each phone worker owns its own Chrome). Warn early and sweep orphan
-        browsers so a freshly added number never tips the process over."""
+        browsers so a freshly added number never tips the process over.
+
+        It also reaps STALE CHROMEDRIVER processes. Every browser rebuild used
+        to leak its driver: the old driver had no chrome child left, so the
+        ownership probe could never prove it was ours and the conservative
+        sweep spared it forever. Measured live: 16 chromedriver processes for
+        2 browsers — 14 idle orphans, each holding a port and burning CPU,
+        which is what pinned the fans on high. Reaping them here keeps CPU and
+        RAM flat across long unattended runs."""
         try:
+            # Reap leaked chromedriver processes FIRST and unconditionally.
+            # This must not sit behind the memory thresholds below: the leak is
+            # driven by browser rebuilds, not by this process's own RSS, so
+            # waiting for 1.1 GB meant the orphans simply accumulated.
+            try:
+                be0 = getattr(self, "backend", None)
+                if be0 is not None and hasattr(be0, "_reap_stale_chromedrivers"):
+                    be0._reap_stale_chromedrivers(gui_callback=self._emit)
+            except Exception:
+                pass
             mb = self._process_mem_mb()
             if mb <= 0:
                 return
@@ -1280,6 +1383,10 @@ class BetFlowProGUI:
         self._field(params, "Daily cap (0=∞)", "daily_var", "20", 0, 2)
         self._field(params, "Max bets (0=∞)", "max_var", "0", 1, 0)
         self._field(params, "Stake % (0=fixed)", "pct_var", "0", 1, 1)
+        # The betting day (and so the daily cap) rolls over at this hour -
+        # midnight by default. A 23:30 slip belongs to the day that started at
+        # the configured hour, not to the calendar day.
+        self._field(params, "Day resets at (0-23)", "reset_var", "0", 1, 3)
 
         self.chain_var = tk.BooleanVar(value=True)
         self.autostart_var = tk.BooleanVar(value=True)
@@ -1310,19 +1417,21 @@ class BetFlowProGUI:
         # action row — an in-parameter full-width chip ate terminal height
         # every launch, so it moved out of the params grid. ─────────────────
         self.roll_over_var = tk.BooleanVar(value=False)
-        self._field(params, "LS legs (0=off)", "ls_legs_var", "14", 3, 0)
-        self._field(params, "LS x min", "ls_min_var", "15", 3, 1)
-        self._field(params, "LS x max", "ls_max_var", "60", 3, 2)
-        self._field(params, "Auto-withdraw KES (0=off)", "withdraw_var", "200", 4, 0)
+        _dead_fields = [self._field(params, "LS legs (0=off)", "ls_legs_var", "14", 3, 0),
+                        self._field(params, "LS x min", "ls_min_var", "15", 3, 1),
+                        self._field(params, "LS x max", "ls_max_var", "60", 3, 2),
+                        self._field(params, "Auto-withdraw KES (0=off)", "withdraw_var", "200", 4, 0)]
         self._field(params, "Deposit KES (M-Pesa)", "deposit_var", "99", 4, 1)
         self.cashout_var = tk.BooleanVar(value=True)
         self.cashout_pct_var = tk.StringVar(value="75")
-        tk.Checkbutton(params, text="💱 Auto cash-out",
-                       variable=self.cashout_var, bg=c["bg"], fg=c["fg"],
-                       selectcolor=c["panel"], activebackground=c["bg"],
-                       activeforeground=c["fg"], font=("Segoe UI", 9, "bold")).grid(
-                       row=4, column=2, sticky="w", padx=14)
-        self._field(params, "CO min % (0-100)", "cashout_pct_var", "75", 5, 2)
+        _cashout_chk = tk.Checkbutton(
+            params, text="💱 Auto cash-out",
+            variable=self.cashout_var, bg=c["bg"], fg=c["fg"],
+            selectcolor=c["panel"], activebackground=c["bg"],
+            activeforeground=c["fg"], font=("Segoe UI", 9, "bold"))
+        _cashout_chk.grid(row=4, column=2, sticky="w", padx=14)
+        _dead_fields.append(
+            self._field(params, "CO min % (0-100)", "cashout_pct_var", "75", 5, 2))
         self.notify_var = tk.BooleanVar(value=True)
         tk.Checkbutton(params, text="🔔 Sounds + toasts",
                        variable=self.notify_var, bg=c["bg"], fg=c["fg"],
@@ -1330,6 +1439,73 @@ class BetFlowProGUI:
                        activeforeground=c["fg"], font=("Segoe UI", 9)).grid(
                        row=5, column=0, sticky="w", padx=2, pady=(6, 0))
         self._field(params, "Jackpot KES", "jackpot_stake_var", "99", 5, 1)
+
+        # ── REMOVE THE DEAD SETTINGS ────────────────────────────────────────
+        # These belonged to the old engine (the one that could reach PLACE but
+        # never finish a bet). The new engine does not implement them. Rather
+        # than grey them out and keep the numbers on screen - which invites the
+        # belief that a long-shot is scheduled - they are removed from the
+        # panel entirely. grid_remove() hides a widget without destroying it,
+        # so nothing else in the GUI can break.
+        # Everything NOT removed still works: stake, cadence, daily cap, bet
+        # count, accounts, deposit, jackpot, balances, bet history.
+        _DEAD_VARS = {
+            "longshot_var": "long-shot",
+            "chain_var": "chain slips",
+            "cashout_var": "auto cash-out",
+            "ls_legs_var": "LS legs",
+            "ls_min_var": "LS x min",
+            "ls_max_var": "LS x max",
+            "withdraw_var": "auto-withdraw",
+            "cashout_pct_var": "CO min %",
+            "roll_over_var": "roll-over",
+        }
+
+        def _hide(w):
+            try:
+                w.grid_remove()
+            except Exception:
+                try:
+                    w.pack_forget()
+                except Exception:
+                    pass
+
+        _removed = []
+        for w, label in ((ls_chk, "long-shot"), (chain_chk, "chain slips"),
+                         (_cashout_chk, "auto cash-out")):
+            _hide(w)
+            _removed.append(label)
+
+        # Each _field() returns the small frame holding a label and its entry.
+        # Hide the FRAME - targeting only the Entry left the label behind and
+        # the panel looked half-removed, which is what the first attempt did.
+        for _f in _dead_fields:
+            try:
+                _hide(_f)
+            except Exception:
+                pass
+        _removed += ["long-shot figures", "auto-withdraw", "cash-out threshold"]
+
+        # Hide anything bound to one of the dead variables, whatever built it.
+        # NOTE: must recurse. The entries are not direct children of `params`,
+        # which is why an earlier flat scan removed the checkboxes but left
+        # every number field sitting on screen.
+        def _walk(w):
+            for child in w.winfo_children():
+                for opt in ("variable", "textvariable"):
+                    try:
+                        v = str(child.cget(opt))
+                    except Exception:
+                        continue
+                    for name, label in _DEAD_VARS.items():
+                        target = getattr(self, name, None)
+                        if target is not None and v == str(target):
+                            _hide(child)
+                            if label not in _removed:
+                                _removed.append(label)
+                _walk(child)
+
+        _walk(params)
 
         # ── Markets to bet — kept as always-on defaults; the on-screen toggles
         # were removed to give the terminal more vertical area. All markets stay
@@ -1468,6 +1644,10 @@ class BetFlowProGUI:
                      insertbackground=c["text_fg"], justify="center", relief=tk.FLAT,
                      highlightthickness=1, highlightbackground=c["border"], font=("Consolas", 10))
         e.pack(side="left", padx=(6, 0), ipady=3)
+        # Returned so a caller can hide the whole label+entry pair. Hiding the
+        # Entry alone would leave the label behind and the panel would look
+        # half-removed.
+        return f
 
     # ── Ledger tab ────────────────────────────────────────────────────
     def _build_ledger_tab(self):
@@ -1610,6 +1790,29 @@ class BetFlowProGUI:
         vsb3.pack(side="right", fill="y")
         self.analyst_tree.tag_configure("good", foreground=c["ok"])
         self.analyst_tree.tag_configure("poor", foreground=c["err"])
+        self.recipe_tree.tag_configure("vetoed", foreground=c["err"])
+
+        tk.Label(tab, text="  Teams by market - hit rate and money (min 2 trials)  ",
+                 bg=c["bg"], fg=c["muted"], font=("Segoe UI", 9, "bold"),
+                 anchor="w").pack(fill="x", pady=(8, 2))
+        tcols = ("team", "market", "trials", "won", "hit", "roi", "staked", "returned")
+        wrap4 = tk.Frame(tab, bg=c["bg"])
+        wrap4.pack(fill="both", expand=True)
+        self.team_tree = ttk.Treeview(wrap4, columns=tcols, show="headings", height=7)
+        theads = {"team": "Team", "market": "Market", "trials": "Trials",
+                  "won": "Won (wtd)", "hit": "Hit-rate", "roi": "ROI",
+                  "staked": "Staked KES", "returned": "Returned KES"}
+        twidths = {"team": 200, "market": 90, "trials": 70, "won": 80, "hit": 90,
+                   "roi": 90, "staked": 100, "returned": 110}
+        for col in tcols:
+            self.team_tree.heading(col, text=theads[col])
+            self.team_tree.column(col, width=twidths[col], anchor="center")
+        vsb4 = ttk.Scrollbar(wrap4, orient="vertical", command=self.team_tree.yview)
+        self.team_tree.configure(yscrollcommand=vsb4.set)
+        self.team_tree.pack(side="left", fill="both", expand=True)
+        vsb4.pack(side="right", fill="y")
+        self.team_tree.tag_configure("hot", foreground=c["ok"])
+        self.team_tree.tag_configure("cold", foreground=c["err"])
 
         self._refresh_learning()
 
@@ -2032,7 +2235,73 @@ class BetFlowProGUI:
                 return tag
         return ""
 
+    # ── Log hygiene (2026-10-05) ────────────────────────────────
+    # The terminal tee file is opened with errors="replace", so any character
+    # the console codepage cannot represent was being written to disk as U+FFFD
+    # and as stray Latin-1 mojibake ("dY\"?", "�?"). Those artefacts are
+    # PERMANENT in gui_terminal.log, which is the file used to diagnose
+    # incidents — a corrupted diagnostic log is worse than a short one.
+    #
+    # _sanitize_log_line strips the replacement character and collapses the
+    # mojibake runs that used to precede it, so a line reads cleanly whether it
+    # is viewed in the Tk terminal, the tee file, or an editor.
+    _MOJIBAKE_RUN = re.compile(r"[ÂÃÅÐØÞß][\x80-\xbf-ÿ]{1,3}")
+    # Orphaned junk at the START of a line: the engine's "(emoji)-STATUS:"
+    # prefix whose emoji was destroyed in transit, leaving debris like
+    # ",?" or the Latin-1 mojibake "dY\"?" glued onto the real content.
+    _LEAD_JUNK = re.compile(
+        r'^((?:\[\d{2}:\d{2}:\d{2}\]\s*)?)'
+        r'(?:[�]|[A-Za-z]{1,3}[",;:.\|’])+[\s�]*')
+    # Orphaned punctuation fragments left behind mid-line once the emoji
+    # between two words is gone. A real question mark ("Suspicious odds?")
+    # is CONTENT and must survive, so this only matches a ? that is glued to
+    # other junk punctuation (",?" / ":?"), never a bare "?".
+    _ORPHAN_PUNCT = re.compile(r'(?<=[A-Za-z0-9\)\]"])[",;:.\|]{1,2}\?(?=\s|$)')
+    # A dash glyph that was destroyed on the way to the log.
+    _LOST_DASH = re.compile(r'[�ÂÃ]\s*[-\u2013\u2014]?')
+
+    @classmethod
+    def _sanitize_log_line(cls, text) -> str:
+        try:
+            s = str(text)
+            if not s:
+                return s
+            # 1. Repair classic UTF-8-read-as-Latin-1 runs where possible, so a
+            #    real emoji/glyph is restored rather than merely deleted.
+            try:
+                if any(0x80 <= ord(ch) <= 0xFF for ch in s):
+                    cand = s.encode("latin-1", "strict").decode("utf-8", "strict")
+                    if cand.count("�") < s.count("�"):
+                        s = cand
+            except (UnicodeEncodeError, UnicodeDecodeError, AttributeError):
+                pass
+            # 2. Note whether a separator dash was destroyed (before we delete it),
+            #    strip the junk prefix, then the replacement character.
+            _had_dash = bool(cls._LOST_DASH.search(s))
+            s = cls._LEAD_JUNK.sub(lambda m: m.group(1), s)
+            s = s.replace("�", "")
+            # 3. Collapse residual mojibake runs.
+            s = cls._MOJIBAKE_RUN.sub("", s)
+            # 4. Remove orphaned punctuation fragments left mid-line.
+            s = cls._ORPHAN_PUNCT.sub(" ", s)
+            # 5. Restore a readable separator ONLY where a dash glyph was provably lost —
+            #    i.e. the run we just deleted contained a dash. We must NOT do
+            #    this unconditionally: a blanket "insert - before KES" rule
+            #    corrupted healthy lines like "base KES 10 accumulator" into
+            #    "base - KES 10 accumulator". Losing an em-dash is cosmetic;
+            #    corrupting a clean log line is not.
+            if _had_dash:
+                s = re.sub(r"(?<=[a-z0-9\)])\s+(?=(KES|KSH)\b)", " - ", s)
+            # 6. Tidy whitespace left behind by the removals.
+            s = re.sub(r"[ \t]{2,}", " ", s)
+            s = re.sub(r"\s+([,;:.])", r"\1", s)
+            s = re.sub(r"[\s,;:\-–—]+$", "", s)
+            return s.rstrip()
+        except Exception:
+            return str(text)
+
     def _append_log(self, text, tag=None):
+        text = self._sanitize_log_line(text)
         line = f"[{datetime.now().strftime('%H:%M:%S')}] {text}"
         self._log_lines.append(line)
         if len(self._log_lines) > 6000:
@@ -2126,13 +2395,17 @@ class BetFlowProGUI:
         if not self.password_var.get().strip():
             messagebox.showerror("Missing Data", "Enter the account password.")
             return None
-        stake = max(10.0, num(self.stake_var, 10.0))
-        cadence_min = max(0.25, num(self.cadence_var, 60.0))
+        # No hardcoded floors. An earlier version forced stake >= 10 and
+        # cadence >= 20s, so a figure the user typed was silently replaced by
+        # ours. Whatever is entered here is what the engine is given; the only
+        # guards left are "must be positive".
+        stake = max(0.01, num(self.stake_var, 10.0))
+        cadence_min = max(0.0, num(self.cadence_var, 60.0))
         max_bets = integer(self.max_var, 0)
         daily = integer(self.daily_var, 0)
         pct = max(0.0, num(self.pct_var, 2.0))
         ls_legs = integer(self.ls_legs_var, 14)
-        ls_min = max(3.0, num(self.ls_min_var, 15.0))
+        ls_min = max(0.0, num(self.ls_min_var, 15.0))
         ls_max = max(ls_min, num(self.ls_max_var, 60.0))
         withdraw = max(0.0, num(self.withdraw_var, 200.0))
         mk_on = [k for k, v in self.mk_vars.items() if v.get()]
@@ -2142,7 +2415,7 @@ class BetFlowProGUI:
             "phones": phones,
             "password": self.password_var.get().strip(),
             "stake": stake,
-            "cadence_seconds": max(20.0, cadence_min * 60.0),
+            "cadence_seconds": max(1.0, cadence_min * 60.0),
             "max_bets": max_bets if max_bets > 0 else None,
             "daily_bets": daily if daily > 0 else None,
             "stake_percent": pct,
@@ -2179,24 +2452,31 @@ class BetFlowProGUI:
         self.backend.running = True
         self.state.engine_state = "RUNNING"
         self.bus.emit("status", "RUNNING")
-        ls_txt = (f"long-shot ON x{q['longshot_odds_min']:g}-x{q['longshot_odds_max']:g} "
-                  f"{q['longshot_legs']}-leg/day | " if q.get("longshot") else "long-shot OFF | ")
-        wd_txt = (f"auto-withdraw ON KES {q['withdraw_amount']:g}/day | "
-                  if q.get("auto_withdraw") else "auto-withdraw OFF | ")
+        # Do NOT advertise long-shot / auto-withdraw / roll-over here. This engine
+        # does not run them, and a banner claiming "long-shot ON x15-x60" makes
+        # a plain accumulator look like something with a 20x daily shot in it.
+        # The panel no longer offers them and the log must not either.
         hd_txt = "HEADLESS | " if q.get("headless") else ""
-        ro_txt = "⚡ ROLL-OVER | " if q.get("roll_over") else ""
         pct_txt = f"{q['stake_percent']:g}%" if q["stake_percent"] else "OFF"
         daily_txt = "∞"
         if q.get("daily_bets"):
             db = int(q["daily_bets"])
             daily_txt = f"{db} (split 18:00 {(db + 1) // 2}+{db // 2})"
+        try:
+            reset_h = max(0, min(23, int(float(
+                self.reset_var.get().strip() or 0))))
+        except Exception:
+            reset_h = 0
         self._append_log("⚽ STARTING Bet Machine | " +
                          f"stake KES {q['stake']:.0f} | " +
-                         f"{'HUNGRY chained slips' if q['chain_bets'] else 'classic paced'} | " +
-                         f"daily {daily_txt} | " +
+                         f"2-leg accumulators | " +
+                         f"every {q['cadence_seconds'] / 60:.0f} min | " +
+                         f"day resets {reset_h:02d}:00 | " +
+                         f"daily cap {daily_txt} | " +
                          f"bets {'∞' if not q['max_bets'] else q['max_bets']} | " +
                          f"stake% {pct_txt} | " +
-                         ro_txt + hd_txt + ls_txt + wd_txt)
+                         hd_txt +
+                         "long-shot/withdraw/cash-out NOT AVAILABLE in this engine")
 
         def job():
             qq = q
@@ -2737,6 +3017,13 @@ class BetFlowProGUI:
                     mk, trials, won_disp, f"{hit:.1%}", f"{pred:.1%}",
                     f"{deficit:+.1%}", e.get("weight", 1.0), status), tags=(tag,))
             # ── Recipes ─────────────────────────────────────────────────
+            # Same thresholds the live engine enforces (betflow.VETO_MIN_TRIALS
+            # / VETO_ROI): a shape this losing is refused, not just reported.
+            _veto = {k: v for k, v in (st.get("recipes") or {}).items()
+                     if int(v.get("trials") or 0) >= 15
+                     and float(v.get("stake") or 0) > 0
+                     and ((float(v.get("ret") or 0) - float(v.get("stake") or 0))
+                          / float(v.get("stake") or 0)) <= -0.20}
             recipes = st.get("recipes") or {}
             for key, r in sorted(recipes.items()):
                 trials = int(r.get("trials") or 0)
@@ -2744,8 +3031,38 @@ class BetFlowProGUI:
                 staked = float(r.get("stake") or 0)
                 ret = float(r.get("ret") or 0)
                 roi = ((ret - staked) / staked) if staked else 0.0
+                if key in _veto:
+                    status, tag = "VETOED - engine refuses", "vetoed"
+                else:
+                    status, tag = "", ""
                 self.recipe_tree.insert("", "end", values=(
-                    key, trials, won, f"{roi:+.1%}", ""))
+                    key, trials, won, f"{roi:+.1%}", status), tags=(tag,))
+            # ── Teams by market ─────────────────────────────────────────
+            team_tree = getattr(self, "team_tree", None)
+            if team_tree is not None:
+                for item in team_tree.get_children():
+                    team_tree.delete(item)
+                trows = []
+                for team, mk_map in (st.get("team_stats") or {}).items():
+                    for mk, e in (mk_map or {}).items():
+                        trials = int(e.get("trials") or 0)
+                        if trials < 2:
+                            continue
+                        wonw = float(e.get("won") or 0.0)
+                        staked = float(e.get("stake") or 0.0)
+                        ret = float(e.get("ret") or 0.0)
+                        roi = ((ret - staked) / staked) if staked else 0.0
+                        trows.append((team, mk, trials, wonw, staked, roi))
+                trows.sort(key=lambda x: (-x[5], -x[2]))
+                for team, mk, trials, wonw, staked, roi in trows[:40]:
+                    ret = float(((st.get("team_stats") or {}).get(team)
+                                 or {}).get(mk, {}).get("ret") or 0.0)
+                    tag = ("hot" if roi > 0.10 else
+                           "cold" if roi < -0.20 else "")
+                    team_tree.insert("", "end", values=(
+                        team, mk, trials, f"{wonw:.1f}", f"{wonw / trials:.0%}",
+                        f"{roi:+.1%}", f"{staked:,.0f}", f"{ret:,.0f}"),
+                        tags=(tag,))
             # ── Analyst accuracy ─────────────────────────────────────────
             analyst_tree = getattr(self, "analyst_tree", None)
             if analyst_tree is not None:
@@ -2783,7 +3100,9 @@ class BetFlowProGUI:
             bandit = "ACTIVE" if settled >= 30 else f"learning ({settled}/30 settled)"
             self.learning_summary.config(
                 text=f"settled {settled} | retired "
-                     f"{len(st.get('retired_markets') or [])} | bandit {bandit}")
+                     f"{len(st.get('retired_markets') or [])} | bandit {bandit} | "
+                     f"vetoed recipes {len(_veto)} | "
+                     f"teams tracked {len(st.get('team_stats') or {})}")
         except Exception:
             pass
 
@@ -3009,6 +3328,7 @@ class BetFlowProGUI:
             self.max_var.set(str(data.get("max_bets", 0)))
             self.daily_var.set(str(data.get("daily_bets", 20)))
             self.pct_var.set(str(data.get("stake_percent", 0)))
+            self.reset_var.set(str(int(data.get("betting_reset_hour") or 0)))
             self.chain_var.set(bool(data.get("chain_bets", True)))
             self.longshot_var.set(bool(data.get("longshot", True)))
             self.ls_legs_var.set(str(data.get("longshot_legs", 14)))
@@ -3079,6 +3399,11 @@ class BetFlowProGUI:
                 "max_bets": int(float(self.max_var.get().strip() or 0)),
                 "daily_bets": int(float(self.daily_var.get().strip() or 20)),
                 "stake_percent": float(self.pct_var.get().strip() or 0),
+                # The betting day (and so the daily cap) rolls over at this
+                # hour - midnight by default. The engine reads it straight
+                # from this file, so the boundary applies to every launch.
+                "betting_reset_hour": max(0, min(23, int(float(
+                    self.reset_var.get().strip() or 0)))),
                 "chain_bets": bool(self.chain_var.get()),
                 "longshot": bool(self.longshot_var.get()),
                 "longshot_legs": int(float(self.ls_legs_var.get().strip() or 14)),
@@ -3145,6 +3470,13 @@ class BetFlowProGUI:
             self.backend.running = False
             if self._stop_event is not None:
                 self._stop_event.set()
+        except Exception:
+            pass
+        # Release the keep-awake claim on the way out so we never leave the
+        # machine pinned awake after the tool has gone.
+        try:
+            if self._keep_awake_on:
+                self._set_keep_awake(False)
         except Exception:
             pass
         try:

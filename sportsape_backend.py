@@ -43,6 +43,300 @@ except Exception:  # agents layer optional — engine must run without it
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+
+
+# ── Scoped Chrome reaper ─────────────────────────────────────────────────────
+# Every browser this tool launches is given its own throwaway profile via
+# --user-data-dir=<tempdir>/sportsape_chrome_XXXX. That marker is the ONLY thing
+# we are allowed to match on: the user's personal Chrome uses the real
+# "User Data" directory and must never be touched by any kill below.
+_CHROME_PROFILE_MARKER = "sportsape_chrome_"
+
+# Spawning a console process on Windows flashes a black terminal window. The
+# reaper runs on every driver cleanup, so an unhidden shell made a window pop
+# open and vanish over and over. CREATE_NO_WINDOW keeps it invisible.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+# The process listing is expensive (and used to be re-run per driver), so cache
+# it briefly. Orphaned chrome does not appear and vanish inside 3 seconds.
+_CHROME_PID_CACHE: tuple[float, list[tuple[int, str]]] = (0.0, [])
+_CHROME_PID_TTL = 3.0
+
+
+# ── ONE BROWSER PER ACCOUNT (cross-process) ─────────────────────────
+# SportPesa allows a single active session per account. The moment a second
+# browser logs the same phone in, the book kills the older token and every
+# subsequent PLACE fails with 403 "User logged from another device".
+#
+# This was NOT only an orphan problem: the engine itself opened extra browsers
+# for an account it already had a live driver for (bet history, winnings sync,
+# jackpot scan, pre-window research, market sweep), each one logging in again.
+# The old `_jackpot_lock` / `_engine_busy` waits only sequenced the BETS, not
+# the logins, so the conflict still happened.
+#
+# Ownership is enforced with an exclusive OS file lock per account. An OS lock
+# is released automatically if the process dies, so a crashed run can never
+# leave an account permanently locked.
+_ACCOUNT_LOCK_DIR = os.path.join(tempfile.gettempdir(), "sportsape_account_locks")
+_ACCOUNT_LOCKS: dict[str, dict] = {}
+_ACCOUNT_LOCKS_GUARD = threading.Lock()
+
+# ── GLOBAL LOGIN SERIALISATION (2026-10-05) ────────────────────────────
+# The per-account lock above stops two browsers fighting over the SAME phone.
+# It does nothing for two DIFFERENT accounts, which both mint tokens at the
+# same moment. Live evidence: with both workers running, 0798810080 got
+# 'User logged from another device' at PLACE time twice in five minutes while
+# its own account logged in three times in ninety seconds. Whether the book
+# scopes a session to the account or to the client fingerprint, the safe
+# assumption is that it does not tolerate overlapping credential POSTs.
+#
+# So every credential POST - from ANY account, in ANY thread - is funnelled
+# through one gate and separated by a settle delay. This costs a few seconds
+# per login and removes a whole class of self-inflicted session rejections.
+_LOGIN_GATE = threading.Lock()
+_LOGIN_LAST_POST = 0.0
+_LOGIN_SETTLE_S = 25.0
+
+
+def _acquire_login_gate(phone: str = "") -> float:
+    """Serialise credential POSTs globally. Returns seconds spent waiting."""
+    global _LOGIN_LAST_POST
+    waited = 0.0
+    with _LOGIN_GATE:
+        now = time.time()
+        gap = _LOGIN_SETTLE_S - (now - _LOGIN_LAST_POST)
+        if gap > 0:
+            waited = gap
+            time.sleep(gap)
+        # Claim the slot before releasing the lock so a competing thread waits
+        # for OUR settle window rather than firing immediately behind us.
+        _LOGIN_LAST_POST = time.time()
+    return waited
+
+
+def _kill_chrome_for_profile(profile_path: str) -> int:
+    """Force-kill every chrome.exe still running on `profile_path`. Returns count.
+
+    Scoped strictly to the temp profile WE created (sportsape_chrome_*), matched
+    on the full profile path, so the user's own Chrome is never touched. Used as
+    a backstop when driver.quit() fails and leaves a browser orphaned.
+    """
+    if not profile_path:
+        return 0
+    try:
+        target = os.path.normcase(os.path.abspath(profile_path))
+    except Exception:
+        return 0
+    try:
+        out = subprocess.run(
+            "powershell -NoProfile -NonInteractive -Command \"Get-CimInstance "
+            "Win32_Process -Filter \\\"Name='chrome.exe'\\\" | Select-Object "
+            "ProcessId, CommandLine | ConvertTo-Json -Compress\"",
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return 0
+    import json as _json
+    try:
+        rows = _json.loads((out.stdout or "").strip() or "[]")
+        if isinstance(rows, dict):
+            rows = [rows]
+    except Exception:
+        return 0
+    killed = 0
+    for rec in rows or []:
+        cmd = rec.get("CommandLine") or ""
+        if target not in os.path.normcase(cmd):
+            continue
+        pid = rec.get("ProcessId")
+        if not pid:
+            continue
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True, timeout=15)
+            killed += 1
+        except Exception:
+            pass
+    return killed
+
+
+def _account_lock_key(phone) -> str:
+    digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    return digits or ("unknown_" + str(abs(hash(str(phone))) % 10**8))
+
+
+def _acquire_account_session(phone, blocking: bool = False,
+                             timeout: float = 0.0) -> bool:
+    """Claim exclusive browser ownership of `phone`. True when this process owns it.
+
+    Re-entrant within a process (depth counted) so nested helpers can each take
+    the account without deadlocking, but exclusive ACROSS processes, so a test
+    script and the engine can never both drive one account."""
+    key = _account_lock_key(phone)
+    deadline = time.time() + max(0.0, float(timeout))
+    while True:
+        with _ACCOUNT_LOCKS_GUARD:
+            ent = _ACCOUNT_LOCKS.get(key)
+            if ent is not None and ent["depth"] > 0:
+                ent["depth"] += 1
+                return True
+            try:
+                os.makedirs(_ACCOUNT_LOCK_DIR, exist_ok=True)
+                # "a+b" never truncates. Truncating would destroy the byte range
+                # another process has locked and silently defeat the guard.
+                fh = open(os.path.join(_ACCOUNT_LOCK_DIR, f"{key}.lock"), "a+b")
+                if os.fstat(fh.fileno()).st_size == 0:
+                    fh.write(b" ")
+                    fh.flush()
+                fh.seek(0)
+                import msvcrt
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                _ACCOUNT_LOCKS[key] = {
+                    "fh": fh, "depth": 1, "owner": os.getpid(),
+                    "since": time.time(), "phone": str(phone)}
+                return True
+            except Exception:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+        if not blocking or time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def _release_account_session(phone) -> None:
+    """Give up browser ownership of `phone` (safe to call when not held)."""
+    key = _account_lock_key(phone)
+    with _ACCOUNT_LOCKS_GUARD:
+        ent = _ACCOUNT_LOCKS.get(key)
+        if ent is None:
+            return
+        ent["depth"] -= 1
+        if ent["depth"] > 0:
+            return
+        _ACCOUNT_LOCKS.pop(key, None)
+        try:
+            import msvcrt
+            fh = ent.get("fh")
+            if fh is not None:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                fh.close()
+        except Exception:
+            pass
+
+
+def _account_session_holder(phone) -> dict:
+    """Describe who currently owns `phone` (for skip messages). Never raises."""
+    key = _account_lock_key(phone)
+    try:
+        with _ACCOUNT_LOCKS_GUARD:
+            ent = _ACCOUNT_LOCKS.get(key)
+            if ent:
+                return {"pid": ent.get("owner"), "held": True,
+                        "for_s": round(time.time() - (ent.get("since") or 0), 1)}
+    except Exception:
+        pass
+    return {"pid": None, "held": False, "for_s": 0.0}
+
+
+def _our_chrome_pids(max_age: float | None = None) -> list[tuple[int, str]]:
+    """Return [(pid, command_line)] for chrome processes using OUR temp profile.
+
+    A process qualifies only when its command line contains the sportsape_chrome_
+    marker AND does not reference the user's real Chrome profile directory. That
+    double condition is deliberate defence-in-depth: if the marker were somehow
+    absent we must fail safe and leave the user's browser alone.
+
+    Results are cached for a few seconds so repeated calls (the live-driver
+    exclusion scan runs once per driver) do not spawn a shell per call.
+    """
+    global _CHROME_PID_CACHE
+    ttl = _CHROME_PID_TTL if max_age is None else max_age
+    stamp, cached = _CHROME_PID_CACHE
+    if cached and (time.time() - stamp) < ttl:
+        return list(cached)
+
+    found: list[tuple[int, str]] = []
+    raw = ""
+    delim = None
+    # wmic is gone from modern Windows builds; skip straight to PowerShell
+    # instead of probing for it and flashing a console on every call.
+    # Filter INSIDE the WMI query: marshalling every chrome.exe on the box to
+    # PowerShell took ~10s per call, which stalled driver cleanup and fed the
+    # "renderer hang" abort loop. Letting WMI do the LIKE narrows the result
+    # set server-side and returns in well under a second.
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-CimInstance Win32_Process "
+             "-Filter \"Name='chrome.exe' AND CommandLine LIKE '%sportsape_chrome_%'\" | "
+             "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }"],
+            capture_output=True, text=True, timeout=45,
+            creationflags=_NO_WINDOW,
+        )
+        raw = proc.stdout or ""
+        delim = "pipe"
+    except Exception:
+        return found
+
+    user_profile = (os.environ.get("LOCALAPPDATA", "") or "").rstrip("\\")
+    # Both spellings occur in real command lines: the browser uses
+    # "...\Google\Chrome\User Data" while some children reference "...\User".
+    real_dirs = [
+        os.path.join(user_profile, "Google", "Chrome", "User").lower(),
+        os.path.join(user_profile, "Google", "Chrome").lower(),
+    ]
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or _CHROME_PROFILE_MARKER not in line:
+            continue
+        low = line.lower()
+        # Never touch the user's own browser, whatever else matches.
+        if any(rd and rd in low for rd in real_dirs):
+            continue
+        pid = None
+        if delim == "pipe":
+            # "<pid>|<commandline>" — pid is an exact leading field.
+            head, _sep, _rest = line.partition("|")
+            head = head.strip()
+            if head.isdigit():
+                pid = int(head)
+        if pid is None:
+            continue
+        found.append((pid, line))
+
+    _CHROME_PID_CACHE = (time.time(), list(found))
+    return found
+
+
+def reap_our_chrome(extra_exclude: set[int] | None = None) -> int:
+    """Kill ONLY orphaned chrome processes left by this tool. Never the user's.
+
+    Skips any pid in extra_exclude (drivers still in use). Returns how many were
+    killed. Safe to call repeatedly and at any time.
+    """
+    keep = set(extra_exclude or ())
+    # Ask the live driver objects for their chrome pids so a browser we are
+    # still using is never reaped out from under the session.
+    killed = 0
+    for pid, _cmd in _our_chrome_pids(max_age=0.0):
+        if pid in keep:
+            continue
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"],
+                           capture_output=True, timeout=20,
+                           creationflags=_NO_WINDOW)
+            killed += 1
+        except Exception:
+            continue
+    if killed:
+        try:
+            print(f"[reaper] cleaned {killed} orphaned sportsape chrome process(es)")
+        except Exception:
+            pass
+    return killed
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -136,12 +430,24 @@ class SportsapeBackend:
         self._gid_src = {}                  # gid -> listing URL that contains its row
                                             # (merged games live on popular/football-1/
                                             # upcoming listings, not the today tab)
+        self._suspended_until = {}          # "gid|market" -> epoch ts: legs the book
+                                            # flagged "Not valid"/suspended at PLACE.
+                                            # Rebuilders skip them until they clear so
+                                            # a dead leg can't block every 300s crawl.
         self._log_ring = deque(maxlen=150)
         self._gov_overrides = {}          # governor runtime overrides: param -> value
         self._gov_paused_reason = None     # governor pause: non-None => engine holds betting
         self._engine_state = {}            # live telemetry snapshot for the governor
         self._grok = None
         self._agent_hub = None
+        # Login anti-thrash state (2026-10-05): _auth_ok_at records the last
+        # SUCCESSFUL authentication per phone so other components requesting a
+        # login in the same window reuse that token instead of POSTing a new one
+        # and superseding it. _auth_backoff holds {phone: ts_until_backoff_ends}
+        # plus {phone+"_n": consecutive_rejections} so a rejected session is left
+        # alone to settle instead of being hammered into a permanent lockout.
+        self._auth_ok_at = {}
+        self._auth_backoff = {}
         self._agent_stop = threading.Event()
         self._agent_thread = None
         self.JACKPOT_PAGE_URL = "https://www.ke.sportpesa.com/en/mega-jackpot-pro"
@@ -189,13 +495,116 @@ class SportsapeBackend:
         return defaults
 
     def _driver_is_usable(self, driver) -> bool:
+        """True only when this browser can still be driven.
+
+        CRITICAL FIX (2026-10-05). The old check was `session_id is set` plus a
+        `execute_script` ping. When the chromedriver PROCESS dies, Selenium
+        keeps `session_id` populated, so the check passed and every later call
+        went to a dead socket and BLOCKED on urllib3 retries until they raised
+        MaxRetryError (WinError 10061, connection refused). Observed live: the
+        engine sat silent for 28 minutes inside one dead driver, then the next
+        browser build hung too — no bets, no log, no recovery.
+
+        We now check the chromedriver process itself first. If the OS process
+        has exited, this is a corpse and we return False immediately, so the
+        caller's existing rebuild path runs BEFORE any blocking HTTP call is
+        ever attempted. That single check converts a 28-minute silent hang into
+        a clean rebuild in seconds.
+        """
         if not driver or not getattr(driver, "session_id", None):
             return False
+        # 1) Is the chromedriver process still alive?
+        try:
+            _svc = getattr(driver, "service", None)
+            _proc = getattr(_svc, "process", None) if _svc is not None else None
+            if _proc is not None:
+                _poll = getattr(_proc, "poll", None)
+                if callable(_poll):
+                    _rc = _poll()
+                    if _rc is not None:
+                        return False        # process exited -> corpse
+        except Exception:
+            pass
+        # 2) Can we still talk to it? Bounded so a half-dead driver cannot
+        #    block the calling thread for the full script timeout.
+        try:
+            driver.set_script_timeout(6)
+        except Exception:
+            pass
         try:
             driver.execute_script("return document.readyState")
             return True
         except Exception:
             return False
+
+    def _driver_health_check(self, driver, phone: str, password: str,
+                              gui_callback=None) -> bool:
+        """INDUSTRIAL-GRADE FIX (2026-10-04): comprehensive driver health check.
+
+        Detects and recovers from:
+        - 'invalid session id' (chromedriver crash)
+        - 'no such window' (browser window closed)
+        - 'tab crashed' (renderer OOM)
+        - Dead session token (wallet API returns 401/403)
+
+        Returns True if the driver is healthy or was successfully recovered.
+        Returns False if the driver is dead and needs a full rebuild.
+        """
+        if not driver:
+            return False
+        # Check 1: basic session validity
+        try:
+            _ = driver.session_id
+        except Exception:
+            return False
+        # Check 2: can we execute JS?
+        try:
+            driver.execute_script("return document.readyState")
+        except Exception as e:
+            _err = str(e).lower()
+            if "invalid session id" in _err or "no such window" in _err:
+                return False  # dead — needs rebuild
+            if "tab crashed" in _err:
+                return False  # dead — needs rebuild
+            # Other errors might be transient
+            return True
+        # Check 3: is the session token alive?
+        # A browser that has NEVER been logged in (freshly built this round) has
+        # no token yet. Treating "not logged in" as a dead token there caused a
+        # pointless teardown+rebuild on every fresh warm-up, which churned extra
+        # Chrome profiles and burned the account's login budget. Only a browser
+        # that was PREVIOUSLY logged in can have a token that went dead.
+        _ever_logged = bool(getattr(driver, "_sportsape_logged_in", False))
+        try:
+            if not self._session_is_live(driver, deep_check=True):
+                if not _ever_logged:
+                    # Fresh browser — normal, not a fault. Let the caller's
+                    # _ensure_bet_login perform the first real login.
+                    return True
+                # Token is dead — try to re-login on this same browser
+                self._emit_direct(gui_callback,
+                                  f"  🔐 {phone}: session token dead — re-logging in on existing browser")
+                try:
+                    self._dismiss_foreign_session_prompt(driver)
+                except Exception:
+                    pass
+                try:
+                    self._logout_current_session(driver)
+                except Exception:
+                    pass
+                time.sleep(3)
+                try:
+                    with self._login_lock:
+                        if self._hard_spa_login(driver, phone, password,
+                                                gui_callback=gui_callback, force=True):
+                            return True
+                except Exception:
+                    pass
+                # Re-login failed — browser might be in a bad state
+                return False
+        except Exception:
+            pass
+        return True
 
     def _close_stray_tabs(self, driver) -> None:
         """Close any extra browser tabs beyond the first (main) tab."""
@@ -215,20 +624,87 @@ class SportsapeBackend:
         except Exception:
             pass
 
+    def _live_driver_pids(self) -> set[int]:
+        """PIDs of chrome backing every driver we still hold a handle to.
+
+        These are excluded from reaping so a rotation never kills the browser a
+        worker is actively betting through.
+        """
+        pids: set[int] = set()
+        drivers: list = []
+        with self._active_drivers_lock:
+            drivers.extend(list(self._active_drivers))
+        try:
+            with self._driver_lock:
+                drivers.extend(list(self._worker_drivers.values()))
+        except Exception:
+            pass
+        try:
+            drivers.extend(list(self._preloaded_drivers))
+        except Exception:
+            pass
+        try:
+            if self._bet_driver:
+                drivers.append(self._bet_driver)
+        except Exception:
+            pass
+        # One process listing, reused for every driver. Calling the lister per
+        # driver meant one PowerShell spawn (and one console flash) each.
+        listing = _our_chrome_pids()
+        for d in drivers:
+            # session_id is a chromedriver SESSION KEY, not an OS pid — using it
+            # as one could accidentally protect the wrong process. Resolve the
+            # real browser pid from the temp profile we handed that driver.
+            try:
+                prof = getattr(d, "_sportsape_temp_profile", None)
+                if prof:
+                    for pid, cmd in listing:
+                        if prof.lower() in cmd.lower():
+                            pids.add(pid)
+            except Exception:
+                continue
+            try:
+                service = getattr(d, "service", None)
+                spid = getattr(service, "process", None)
+                if spid is not None and getattr(spid, "pid", None):
+                    pids.add(int(spid.pid))
+            except Exception:
+                continue
+        return pids
+
     def _cleanup_driver(self, driver) -> None:
         if not driver:
             return
         temp_profile = getattr(driver, "_sportsape_temp_profile", None)
+        # Release this browser's claim on the account so the next build (or the
+        # other worker) can take it. Without this a crashed/quit driver keeps the
+        # account locked for the life of the process.
+        acct = getattr(driver, "_sportsape_account", None)
         with self._active_drivers_lock:
             self._active_drivers.discard(driver)
         try:
             driver.quit()
         except Exception:
             pass
+        if acct:
+            try:
+                _release_account_session(acct)
+            except Exception:
+                pass
+            try:
+                driver._sportsape_account = None
+            except Exception:
+                pass
         if temp_profile and os.path.exists(temp_profile):
             shutil.rmtree(temp_profile, ignore_errors=True)
         if self.selenium_driver is driver:
             self.selenium_driver = None
+        # NOTE: deliberately do NOT reap here. This is the hot path — it runs on
+        # every driver teardown while other workers are mid-bet. Reaping any
+        # sportsape chrome not perfectly matched in the exclusion set killed
+        # live worker browsers and produced the "consecutive aborts" loop.
+        # Orphans are swept once at startup and once at shutdown, when nothing
+        # of ours is in use.
 
     def _track_active_driver(self, driver) -> None:
         if not driver:
@@ -328,9 +804,31 @@ class SportsapeBackend:
                 self._driver_warmup_in_progress = False
 
     def _build_driver(self, gui_callback=None, force_visible=False, mobile=False,
-                      headless=None, capture_perf=True, minimize=False) -> webdriver.Chrome:
+                      headless=None, capture_perf=True, minimize=False,
+                      phone=None) -> webdriver.Chrome:
+        # ONE BROWSER PER ACCOUNT. Building a driver for an account another
+        # process already owns would create a second session and get BOTH tokens
+        # revoked ("logged in from another device"). Ownership itself is claimed
+        # in _set_account_driver so claim/release stay exactly paired; this is an
+        # early check so we fail loudly instead of launching a doomed browser.
+        _account_guard = str(phone) if phone is not None else None
+        if _account_guard is not None:
+            _who = _account_session_holder(_account_guard)
+            if _who.get("held") and _who.get("pid") != os.getpid():
+                raise RuntimeError(
+                    f"refusing to open a browser for {_account_guard}: another "
+                    f"process (pid {_who.get('pid')}) already drives that account. "
+                    f"Two sessions on one account = 403 'logged in from another device'.")
         options = Options()
-        options.page_load_strategy = 'normal'
+        # 'normal' waits for EVERY subresource: ad tags, trackers, pixels and the
+        # live-score websocket on today's-games. On this SPA that regularly blew
+        # past the page-load timeout and surfaced as
+        #   "tab crashed" / "Timed out receiving message from renderer",
+        # which cost a full browser rebuild each time (12+ in the crash trace).
+        # 'eager' returns at DOMContentLoaded and lets the crawler's existing
+        # explicit waits (row counts, staleness, placeable counts) do the
+        # synchronising — that is where the real readiness check already lives.
+        options.page_load_strategy = 'eager'
         use_headless = self.headless if headless is None else bool(headless)
         if use_headless:
             options.add_argument("--headless=new")
@@ -340,7 +838,13 @@ class SportsapeBackend:
             options.add_argument("--window-size=1280,800")
         options.add_argument("--disable-gpu")
         options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-dev-shm-usage")   # Linux-only, no-op here; kept for parity
+        # --disable-dev-shm-usage does nothing on Windows, so nothing was ever
+        # bounding renderer memory. The extended board pulls 150+ fixtures of
+        # live odds — each a ticking DOM subtree — and one renderer can blow its
+        # budget and die outright ("tab crashed"). Cap the heap so an over-budget
+        # renderer GCs instead of taking the tab with it.
+        options.add_argument("--js-flags=--max-old-space-size=768")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         options.add_experimental_option("useAutomationExtension", False)
@@ -407,7 +911,33 @@ class SportsapeBackend:
         if minimize and not use_headless:
             options.add_argument("--start-minimized")
 
-        temp_profile = tempfile.mkdtemp(prefix="sportsape_chrome_")
+        # Put the ACCOUNT in the profile directory name (2026-10-05).
+        #
+        # WHY: until now every profile was `sportsape_chrome_<random>`, so
+        # neither an operator nor the reaper could tell which account an
+        # orphaned browser belonged to. With two accounts running we measured 4
+        # live profiles and could not say which 2 were legitimate. That made it
+        # impossible to scope the orphan sweep to one account - the very thing
+        # that stops two browsers fighting over one session.
+        #
+        # The random suffix still guarantees uniqueness; the phone simply makes
+        # each profile self-identifying in the process list, in the temp folder
+        # listing, and in our own logs. Falls back to a neutral token when no
+        # phone is known.
+        _acct_tag = "".join(ch for ch in str(phone or "") if ch.isdigit())[:12]
+        if not _acct_tag:
+            _acct_tag = "shared"
+        # ONE BROWSER PER ACCOUNT.
+        #
+        # ROLLED BACK OUT OF THIS HOT PATH (2026-10-05). Calling the duplicate
+        # sweep here looked thorough, but `_build_driver` is on the critical
+        # path of EVERY browser start and the sweep shells out to a CIM query
+        # over all chrome processes. Doing that inline stalled the workers:
+        # both accounts went silent and Fibi reported "ENGINE STALL: no round
+        # completed in ~16 min". Correctness is not worth a stalled engine, so
+        # the sweep now runs only at the explicit round-start call sites (where
+        # it was already wired) and is throttled there.
+        temp_profile = tempfile.mkdtemp(prefix=f"sportsape_chrome_{_acct_tag}_")
         options.add_argument(f"--user-data-dir={temp_profile}")
         # Stability for concurrent workers: prevent the renderer from hanging
         # (which surfaces as "timeout: Timed out receiving message from renderer")
@@ -418,10 +948,27 @@ class SportsapeBackend:
         options.add_argument("--disable-software-rasterizer")
 
         try:
-            # Use a simpler service initialization
-            service = Service()
-            
-            driver = webdriver.Chrome(service=service, options=options)
+            # Resolve the driver from the LOCAL cache first: an empty Service
+            # path makes Selenium Manager phone googlechromelabs.github.io on
+            # every launch, and when that fetch is slow it raises and the
+            # session dies with the generic "Unable to obtain driver for
+            # chrome" (measured live 2026-10-16: every win-sync failed for 40
+            # minutes while a matching driver sat in the cache). An explicit
+            # path makes DriverFinder skip the manager altogether.
+            try:
+                import betflow as _bf
+                _drv = _bf.local_chromedriver()
+            except Exception:
+                _drv = ""
+            try:
+                service = Service(executable_path=_drv)
+                driver = webdriver.Chrome(service=service, options=options)
+            except Exception:
+                if not _drv:
+                    raise
+                # Cached driver rejected -> let the manager resolve one.
+                service = Service()
+                driver = webdriver.Chrome(service=service, options=options)
             self._track_active_driver(driver)
             self.selenium_driver = driver
 
@@ -431,6 +978,11 @@ class SportsapeBackend:
             # STEALTH CDP layer: hide automation fingerprints, spoof the UA and
             # client-hint headers to match a genuine Chrome on Windows (this is what
             # lets headless sessions pass Akamai's JS/header checks on the widget).
+            try:
+                driver.set_page_load_timeout(30)
+                driver.set_script_timeout(10)
+            except Exception:
+                pass
             try:
                 driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": (
                     "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -471,6 +1023,12 @@ class SportsapeBackend:
                 except Exception:
                     pass
             driver._sportsape_temp_profile = temp_profile  # type: ignore[attr-defined]
+            # Deliberately NOT stamped with the account here: _build_driver only
+            # performs the cross-process guard above. The claim is taken in
+            # _set_account_driver, which is the single point paired with release
+            # on teardown. Stamping here would mark a driver as owning an
+            # account whose lock was never actually taken.
+            driver._sportsape_account = None  # type: ignore[attr-defined]
             return driver
         except Exception as e:
             self._emit_direct(gui_callback, f"   ❌ Browser launch failed: {str(e)[:50]}")
@@ -489,9 +1047,106 @@ class SportsapeBackend:
                 return
             except Exception as exc:  # retry transient "Timed out receiving message from renderer"
                 last = exc
-                self._emit_direct(None, f"   ⏳ retry navigating to page ({i + 1}/{attempts})")
+                exc_s = str(exc).lower()
+                # A renderer timeout usually leaves the tab mid-navigation and
+                # the old document still on screen, so re-issuing get() straight
+                # away can wedge on the same pending work. Tear the session down
+                # first: a hung renderer almost never recovers, and the caller's
+                # own rebuild path handles a genuinely dead browser. One cheap
+                # stop/start is still worth trying because it is far cheaper than
+                # the full driver rebuild this used to trigger.
+                if "tab crashed" in exc_s or "no such window" in exc_s:
+                    self._emit_direct(None, f"   ⚠️ tab crashed navigating — discarding "
+                                            f"browser ({i + 1}/{attempts})")
+                    raise
+                if "invalid session id" in exc_s:
+                    self._emit_direct(None, f"   ⚠️ session lost navigating "
+                                            f"({i + 1}/{attempts})")
+                    raise
+                self._emit_direct(None, f"   ↻ retry navigating to page ({i + 1}/{attempts})")
+                try:
+                    driver.execute_script("window.stop();")
+                except Exception:
+                    pass
                 time.sleep(2)
         raise last
+
+    def _exec_script(self, driver, code: str, default=None, timeout: float = 12.0,
+                     refresh_on_hang: bool = False, label: str = "script") -> object:
+        """Run page-side JS behind a short, bounded timeout so a busy/stuck
+        renderer can NEVER stall a maintenance task or surface the raw
+        'Timed out receiving message from renderer' error.
+
+        A renderer that is busy with the heavy SPA (animations, infinite
+        scroll, ads) stops answering CDP commands; with the default 45s script
+        timeout that means up to 45 seconds of blocking per call. Here the call
+        is capped at `timeout` seconds, and on the specific renderer-hang
+        exception it retries once after a page refresh when asked, then returns
+        `default` with a single calm note — the task continues next cycle with
+        a fresh page. Unrelated JS errors still propagate.
+        """
+        prev = None
+        try:
+            prev = driver.timeouts.script
+        except Exception:
+            prev = None
+        try:
+            try:
+                driver.set_script_timeout(timeout)
+            except Exception:
+                pass
+            return driver.execute_script(code)
+        except Exception as exc:
+            msg = str(exc)
+            is_hang = ("Timed out receiving message from renderer" in msg
+                       or "script timeout" in msg or "renderer" in msg.lower())
+            if is_hang and refresh_on_hang:
+                try:
+                    time.sleep(1.0)
+                    self._safe_get(driver, driver.current_url, attempts=1)
+                    driver.set_script_timeout(timeout)
+                    return driver.execute_script(code)
+                except Exception:
+                    pass
+            if is_hang:
+                self._emit_direct(None, f"   ⏸️ Renderer busy — {label} skipped (will retry next cycle)")
+                return default
+            raise
+        finally:
+            if prev is not None:
+                try:
+                    driver.set_script_timeout(prev)
+                except Exception:
+                    pass
+
+    def _exec_async_script(self, driver, code: str, default=None, timeout: float = 12.0,
+                           label: str = "async script") -> object:
+        """execute_async_script variant of _exec_script — same bounded-timeout,
+        renderer-hang-safe behavior (used by the wallet/API page probes)."""
+        prev = None
+        try:
+            prev = driver.timeouts.script
+        except Exception:
+            prev = None
+        try:
+            try:
+                driver.set_script_timeout(timeout)
+            except Exception:
+                pass
+            return driver.execute_async_script(code)
+        except Exception as exc:
+            msg = str(exc)
+            if ("Timed out receiving message from renderer" in msg
+                    or "script timeout" in msg or "renderer" in msg.lower()):
+                self._emit_direct(None, f"   ⏸️ Renderer busy — {label} skipped (will retry next cycle)")
+                return default
+            raise
+        finally:
+            if prev is not None:
+                try:
+                    driver.set_script_timeout(prev)
+                except Exception:
+                    pass
 
     def _emit_direct(self, gui_callback, message: str) -> None:
         """Internal emit that bypasses the verbose check for critical diagnostics.
@@ -833,7 +1488,19 @@ return true;
 
     def _logout_current_session(self, driver: webdriver.Chrome) -> bool:
         self._dismiss_visible_promos(driver, rounds=1)
-        if self._click_by_text(driver, ["logout", "log out", "sign out", "exit login", "exit"]):
+        clicked = False
+        # Order matters: prefer the explicit control. The bare "exit" token is a
+        # last resort because it also matches incidental text ("exit speed")
+        # and could activate the wrong control entirely.
+        for labels in (["logout", "log out", "sign out", "exit login", "log-out"],
+                       ["exit"]):
+            try:
+                if self._click_by_text(driver, labels):
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if clicked:
             time.sleep(0.5)
             return True
         return False
@@ -1065,7 +1732,8 @@ return true;
     def _extract_wallet_snapshot_from_sportpesa_api(self, driver: webdriver.Chrome) -> dict | None:
         """Fetch the SportPesa /api/wallets/balance endpoint from the logged-in page."""
         try:
-            data = driver.execute_async_script(
+            data = self._exec_async_script(
+                driver,
                 """
                 var done = arguments[arguments.length - 1];
                 var controller = new AbortController();
@@ -1074,8 +1742,8 @@ return true;
                     .then(function (r) { clearTimeout(timeoutId); return r.json(); })
                     .then(function (d) { done(d); })
                     .catch(function () { clearTimeout(timeoutId); done(null); });
-                """
-            )
+                """,
+                default=None, timeout=10.0, label="wallet API snapshot")
         except Exception:
             return None
         if not data:
@@ -1154,7 +1822,8 @@ return true;
             }
             return findWallet();
             """
-            page_wallet = driver.execute_script(script)
+            page_wallet = self._exec_script(driver, script, default=None, timeout=8.0,
+                                            refresh_on_hang=True, label="page wallet snapshot")
             if isinstance(page_wallet, dict):
                 snapshot = self._finalize_wallet_snapshot(
                     {
@@ -1846,6 +2515,16 @@ return true;
 
             deposited = False
 
+            # A deposit URL that never fires the page-load event would block
+            # driver.get() for ChromeDriver's default 300s (measured 2026-10-09:
+            # account 2 frozen on /en/deposit for minutes inside the exe). Cap
+            # the load so the URL loop advances and the API fallback fires.
+            try:
+                driver.set_page_load_timeout(30)
+                driver.set_script_timeout(30)
+            except Exception:
+                pass
+
             def _try_fill_and_submit(drv, amt, ui_cb) -> bool:
                 """Find amount input (main doc or iframe) + submit button; return True if clicked."""
                 search_scopes = [(drv, "main")]
@@ -2222,39 +2901,84 @@ return true;
     ENRICH_PATH = Path(writable_path("sportsape_enrich_cache.json"))
     ENRICH_TTL_SECONDS = 6 * 3600  # game enrichment (injuries, weather) valid 6h
     ODDS_HISTORY_PATH = Path(writable_path("sportsape_odds_history.json"))
-    MIN_LEG_CONF = 0.55  # minimum fair probability per leg — only markets with a genuine shot
-    MIN_LEG_ODDS = 1.20  # owner rule: no leg under x1.20 (never 1.01/1.04 filler legs)
-    RAW_LEG_VETO = 0.45  # hard veto: never bet a leg whose raw fair prob is below this.
-                         # (2026-09-28, OWNER decision): relaxed 0.50 -> 0.45. The 0.50
-                         # bar combined with the x1.20 odds floor to leave only 3 of
-                         # 25-32 games qualifying on an overnight board (rawveto_calls
-                         # 83-96 per round), which could never build an x2.50 slip.
-                         # 0.45 still admits only genuine near-favourites (>= 45% at
-                         # margin-stripped fair prob) and still blocks the 0.136/0.21
-                         # garbage the veto was created for; a 2.2 favourite (fair ~45%)
-                         # should supply the legs the board was withholding.
-    BTTS_STRONG_FLOOR = 0.62  # OWNER RULE (2026-09-19, ENFORCED): a BTTS/GG leg may
-                              # join a slip ONLY when the model's weighted confidence
-                              # clears 0.62 — GG's fair prob is ~55-60% (a coin-flip),
-                              # so any raw "pick GG" decision below this floor is a
-                              # donation waiting to happen. Data must STRONGLY back it.
-    MIN_COMBINED_ODDS = 2.5  # OWNER RULE (2026-09-18, ENFORCED): every betslip must
-                             # clear at LEAST x2.50 combined — no slip ever lands at
-                             # 1.02/1.20 filler odds. The earlier 4.5 floor starved
-                             # thin boards into "no accumulator combination found", and
-                             # the later silent 1.5 floor let junk slips through; the
-                             # correct floor is x2.50: high enough that a winning slip
-                             # is always worth real money, low enough that healthy
-                             # boards still build 2-3 clean legs. Where the engine plays
-                             # a goals/OVER market it always targets a CLEAN Over 1.5 or
-                             # Over 2.5 line (never an Over 0.5 — odds ~1.02, zero value:
-                             # KES 10 stake returns ~KES 1). Over 0.5 is not even in the
-                             # scrape pipeline (fields h3/btts/ou/ou15 only), and the
-                             # MIN_LEG_ODDS x1.20 veto kills any sub-1.20 filler leg.
-    MIN_STAKE = 5.0  # OWNER RULE (reverted 2026-09-16): the KES 1 floor produced
-                     # meaningless 1-shilling tickets that never grow the bank. Floor
-                     # is KES 5 (never below), stake scales with balance/sureness and
-                     # is capped at KES 20 so a single slip can't torch the bankroll.
+    # ── OWNER DECISION (2026-10-01): Option A gate profile ───────────────────
+    # "Fewer artificial gates, more bets" — but NOT at the cost of staking on
+    # markets the engine is demonstrably bad at.
+    #
+    # RELAXED (shape gates — these were manufacturing junk legs):
+    #   MIN_COMBINED_ODDS 2.50 -> 1.60. The x2.50 floor forced the engine to
+    #     pad a 2-leg slip with a third coin-flip just to reach the target,
+    #     which is how Salvadoran/Peruvian domestic fixtures with no form data
+    #     kept ending up in real tickets. A 2-leg x1.6 slip is a genuine bet.
+    #   MIN_LEG_CONF 0.55 -> 0.42, BTTS_STRONG_FLOOR 0.50 -> 0.42, so short-
+    #     priced and BTTS legs are no longer deleted from the board.
+    #   MIN_LEG_ODDS 1.20 -> 1.05 (still blocks 1.01/1.02 dead filler).
+    #   MAX_GOALS_LEGS_PER_SLIP 2 -> 4.
+    #
+    # KEPT (calibration/value gates — the model is 29+ points wrong here):
+    #   RAW_LEG_VETO 0.40, SLIP_MIN_EV 1.05, retired_markets, recipe vetoes,
+    #   correlation caps, Kelly sizing. The ledger shows over1 priced at 84%
+    #   hitting 55% over 29 trials and under575 -37 points; these gates are
+    #   the only thing preventing real stakes on markets the model cannot
+    #   price. Injuries + H2H scoring remain the primary filters.
+    MIN_LEG_CONF = 0.42  # relaxed 0.55: only markets with a genuine shot
+    # OWNER RULE (2026-10-05): never bet a leg priced 1.00-1.09.
+    # The gate below is a STRICT `>` (see `if not (self.MIN_LEG_ODDS < o)`),
+    # so 1.09 admits only legs at 1.10 and above — the whole 1.00-1.09 band,
+    # including the 1.01/1.02/1.06 dead filler, is now excluded.
+    #
+    # Why: a 1.06 leg returns ~6% on the stake, so it contributes essentially
+    # nothing to the payout, yet it still carries real downside (it loses on
+    # the rare event and can be voided/settled early on a lineup change) and it
+    # consumes one of only 6 slip slots. It also quietly drags the combined
+    # odds down, which is what made the slips bottom out at x1.6-x1.9.
+    #
+    # Trade-off to watch: this narrows an already-thin board. The selector
+    # previously reported ~24 of 33 games with "no options". If slip building
+    # starts declining more often, raise MAX_SLIP_LEGS_HARD or the combined
+    # floor rather than lowering this number back into dead-filler territory.
+    MIN_LEG_ODDS = 1.09
+    # ── EDGE-AWARE RANKING tunables (2026-10-05) ────────────────────
+    # How strongly a leg's disagreement with the book influences its rank.
+    # 0.0 reproduces the old pure-confidence behaviour; 0.30 is a deliberate
+    # nudge that can flip a leg only when we rate it materially above the
+    # price, while confidence still dominates. Higher values chase value
+    # harder and accept more coin-flip legs — not recommended before the
+    # calibration data is trustworthy.
+    _EDGE_VALUE_WEIGHT = 1.20
+    # Cap on the square-rooted edge ratio. At 1.25 a leg must look ~1.56x more
+    # likely than its price implies before it saturates; this stops a single
+    # noisy longshot from dominating the whole board.
+    _EDGE_RATIO_CAP = 1.25
+    # Share of the final rank score that comes from the edge term rather than
+    # raw confidence (see _edge_key for the measurements behind this). 0.0
+    # restores pure confidence-primary ranking.
+    _EDGE_CONF_BLEND = 0.50
+    RAW_LEG_VETO = 0.40  # hard veto: never bet a leg whose raw fair prob is below this.
+                         # (2026-09-28, OWNER decision — FIRST-BET TEST): relaxed to
+                         # 0.40 to match the long-shot branch. The 0.50/0.45 bars plus
+                         # the x1.20 odds floor left only 3 of 25-32 games qualifying
+                         # on overnight boards (every matchup evenly priced ~0.40-0.50
+                         # fair), which could never build an x2.50 slip. 0.40 still
+                         # admits only genuine near-even favourites and still blocks
+                         # the 0.136/0.21 garbage the veto was created for. REVISIT
+                         # after the first real bet lands.
+    BTTS_STRONG_FLOOR = 0.42  # relaxed 0.50 -> 0.42 (Option A): BTTS legs are no
+                              # longer deleted from the board, but a sub-42% GG
+                              # pick is still blocked (a true coin-flip is a
+                              # donation). Injuries + H2H now do the screening.
+    MIN_COMBINED_ODDS = 1.6  # relaxed 2.50 -> 1.60 (Option A): the x2.50 floor
+                             # was manufacturing junk — it forced a 3rd coin-flip
+                             # leg onto 2-leg slips, which is how unknown
+                             # domestic fixtures kept reaching real tickets.
+                             # x1.60 allows a clean 2-leg slip and stops the
+                             # engine padding legs just to hit a target.
+    MIN_STAKE = 10.0  # OWNER RULE (2026-09-30): the KES 5 floor produced tiny
+                      # tickets that grew the bank at a crawl. Floor is KES 10
+                      # (never below — the owner mandates every real bet is at
+                      # least KES 10), stake scales with balance/sureness and
+                      # is capped at KES 20 so a single slip can't torch the
+                      # bankroll.
     # OWNER RULES (2026-09-25) — the two numbers above were the whole staking
     # policy, and both were static. The 09-24 ledger adds two more:
     #  • SLIP_MIN_EV — a slip can only be staked (at ANY size) when the market-
@@ -2265,15 +2989,27 @@ return true;
     #  • STAKE_BANKROLL_SHARE — even a "high-confidence" slip never risks more
     #    than this fraction of the current balance, so a young KES 6.47 bankroll
     #    can't be consumed by one too-good slip before it ever grows.
-    SLIP_MIN_EV = 1.05
+    # RELAXED 1.05 -> 0.95 (owner decision, 2026-10-02): at 1.05 the EV gate
+    # rejected EVERY round — 6 consecutive FOOTBALL AUTO-BET rounds with a
+    # balance read and zero real slips placed (all 4 went to shadow). It was
+    # eating the whole board, not protecting it. 0.95 still refuses a slip whose
+    # market-weight-corrected joint probability times the combined odds is
+    # below 0.95, which keeps the worst-priced markets out while letting
+    # genuinely marginal-but-positive slips through.
+    SLIP_MIN_EV = 0.95
     STAKE_BANKROLL_SHARE = 0.33
-    # OWNER RULE (2026-09-26): max O/U (goals) legs per slip. The 09-26 ledger
-    # caught a 4x-"over" slip @ 0.93 confidence each that settled LOST — one
-    # correlated goal-stack, every leg dead together. 2 keeps O/U represented in
-    # the mix while forcing 1X2 / Double Chance / BTTS into the other slots, so
-    # the machine bets the whole board instead of one market four times.
-    MAX_GOALS_LEGS_PER_SLIP = 2
-    DEFAULT_POOL_SHARE = 0.25  # share of each win banked toward the auto-withdraw reserve
+    # OWNER RULE (2026-09-26), relaxed 2 -> 4 (Option A, 2026-10-01): the cap
+    # existed because a 4x-"over" slip settled LOST — every leg correlated and
+    # died together. Relaxed rather than removed: over-stacking the same
+    # correlated goals market is still the one shape guaranteed to fail
+    # together, so a hard ceiling remains even with the gates relaxed.
+    MAX_GOALS_LEGS_PER_SLIP = 4
+    # OWNER DECISION (2026-10-02): savings reserve OFF. At the default 0.25 the
+    # KES 31.87 pool left only KES 3.39 spendable of a KES 35.26 balance — under
+    # the KES 10 minimum, so the engine could not stake despite being funded and
+    # active. Share is 0.0 so no new wins are banked into the reserve; the
+    # existing pool is zeroed in stats (see _pool).
+    DEFAULT_POOL_SHARE = 0.0  # share of each win banked toward the auto-withdraw reserve (off)
 
     # Market groups for the owner's market whitelist (all-on by default).
     # mk -> group; toggling a group in the GUI removes those markets entirely.
@@ -2298,10 +3034,52 @@ return true;
         return (grp or mk) in wl
 
 
+    _AUTH_COOLDOWN_S = 600.0   # 10 min quiet after repeated login rejections
+
     def _ensure_bet_login(self, driver, phone: str, password: str, gui_callback=None):
-        """Put `driver` on the today-games page and ensure we're logged in
-        (re-logs-in when the session is gone — safe to call every round)."""
+        """Put `driver` on the today-games page and ensure we're logged in.
+
+        ANTI-THRASH GUARD (2026-10-05). Several components ask for a login for
+        the same account in the same round (startup win-sync, balance sweep,
+        jackpot research, the worker itself). Each POST /login_check supersedes
+        the previous token, so they invalidate each other and the book answers
+        "User logged from another device". The engine then compounded it by
+        retrying the pre-slip gate 3x per round, every ~2 min — roughly 90 login
+        POSTs per hour. Measured on a live run: 34 dismissals, 33 failed logins,
+        31 gate failures and ZERO bets placed, with recovery never succeeding.
+
+        We now record a successful authentication and treat a login as
+        idempotent: if this account authenticated recently AND the wallet probe
+        confirms the session, we do nothing at all — no POST, no dismissal, no
+        logout. Repeated rejections put the account into a growing cooldown so
+        the session is left alone to recover instead of being beaten to death.
+        """
+        key = str(phone or "")
+        now = time.time()
+        # Respect an active cooldown: do not touch the session at all.
+        _cool = getattr(self, "_auth_backoff", {}) or {}
+        _until = float(_cool.get(key) or 0.0)
+        if _until > now:
+            self._emit_direct(
+                gui_callback,
+                f"⏸️ {phone}: login backing off for "
+                f"{int((_until - now) / 60) + 1} more min — repeated attempts were "
+                "invalidating our own session (the book throttles back-to-back "
+                "logins). Will retry when the cooldown expires.")
+            return
         normalized = self._format_sportsape_login_phone(phone)
+        # Idempotency: a recent successful login + a live wallet means every
+        # caller in this window shares ONE token instead of replacing it.
+        _authed = getattr(self, "_auth_ok_at", {}) or {}
+        if (now - float(_authed.get(key) or 0.0)) < self._AUTH_COOLDOWN_S:
+            try:
+                if self._session_is_live(driver, deep_check=True):
+                    return
+            except Exception:
+                pass
+            # Session died inside the window — clear so we re-authenticate once.
+            _authed.pop(key, None)
+            self._auth_ok_at = _authed
         self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
         force_relogin = False
         try:
@@ -2317,7 +3095,19 @@ return true;
                     pass
         except Exception:
             pass
-        WebDriverWait(driver, 20).until(lambda d: d.execute_script("return document.readyState") != "loading")
+        _ready = "loading"
+        for _i in range(8):
+            try:
+                _ready = self._exec_script(driver, "return document.readyState",
+                                           default="loading", timeout=2.0,
+                                           label="readyState probe")
+            except Exception:
+                _ready = "loading"
+            if _ready != "loading":
+                break
+            time.sleep(0.75)
+        if _ready == "loading":
+            self._emit_direct(gui_callback, "⚠️ Page still loading after retries — continuing")
         time.sleep(1)
         driver.execute_script("""
             var ov = document.querySelectorAll('[id*=responsive-image],[class*=ins-element],iframe');
@@ -2327,6 +3117,15 @@ return true;
         with self._login_lock:
             if phone:
                 if self._hard_spa_login(driver, phone, password, gui_callback=gui_callback):
+                    # Record the successful authentication so other components
+                    # asking for a login in this window reuse this token instead
+                    # of POSTing a second one and invalidating it.
+                    try:
+                        self._auth_ok_at[str(phone)] = time.time()
+                        # A success clears any accumulated backoff.
+                        (getattr(self, "_auth_backoff", {}) or {}).pop(str(phone), None)
+                    except Exception:
+                        pass
                     if self._agent_hub is not None:
                         try:
                             self._agent_hub.record_login(phone)
@@ -2372,9 +3171,11 @@ return true;
         signal the SPA uses (isAuthenticated() -> e.logged === '1'); the old
         \"KES/deposit text\" heuristics below it are useless for gate decisions."""
         try:
-            return str(driver.execute_script(
+            return str(self._exec_script(
+                driver,
                 "return (document.body && "
-                "document.body.innerHTML.indexOf('logged=\"1\"') >= 0) ? '1' : '0';"))
+                "document.body.innerHTML.indexOf('logged=\"1\"') >= 0) ? '1' : '0';",
+                default="0", timeout=8.0, refresh_on_hang=True, label="logged attr"))
         except Exception:
             return "0"
 
@@ -2395,15 +3196,50 @@ return true;
         rendered. The SPA silently re-mounts an EMPTY page (bare body, live to the
         wallet API, logged=\"1\" intact) ~7min after login while we tour games —
         the only known way back to a hydrated slip is a genuine fresh session POST,
-        so the mint gate calls us with force=True."""
+        so the mint gate calls us with force=True.
+
+        INDUSTRIAL-GRADE FIX (2026-10-04): logged=\"1\" alone is NEVER accepted as
+        proof of a live session. The attribute survives server-side token
+        invalidation, so a browser can look logged in while every PLACE returns
+        403. We now ALWAYS verify the wallet API returns 200 before declaring
+        success. If the wallet probe fails, we force a fresh login."""
         normalized = self._format_sportsape_login_phone(phone)
         if not force:
             try:
                 if self._spa_logged_attr(driver) == "1":
-                    return True
+                    # logged="1" is necessary but NOT sufficient — verify the
+                    # wallet API actually returns 200 before trusting the session.
+                    try:
+                        if self._session_is_live(driver, deep_check=True):
+                            try:
+                                driver._sportsape_logged_in = True
+                            except Exception:
+                                pass
+                            return True
+                    except Exception:
+                        pass
+                    # Wallet probe failed — the token is dead even though the
+                    # page still renders logged="1". Fall through to force a
+                    # fresh login below.
+                    self._emit_direct(gui_callback,
+                                      f"  ⚠️ {phone}: logged=\"1\" present but wallet API "
+                                      "rejected the token — forcing fresh login.")
             except Exception:
                 pass
-        for _attempt in range(2):
+        for _attempt in range(3):
+            # RELIABILITY FIX (2026-10-04): re-open the login entry on every
+            # attempt. _click_login_entry falls back to a full driver.get() on
+            # /login, and that navigation can land on a still-hydrating SPA
+            # where #username / #password do not exist yet. The old code opened
+            # the entry ONCE and then polled the DOM, so a form that mounted a
+            # moment later was never retried and the attempt failed with
+            # "Hard login did not reach logged=1" even though the credentials
+            # were fine. Re-opening per attempt makes the poll actually able to
+            # observe a late-mounting form.
+            try:
+                self._dismiss_foreign_session_prompt(driver)
+            except Exception:
+                pass
             try:
                 self._click_login_entry(driver)
             except Exception:
@@ -2421,9 +3257,27 @@ return true;
                 except Exception:
                     pass
                 time.sleep(0.4)
+                # Re-click the entry mid-wait if the form still has not mounted.
+                if time.time() > deadline - 12:
+                    try:
+                        self._click_login_entry(driver)
+                    except Exception:
+                        pass
             if not inputs_found:
                 continue
             u, p = inputs_found
+            # Global login serialisation: never overlap credential POSTs with
+            # another account's, and always leave a settle gap after the last
+            # one. See _acquire_login_gate for why this is not paranoia.
+            try:
+                _waited = _acquire_login_gate(phone)
+                if _waited > 1:
+                    self._emit_direct(
+                        gui_callback,
+                        f"  ⏳ Waited {_waited:.0f}s to submit credentials "
+                        "(another account was authenticating).")
+            except Exception:
+                pass
             try:
                 u.clear()
                 u.send_keys(normalized)
@@ -2438,62 +3292,200 @@ return true;
                                   f"  ⚠️ login form fill failed: {str(exc)[:80]}")
                 continue
             deadline = time.time() + timeout
+            # Poll the cheap signal every second, but probe the authoritative
+            # wallet API at most every 8s (each probe can take seconds).
+            next_deep = 0.0
             while time.time() < deadline:
                 time.sleep(1)
+                # Cheap signal first: the SPA normally flips logged="1" promptly.
                 try:
                     if self._spa_logged_attr(driver) == "1":
+                        # Remember this browser has held a session, so a later
+                        # dead-token finding is a real regression (worth a
+                        # re-login) rather than a fresh browser's first login.
+                        try:
+                            driver._sportsape_logged_in = True
+                        except Exception:
+                            pass
                         self._emit_direct(gui_callback,
-                                          "  ✅ Logged in (server session confirmed)")
+                                          f"  ✅ Logged in as {phone} "
+                                          "(server session confirmed)")
                         return True
                 except Exception:
                     pass
+                # AUTHORITATIVE SIGNAL (fix 2026-10-05). The login gate above
+                # already knows logged="1" alone is not proof, yet success here
+                # was still gated on that one attribute. The SPA frequently
+                # HIDES logged="1" while the wallet API is fully live - the app's
+                # own log says so: "wallet API live (identity hidden by SPA)".
+                # So every failed attempt here used to return False, print
+                # "session not confirmed", and trigger ANOTHER re-login, and
+                # each re-login supersedes our own token - which is how a single
+                # account ends up fighting itself with 'User logged from another
+                # device'. Observed 6+ false negatives in one hour, each one
+                # minting a fresh token. A live wallet API is real proof, so we
+                # accept it.
+                if time.time() >= next_deep:
+                    next_deep = time.time() + 8
+                    try:
+                        if self._session_is_live(driver, deep_check=True):
+                            try:
+                                driver._sportsape_logged_in = True
+                            except Exception:
+                                pass
+                            self._emit_direct(
+                                gui_callback,
+                                f"  ✅ Logged in as {phone} "
+                                "(wallet API live; SPA hides the logged flag)")
+                            return True
+                    except Exception:
+                        pass
         self._emit_direct(gui_callback,
                           "  ⚠️ Hard login did not reach logged=\"1\" — session not confirmed")
         return False
 
     def _session_is_live(self, driver, deep_check: bool = True) -> bool:
         """True when the current page actually has a valid logged-in session.
-        Primary signal: the server-rendered logged=\"1\" attr (the SPA's own
-        isAuthenticated source). Quick fallback: DOM text contains balance/logout.
-        Deep check: probe the wallet API and require a REAL 200 (a 401 proves the
-        session died — the old code treated 401 as live, hiding every logout)."""
+
+        The wallet API is the ONLY trustworthy signal, so it is probed FIRST when
+        deep_check is on. Returning early on logged="1" was wrong: that attribute
+        survives a server-side invalidation, so the session looked confirmed and
+        then every PLACE returned 403 "Forbidden". A cheap logged="1" check now
+        only stands in when deep_check is off."""
+        if not deep_check:
+            try:
+                if self._spa_logged_attr(driver) == "1":
+                    return True
+            except Exception:
+                pass
         try:
-            if self._spa_logged_attr(driver) == "1":
-                return True
-        except Exception:
-            pass
-        try:
-            body = driver.execute_script("return ((document.body && document.body.innerText) || '').toLowerCase();")
-            quick_ok = any(k in body for k in ("ksh", "kes", "logout", "deposit", "balance"))
-            if not quick_ok:
-                return False
-            if not deep_check:
-                return True
-            auth_ok = driver.execute_async_script("""
+            auth_ok = self._exec_async_script(
+                driver,
+                """
                 var done = arguments[arguments.length - 1];
-                var tid = setTimeout(function(){ done(false); }, 6000);
+                var tid = setTimeout(function(){ done(null); }, 8000);
                 fetch('/api/wallets/balance', {credentials: 'include', cache: 'no-store'})
                     .then(function(r){
                         clearTimeout(tid);
                         if (r.status === 200) { done(true); }
-                        else { done(false); }
+                        else { done('http' + r.status); }
                     })
-                    .catch(function(){ clearTimeout(tid); done(false); });
-            """)
-            return bool(auth_ok)
+                    .catch(function(){ clearTimeout(tid); done('neterr'); });
+                """,
+                default=False, timeout=12.0, label="session API probe")
+            if auth_ok is True:
+                return True
+            if isinstance(auth_ok, str) and auth_ok.startswith("http"):
+                # The wallet endpoint answered and said NO (401/403). That is a
+                # definitive rejection, so do NOT let logged="1" rescue it —
+                # that attribute outlives a server-killed token and is exactly
+                # what let a dead session look live and then fail every PLACE.
+                return False
+        except Exception:
+            pass
+        # Only fall back to the rendered DOM when the probe could not run at all
+        # (timeout / network error / endpoint blocked). An unreachable endpoint is
+        # not evidence the session died.
+        try:
+            if self._spa_logged_attr(driver) == "1":
+                return True
+            body = self._exec_script(
+                driver,
+                "return ((document.body && document.body.innerText) || '').toLowerCase();",
+                default='', timeout=8.0, refresh_on_hang=True, label="session body")
+            return any(k in body for k in ("ksh", "kes", "logout", "deposit", "balance"))
         except Exception:
             return False
+
+    def _dismiss_foreign_session_prompt(self, driver) -> bool:
+        """Click through SportPesa's 'You have logged in from another device'
+        notice so it cannot sit over the listing or swallow the next click."""
+        try:
+            body = self._exec_script(
+                driver,
+                "return ((document.body && document.body.innerText) || '').toLowerCase();",
+                default='', timeout=6.0, label="foreign-session scan") or ""
+        except Exception:
+            return False
+        needles = ("logged in from another device", "logged from another device",
+                   "logged in on another device", "another device")
+        if not any(n in body for n in needles):
+            return False
+        try:
+            if self._click_by_text(driver, ["okay", "ok", "continue", "proceed",
+                                            "got it", "close", "dismiss", "yes"]):
+                time.sleep(0.6)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _confirm_session_ready(self, driver, phone: str, password: str,
+                               gui_callback=None) -> bool:
+        """PROVE this browser can bet on `phone` before any slip work begins.
+
+        Two checks, both required:
+          1. the wallet API returns 200 (the session token is genuinely alive), and
+          2. no 'logged in from another device' notice is on screen.
+        logged="1" alone is deliberately NOT accepted: it survives server-side
+        invalidation, which is what produced 403 Forbidden on PLACE."""
+        if self._dismiss_foreign_session_prompt(driver):
+            self._emit_direct(gui_callback,
+                              "  👆 Dismissed a 'logged in from another device' "
+                              "notice — re-checking the session now it is cleared.")
+            # DISMISSING IS THE FIX, NOT THE FAILURE (2026-10-06).
+            #
+            # This used to `return False` the moment a notice was found, so the
+            # gate failed the attempt BECAUSE it had successfully dismissed the
+            # notice - and never re-checked whether the session was usable. The
+            # notice is a stale alert the SPA leaves on screen from an EARLIER
+            # session event; the current session is frequently perfectly fine,
+            # which is why the wallet API returns 200 in the very same rounds
+            # where placement is later refused.
+            #
+            # The log showed this exactly, three attempts running:
+            #   👆 Dismissed a 'logged in from another device' notice.
+            #   🔐 PRE-SLIP LOGIN GATE failed (1/3)
+            #   ... (2/3) ... (3/3) -> round skipped, no bet
+            # Every attempt dismissed the alert and failed anyway, because
+            # dismissal was scored as a fault rather than as the cure.
+            #
+            # So: clear the notice, give the SPA a moment to drop the stale
+            # session, then verify properly below. Only a session that is STILL
+            # not live after that is a genuine failure.
+            time.sleep(0.8)
+        try:
+            live = self._session_is_live(driver, deep_check=True)
+        except Exception:
+            live = False
+        if not live:
+            return False
+        try:
+            who = self._who_is_logged_in(driver)
+        except Exception:
+            who = ""
+        expected = "".join(ch for ch in str(phone or "") if ch.isdigit())
+        if who and expected and who != expected:
+            self._emit_direct(gui_callback,
+                              f"  ⛔ Session identity mismatch: page shows {who}, "
+                              f"expected {expected}.")
+            return False
+        self._emit_direct(gui_callback,
+                          f"  ✅ PRE-SLIP LOGIN GATE passed — wallet API live"
+                          + (f", identity {who}" if who else " (identity hidden by SPA)")
+                          + ". Proceeding to slip build.")
+        return True
 
     def _who_is_logged_in(self, driver) -> str:
         """Best-effort read of WHICH account the current session belongs to, as
         normalized digits (e.g. "0700000001"). Returns '' when the page does not expose
         the account identity (we then rely on live/logged-out only)."""
         try:
-            raw = driver.execute_script("""
+            raw = self._exec_script(driver, r"""
 var b = (document.body && document.body.innerText) || '';
 var m = b.match(/(?:254)?0?[17][0129][0-9]{7}/g);
 return m ? m[0] : '';
-""")
+""", default='', timeout=8.0, refresh_on_hang=True, label="who-logged-in")
         except Exception:
             return ""
         if not raw:
@@ -2512,6 +3504,22 @@ return m ? m[0] : '';
         re-logs-in / switches accounts before betting. Returns True when the driver
         is confirmed live on the right account."""
         expected = "".join(ch for ch in str(phone or "") if ch.isdigit())
+        # DEAD-DRIVER GUARD (2026-10-05). Re-logging in on a driver whose
+        # session has already died ("invalid session id" /
+        # HTTPConnectionPool) can NEVER succeed — the browser is a corpse — yet
+        # the old code retried twice, burning ~90s of wall-clock and a chunk of
+        # CPU per round before the caller's heal path finally replaced it. We
+        # now detect the corpse up front, say so plainly, and hand straight back
+        # so the worker's next iteration rebuilds the browser properly.
+        try:
+            if not self._driver_is_usable(driver):
+                self._emit_direct(
+                    gui_callback,
+                    f"\U0001f6ab7 {phone}: browser session is dead — skipping this round "
+                    "so the driver can be rebuilt cleanly.")
+                return False
+        except Exception:
+            pass
         for _attempt in range(2):
             live = False
             try:
@@ -2585,13 +3593,78 @@ return m ? m[0] : '';
                                                 gui_callback=gui_callback):
                 return {"status": "error",
                         "message": "Account session could not be re-established"}
+            # ── PRE-SLIP LOGIN GATE (owner rule) ───────────────────────────
+            # Nothing may be crawled, researched or slipped until the wallet API
+            # proves THIS browser owns a live session on THIS account. The SPA's
+            # logged="1" attribute stays set after the server kills the token, so
+            # it is not proof — the wallet probe is. When the book reports
+            # "User logged from another device" we click Okay and re-login in a
+            # bounded loop instead of crawling a session that cannot bet.
+            # Anchor to the SPA games page FIRST so the probe's relative
+            # /api/wallets/balance request actually resolves; probing a stale or
+            # error page would time out and degrade to the weak DOM fallback.
+            _gate_ok = False
+            # BACKOFF RESPECT (2026-10-05): the gate must not start its 3
+            # dismiss+logout+login cycles while this account is already in a
+            # login cooldown. Doing so re-created the exact thrash the backoff
+            # exists to stop — one stuck account still burned 3 fresh login POSTs
+            # per round, which is what kept it permanently wedged (0 bets in 52
+            # minutes while the other account placed 3). If we are cooling down,
+            # decline this round immediately and let the session settle.
+            _bo = getattr(self, "_auth_backoff", {}) or {}
+            _bo_until = float(_bo.get(str(phone or "")) or 0.0)
+            if _bo_until > time.time():
+                self._emit_direct(
+                    gui_callback,
+                    f"⏸️ {phone}: login in cooldown "
+                    f"({int((_bo_until - time.time()) / 60) + 1} min left) — skipping this "
+                    "round rather than superseding our own session again.")
+                return {"status": "skipped", "skipped": True,
+                        "message": "login cooldown active — round skipped by design"}
+            for _try in range(3):
+                # Re-anchor to the games page on EVERY attempt, not just the
+                # first. `_logout_current_session` leaves the SPA on a
+                # logged-out route, where the relative /api/wallets/balance
+                # probe cannot resolve — so probing there degraded to the weak
+                # DOM fallback and could never confirm, even after a perfectly
+                # good re-login. That is what made the gate burn all 3 attempts
+                # and skip the round.
+                try:
+                    self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                    time.sleep(0.8)
+                except Exception:
+                    pass
+                if self._confirm_session_ready(driver, phone, password,
+                                                gui_callback=gui_callback):
+                    _gate_ok = True
+                    break
+                self._emit_direct(
+                    gui_callback,
+                    f"🔐 PRE-SLIP LOGIN GATE failed ({_try + 1}/3) — dismissing any "
+                    f"'logged in elsewhere' prompt and re-logging in.")
+                try:
+                    self._dismiss_foreign_session_prompt(driver)
+                except Exception:
+                    pass
+                try:
+                    self._logout_current_session(driver)
+                except Exception:
+                    pass
+                # Let the old session actually die on the server before we
+                # present new credentials. Re-submitting instantly races the
+                # teardown and the book answers "another device" again.
+                time.sleep(4)
+                try:
+                    self._hard_spa_login(driver, phone, password,
+                                         gui_callback=gui_callback, force=True)
+                except Exception:
+                    pass
+                time.sleep(2)
+            if not _gate_ok:
+                return {"status": "skipped", "skipped": True,
+                        "message": "PRE-SLIP LOGIN GATE: could not confirm a live "
+                                   "session on this account after 3 attempts"}
             self._close_stray_tabs(driver)
-            # Anchor to the main games page so the wallet header / API is reachable.
-            try:
-                self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
-                time.sleep(0.8)
-            except Exception:
-                pass
 
             # FRESH SLIP EVERY ROUND (owner rule): the betslip panel is persistent
             # across navigation. If the previous round died on a suspended/removed
@@ -2727,6 +3800,23 @@ return m ? m[0] : '';
             # Risk manager and compounding are disabled: the owner wants KES 10
             # minimum always, no automatic increases.
             stake = max(self.MIN_STAKE, float(stake))
+            # DRAWDOWN RECOVERY MODE (2026-10-05). The breaker ALLOWED this
+            # round, but only because the account is frozen-but-recovering: it
+            # has to be able to win its way back over the threshold, so the
+            # stake is cut rather than the account being allowed full size.
+            # Without this the freeze is a deadlock (see the latch-recovery
+            # comment in _circuit_breaker_check).
+            try:
+                if (getattr(self, "_recovery_mode", None) or {}).get(str(phone)):
+                    stake = max(self.MIN_STAKE,
+                                round(stake * self.DRAWDOWN_RECOVERY_STAKE_PCT, 2))
+                    self._emit_direct(
+                        gui_callback,
+                        f"💠 {phone}: DRAWDOWN RECOVERY MODE — stake reduced to "
+                        f"KES {stake:,.2f} until the balance climbs back above "
+                        f"the -{self.ACCOUNT_DRAWDOWN_FREEZE:.0%} drawdown limit.")
+            except Exception:
+                pass
 
             # Effective pool: waived automatically when balance is low so the
             # savings reserve never blocks a legitimate KES 10 bet.
@@ -2964,6 +4054,12 @@ return { real: real, h: h };
             # (owner rule 2026-09: no match repeats today across ANY number) — so
             # the first account to place a game owns it and the others pick fresh
             # ones, while still being free to exploit MANY markets per game.
+            # Keep the pre-slice full board so a slice that fails to build a
+            # combo can widen to the whole board (owner rule: "make sure ALL the
+            # accounts get games") — the fix for account-2 starvation, where one
+            # account's gid-parity slice held only suspended fixtures and every
+            # round died with "No accumulator combination found".
+            _full_playable = list(playable)
             if not board_wide:
                 try:
                     with self._used_lock:
@@ -3042,6 +4138,23 @@ return { real: real, h: h };
                 for mk_val in (mks or {}):
                     used_games.add(f"{gid_key}|{mk_val}")   # finer legacy net
 
+            # CORRELATION-AWARE DRAFTING (2026-09-30): games sitting on a sibling
+            # account's ACTIVE slip can't be drafted by this account either — the
+            # hard _correlation_verdict would refuse the whole slip at submit time.
+            # Bet-flow imports happen at startup, so `_game_owners` (set during
+            # THIS session's slice logic) and `_used_games` are often cold and the
+            # full-board fallback keeps picking a sibling's match, sees
+            # "correlation: game X is already held" and dies for the round. Feed
+            # the live exposure map in as used-games so a draft can never even try.
+            try:
+                _exp_held = self._active_exposure().get("games") or {}
+                _phx = str(phone or "")
+                for _gid, _owner_set in _exp_held.items():
+                    if _owner_set - {_phx}:
+                        used_games.add(str(_gid))
+            except Exception:
+                pass
+
             # Double-chance pre-flight: read real DC (1X/X2/12) odds off the
             # full-market page of near-kickoff games so DC legs are selectable
             # even when the opportunity scout has not visited them.
@@ -3091,6 +4204,45 @@ return { real: real, h: h };
                     conf_floor=conf_floor, no_odds_cap=no_odds_cap,
                     researched_only=researched_only,
                     gui_callback=gui_callback)
+            if not legs and _full_playable and len(_full_playable) > len(playable):
+                # ACCOUNT-STARVATION FIX (2026-09-30): the account's own gid-parity
+                # slice came back empty (e.g. its fixtures were all suspended, or
+                # the suspend-bench cleared them after repeated "Not valid" reject-
+                # ions). Draft instead from the FULL board — the global used_set
+                # still blocks games wagered on any number today, and _game_owners
+                # stops a sibling re-using the same match — so a thin account gets
+                # a real chance instead of sitting out round after round while the
+                # board sits open. This is exactly what the adaptive-slice comment
+                # above promised but never delivered: it checked raw game count,
+                # not qualifying legs, so it never fired when it mattered.
+                # Re-apply the owner block at use-time so a sibling's freshly-claimed
+                # match can never slip into this account's fallback draft.
+                try:
+                    _own2 = getattr(self, "_game_owners", None) or {}
+                    _pg2 = str(phone or "")
+                    _blocked2 = {_gid for _gid, _o in _own2.items() if _o != _pg2}
+                    if _blocked2:
+                        _full_playable = [g for g in _full_playable
+                                          if str(g.get("id") or "") not in _blocked2]
+                except Exception:
+                    pass
+                self._emit_direct(gui_callback,
+                                  f"🔀 {phone}: own slice had no qualifying combo "
+                                  f"— drafting from the full board ({len(_full_playable)} games)...")
+                legs, product = self._select_football_legs(
+                    _full_playable,
+                    target_min=target_min, target_max=target_max,
+                    odds_cap=odds_cap, max_legs=max_legs, min_legs=min_legs,
+                    used=used_games,
+                    prefer_more_legs=prefer_more_legs,
+                    seed=jitter_seed,
+                    conf_floor=conf_floor, no_odds_cap=no_odds_cap,
+                    researched_only=researched_only,
+                    gui_callback=gui_callback)
+                if legs:
+                    self._emit_direct(gui_callback,
+                                      f"✅ {phone}: full-board draft yielded "
+                                      f"{len(legs)} leg(s) @ x{round(product, 2)}")
             if not legs:
                 self._emit_direct(gui_callback,
                                   "⚠️ Not enough qualifying games this round — re-crawling shortly.")
@@ -3175,6 +4327,18 @@ return { real: real, h: h };
                 _g = leg_by_gid.get(str(gid))
                 kf = _g.get("ko_label") if _g else ""
                 _start = _g.get("start") if _g else None
+                # DATE-AWARE KICKOFF (2026-10-05). ko_label carries only HH:MM,
+                # so a match at 21:00 TOMORROW printed exactly like one at 21:00
+                # today - which reads as "already under way" and sent this whole
+                # investigation down the wrong path. The leg was correctly
+                # playable; only the log lied. Show the weekday+day whenever the
+                # kick-off is not today.
+                if _start is not None:
+                    try:
+                        if _start.date() != datetime.now().date():
+                            kf = f"{_start.strftime('%a %d %b')} {_start.strftime('%H:%M')}"
+                    except Exception:
+                        pass
                 k_end = self._ko_end_hhmm(_start)
                 drift = self._drift_k(gid, market, o)
                 d_mark = f" | drift {'▲' if drift > 1.005 else ('▼' if drift < 0.995 else '＝')}x{drift:.2f}"
@@ -3238,14 +4402,21 @@ return { real: real, h: h };
             _fleet_total += float(balance or 0.0)
             sized = self._kelly_stake(phone, balance, joint_prob, product, _fleet_total)
             if sized <= 0:
-                self._count_refusal("kelly says no edge")
-                self._emit_direct(gui_callback,
-                                  f"⛔ Kelly: joint {joint_prob*100:.1f}% @ x{product:.2f} has no "
-                                  "positive edge at 1/5 Kelly — skipping this slip entirely.")
-                return {"status": "skipped", "skipped": True,
-                        "kelly_blocked": True,
-                        "message": "Kelly: no positive edge",
-                        "kelly_blocked": True}
+                # OWNER decision (2026-09-29, FIRST-BET TEST): a joint prob that
+                # doesn't clear the positive-edge line at 1/5 Kelly USED TO SKIP
+                # the slip entirely ("no positive edge") — which froze the machine
+                # on every healthy-looking board (asteady 2-3 leg slips ~x2.5-3.0
+                # with ~33-37% pooled prob = ~0.92-0.94 EV, just under the line).
+                # While the FIRST-BET TEST is on, Kelly only floors: no-edge ->
+                # MIN stake instead of $0, so the tool actually bets. The
+                # downstream gates (bankroll share, SLIP_MIN_EV, MIN_STAKE) still
+                # bind hard, so a no-edge slip is ALWAYS capped to the minimum.
+                # REVISIT once the first real bet has landed and we re-tighten.
+                self._emit_direct(
+                    gui_callback,
+                    f"🎲 Kelly: joint {joint_prob*100:.1f}% @ x{product:.2f} has no "
+                    f"positive edge at 1/5 Kelly — TEST MODE floors it to MIN stake.")
+                sized = self.MIN_STAKE
             self._emit_direct(gui_callback,
                               f"📐 Kelly stake: KES {sized:,.2f} (joint {joint_prob*100:.1f}% "
                               f"@ x{product:.2f}, 1/{int(round(1/self.KELLY_FRACTION))} Kelly, "
@@ -3358,10 +4529,37 @@ return { real: real, h: h };
                         "correlation_blocked": "correlation" in _gate_why,
                         "recipe_vetoed": "vetoed recipe" in _gate_why}
             for rebuild_round in range(1, 4):
+                # A rebuild cannot fix a dead session: the token was rejected by
+                # the server, so reselecting legs just repeats the same 403 on a
+                # doomed token. _open_betslip_and_place parks the account when it
+                # cannot recover, so stop the loop instead of burning two more
+                # full crawls against a book that has already refused us.
+                try:
+                    if str(phone) in (getattr(self, "_parked_until", {}) or {}):
+                        self._emit_direct(
+                            gui_callback,
+                            f"🅿️ {phone}: account is parked after a session rejection — "
+                            f"skipping rebuild #{rebuild_round} (a new slip cannot fix "
+                            f"a dead token).")
+                        break
+                except Exception:
+                    pass
+                # Publish the odds floor this round insists on so the place step can
+                # refuse a slip the site degraded below it (see the ODDS FLOOR
+                # check inside _open_betslip_and_place). Set immediately before
+                # the call and cleared after, so it can never leak across rounds.
+                try:
+                    self._active_odds_floor = float(target_min)
+                except Exception:
+                    self._active_odds_floor = 0.0
                 res = self._open_betslip_and_place(driver, stake, phone, password,
                                                    gui_callback=gui_callback,
                                                    before_balance=balance,
                                                    legs=used_legs)
+                try:
+                    self._active_odds_floor = 0.0
+                except Exception:
+                    pass
                 if isinstance(res, bool) and res:
                     placed = True
                     break
@@ -3374,13 +4572,60 @@ return { real: real, h: h };
                 if self._clear_betslip(driver, gui_callback=gui_callback):
                     self._emit_direct(gui_callback,
                                       "  🧹 Cleared the persistent betslip before rebuild.")
+                # STACKING GUARD (2026-09-30): a best-effort clear that returned
+                # False leaves the old selections in the slip, and clicking the
+                # rebuild's fresh legs stacks onto them (3 → 6 → 8) — exactly the
+                # dead "Not valid" loop seen on the account-2 rebuild. If the slip
+                # is NOT genuinely empty now, do not click: hand back cleanly so
+                # the worker re-crawls a fresh page where removal buttons answer.
+                try:
+                    _leftover = self._read_betslip_count(driver) or 0
+                except Exception:
+                    _leftover = 0
+                if int(_leftover or 0) > 0:
+                    self._emit_direct(
+                        gui_callback,
+                        f"  ⚠️ Slip not empty after clear ({_leftover} leftover) — "
+                        "refusing to stack rebuild legs on it; moving on.")
+                    return {"status": "skipped", "skipped": True,
+                            "message": f"could not clear the persistent slip ({_leftover} leftover)"}
                 # Rebuild: only games still kicking off with runway, and none used before
+                # ACCOUNT-STARVATION FIX (2026-09-30): this was the LAST hole. The
+                # initial draft can now widen to the full board, but if own-slice
+                # picks suspend MID-SUBMIT the rebuild re-selected only from the
+                # narrowed slice — thin accounts looped "Bet not placed" forever with
+                # plenty of fresh games sitting on the full board. Widen the same way
+                # the initial draft does: own slice first, full board (minus the owner
+                # rule) if the slice comes up short.
                 now = datetime.now()
-                remaining_playable = [
+                _slice_fresh = [
                     g for g in playable
                     if str(g.get("id")) not in used_ids and g.get("start")
                     and ((g["start"] - now).total_seconds() / 60.0) >= min_lead_minutes
                 ]
+                _pool_fresh = _slice_fresh
+                if len(_slice_fresh) < max(int(max_legs) * 2, 6) and _full_playable:
+                    try:
+                        _own2 = getattr(self, "_game_owners", None) or {}
+                        _pg2 = str(phone or "")
+                        _full_playable = [g for g in _full_playable
+                                          if str(g.get("id") or "") not in
+                                          {_gid for _gid, _o in _own2.items() if _o != _pg2}]
+                    except Exception:
+                        pass
+                    _full_fresh = [
+                        g for g in _full_playable
+                        if str(g.get("id")) not in used_ids and g.get("start")
+                        and ((g["start"] - now).total_seconds() / 60.0) >= min_lead_minutes
+                    ]
+                    if len(_full_fresh) > len(_slice_fresh):
+                        self._emit_direct(
+                            gui_callback,
+                            f"🔀 {phone}: rebuild widening from own slice "
+                            f"({len(_slice_fresh)} fresh) to the full board "
+                            f"({len(_full_fresh)} fresh)...")
+                        _pool_fresh = _full_fresh
+                remaining_playable = _pool_fresh
                 self._emit_direct(gui_callback,
                                   f"🔁 Rebuild #{rebuild_round}: reselecting from "
                                   f"{len(remaining_playable)} fresh upcoming games...")
@@ -4063,7 +5308,16 @@ return { real: real, h: h };
                             and not str(b.get("status", "")).startswith("shadow"))
                         _phones = list((self._engine_state or {}).get("phones") or [])
                         _pw     = str((self._engine_state or {}).get("password") or "")
-                        if not _workers_running and _phones and _pw:
+                        # The bet workers sleep through the daily-cap hold
+                        # (an hours-long wait inside their own thread), so
+                        # "no workers alive" is the wrong test for "safe to
+                        # sync" - measured 2026-10-14: the whole hold window
+                        # went unsettled and the learning journal wrote an
+                        # empty day. The adapter sets cap_hold while it holds;
+                        # holding means no browser is open, so the sync is
+                        # safe exactly then.
+                        _holding = bool((self._engine_state or {}).get("cap_hold"))
+                        if (not _workers_running or _holding) and _phones and _pw:
                             now_h = datetime.now().hour
                             now_m = datetime.now().minute
                             # 1) Check active bet results
@@ -4306,8 +5560,72 @@ return { real: real, h: h };
         with self._driver_lock:
             return self._worker_drivers.get(str(phone))
 
-    def _set_account_driver(self, phone, driver):
+    def _borrow_account_browser(self, phone, gui_callback=None, **build_kw):
+        """Get a browser for `phone` WITHOUT ever creating a second session.
+
+        Returns ``(driver, owned)``. If this account already has a live browser,
+        that browser is reused and ``owned`` is False — the caller must NOT quit
+        it. Only when the account has no browser does one get built (and then
+        ``owned`` is True, so the caller must clean it up).
+
+        Background jobs (bet history, winnings sync, jackpot scan, pre-window
+        research, market sweep) used to open their OWN headless browser and log
+        the account in again, which is exactly what makes the book revoke the
+        first token. Reusing the account's single browser removes that whole
+        class of failure.
+        """
         phone = str(phone)
+        existing = self._account_driver(phone)
+        if existing is not None:
+            try:
+                if self._driver_is_usable(existing):
+                    return existing, False
+            except Exception:
+                pass
+        # No live browser for this account: take exclusive ownership and build one.
+        drv = self._build_driver(gui_callback=gui_callback, phone=phone, **build_kw)
+        return self._set_account_driver(phone, drv), True
+
+    def _set_account_driver(self, phone, driver):
+        """Register *driver* as the ONE browser for *phone*.
+
+        This is the single claim point for account ownership. Claiming here (not
+        at build time) keeps claim and release exactly paired: a preloaded driver
+        adopted for an account gets claimed on adoption, and every exit path
+        releases via _cleanup_driver/_quit_bet_driver. If the account already has
+        a different live browser, the existing one is returned instead — two
+        browsers on one account is the 403 "logged in from another device" bug.
+        """
+        phone = str(phone)
+        with self._driver_lock:
+            cur = self._worker_drivers.get(phone)
+        if cur is not None and cur is not driver:
+            try:
+                if self._driver_is_usable(cur):
+                    return cur
+            except Exception:
+                pass
+        acct = getattr(driver, "_sportsape_account", None)
+        if acct != phone:
+            if acct:
+                try:
+                    _release_account_session(acct)
+                except Exception:
+                    pass
+            try:
+                if not _acquire_account_session(phone):
+                    _who = _account_session_holder(phone)
+                    raise RuntimeError(
+                        f"account {phone} is owned by another process "
+                        f"(pid {_who.get('pid')})")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+            try:
+                driver._sportsape_account = phone  # type: ignore[attr-defined]
+            except Exception:
+                pass
         with self._driver_lock:
             self._worker_drivers[phone] = driver
         return driver
@@ -4320,6 +5638,354 @@ return { real: real, h: h };
 
 \
     _PROFILE_PREFIX = "sportsape_chrome_"
+
+    @staticmethod
+    def _proc_creation_epoch(rows, pid):
+        """CreationDate (as epoch seconds) for `pid` from a Win32_Process JSON
+        row set, or None when unavailable. WMI reports this as a string, so we
+        accept both the '...Z' ISO form and a PS datetime string."""
+        for rec in rows or []:
+            try:
+                if int(rec.get("ProcessId") or 0) != int(pid):
+                    continue
+            except Exception:
+                continue
+            raw = rec.get("CreationDate") or rec.get("creationdate")
+            if not raw:
+                return None
+            try:
+                import datetime as _dt
+                s = str(raw).strip()
+                if s.endswith("Z"):
+                    s = s[:-1]
+                # /Date(1700000000000)/ form
+                if s.startswith("/Date("):
+                    import re as _re
+                    m = _re.search(r"/Date\((-?\d+)", s)
+                    return int(m.group(1)) / 1000.0 if m else None
+                for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                            "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                    try:
+                        return _dt.datetime.strptime(s, fmt).timestamp()
+                    except ValueError:
+                        continue
+            except Exception:
+                return None
+            return None
+        return None
+
+    def _reap_stale_chromedrivers(self, gui_callback=None) -> dict:
+        """Kill chromedriver.exe processes that belong to this tool but no longer
+        own a live browser (2026-10-05).
+
+        WHY THIS EXISTS. The original ownership probe could only prove a driver
+        was ours by finding a surviving chrome.exe child that carries our
+        temp-profile marker. A driver whose browser has been replaced or crashed
+        has NO chrome child at all, so it could never be proven ours — and the
+        conservative sweep then spared it FOREVER. The tool rebuilds a browser
+        whenever one dies, so every rebuild leaked a driver. Measured on a live
+        run: 16 chromedriver processes for 2 browsers, 14 of them orphans,
+        each holding a port and burning CPU. That is what sent the fans wild.
+
+        IDENTIFICATION (two independent signals, both required, so we still
+        never touch another tool's driver):
+          1. the process runs from the Selenium manager cache, AND
+          2. it is NOT one of our currently-live drivers, AND
+          3. it owns no chrome child carrying our profile marker.
+        An old driver from some other automation tool would also satisfy (1),
+        but it would still own its own chrome children and is never in our live
+        set, so in practice we only reap our own leftovers. To stay strictly
+        conservative we additionally require the driver to be older than
+        `min_age_s`, which gives a driver that is mid-boot time to attach.
+        """
+        import subprocess as _sp
+        import time as _t
+        min_age_s = 180.0
+        try:
+            r = _sp.run(
+                "powershell -NoProfile -NonInteractive -Command "
+                "\"Get-CimInstance Win32_Process | Where-Object { $_.Name -in "
+                "@('chromedriver.exe','chrome.exe') } | Select-Object Name, "
+                "ProcessId, ParentProcessId, ExecutablePath, CommandLine, "
+                "CreationDate | ConvertTo-Json -Compress\"",
+                capture_output=True, text=True, timeout=40, shell=True)
+        except Exception:
+            return {"killed": 0, "skipped": "probe failed"}
+        import json as _json
+        try:
+            rows = _json.loads((r.stdout or "").strip() or "[]")
+            if isinstance(rows, dict):
+                rows = [rows]
+        except Exception:
+            return {"killed": 0, "skipped": "unparseable probe"}
+
+        # PIDs of drivers we are actively using right now — never touch these.
+        live = set()
+        try:
+            for d in self._worker_drivers.values():
+                pr = getattr(getattr(d, "service", None), "process", None)
+                if pr is not None and getattr(pr, "pid", None):
+                    live.add(int(pr.pid))
+        except Exception:
+            pass
+
+        marker = self._PROFILE_PREFIX
+        chrome_by_parent = {}
+        # EVERY chrome parent, ours or not (2026-10-16, see the safety note
+        # below): a driver attached to somebody else's browser is just as
+        # "in use" as one attached to ours.
+        chrome_parents_any = set()
+        drivers = []
+        for rec in rows or []:
+            try:
+                pid = int(rec.get("ProcessId") or 0)
+                ppid = int(rec.get("ParentProcessId") or 0)
+            except Exception:
+                continue
+            name = (rec.get("Name") or "").lower()
+            if name == "chrome.exe":
+                chrome_parents_any.add(ppid)
+                if marker in (rec.get("CommandLine") or ""):
+                    chrome_by_parent.setdefault(ppid, []).append(pid)
+            elif name == "chromedriver.exe":
+                drivers.append((pid, ppid, rec.get("ExecutablePath") or ""))
+
+        # SAFETY (2026-10-05): a driver that still OWNS a live chrome carrying
+        # our profile marker is in use and must NEVER be reaped — even if this
+        # process has no handle on it. My first version protected only the PIDs
+        # in self._worker_drivers, which are invisible when the reaper is called
+        # from another process (or after a driver was re-registered); it then
+        # killed every driver including the live ones and broke the engine's
+        # ability to place bets. Ownership of our own chrome is the real proof
+        # of life, so that is what gates the kill.
+        for drv_pid, _ppid, _exe in drivers:
+            if chrome_by_parent.get(drv_pid):
+                live.add(drv_pid)
+
+        # SAFETY (2026-10-16, owner request "closing the tool must not alter
+        # the user's browser"): the rule above only protected drivers that own
+        # OUR profile marker. A driver belonging to somebody ELSE's automation
+        # owns chrome.exe children too, but they carry no marker - so this
+        # reaper happily killed their chromedriver 180s after they launched it,
+        # taking their browser session out from under them. Every chromedriver
+        # runs from the SAME selenium cache, so the exe path cannot tell the
+        # two apart. The decisive signal is use: a driver with any live chrome
+        # child is attached to a browser that is in use, whoever owns it.
+        anyone_parent = chrome_parents_any
+        for drv_pid, _ppid, _exe in drivers:
+            if drv_pid in anyone_parent:
+                live.add(drv_pid)
+
+        if not drivers:
+            return {"killed": 0, "skipped": "no chromedriver found"}
+
+        killed, spared = 0, []
+        for pid, _ppid, exe in drivers:
+            if pid in live:
+                continue
+            if marker not in (exe or "").lower() and \
+               "selenium" not in (exe or "").lower():
+                # Not launched from the Selenium cache — not provably ours.
+                spared.append(pid)
+                continue
+            # Age gate: never reap a driver young enough to still be booting.
+            try:
+                created = self._proc_creation_epoch(rows, pid)
+                if created and (_t.time() - created) < min_age_s:
+                    spared.append(pid)
+                    continue
+            except Exception:
+                pass
+            try:
+                _sp.run(["taskkill", "/PID", str(pid), "/F"],
+                        capture_output=True, timeout=15)
+                killed += 1
+            except Exception:
+                spared.append(pid)
+        if killed:
+            self._emit_direct(
+                gui_callback,
+                f"\U0001f9f9 Reaped {killed} stale chromedriver process(es) "
+                f"(no live browser) — frees CPU/RAM; {len(spared)} spared.")
+        return {"killed": killed, "spared": spared, "live": sorted(live)}
+
+    def _reap_orphaned_chrome(self, gui_callback=None) -> dict:
+        """Kill chrome.exe processes running on OUR temp profile whose
+        chromedriver parent is gone (2026-10-05).
+
+        WHY THIS EXISTS. _reap_stale_chromedrivers cleans up the opposite case -
+        a driver with no browser. This handles a browser with no driver: when
+        chromedriver is killed or crashes, its chrome children SURVIVE. Nobody
+        can drive that browser any more, yet it keeps running, keeps its
+        SportPesa session alive, and keeps its own token current.
+
+        That is not just wasted CPU. A live orphan means TWO browsers for one
+        account, and each one's login mints a token that invalidates the other.
+        Measured on a live run: 3 live browsers for 2 accounts, and an account
+        that logged in successfully at 23:06:23 was told "logged in from
+        another device" six seconds later with no other account logging in at
+        all. The engine then burned its whole round re-authenticating and
+        placed nothing.
+
+        IDENTIFICATION (strict, so the user's own Chrome is never touched):
+          1. the command line carries our sportsape_chrome_ profile marker, AND
+          2. its parent process is no longer a live chromedriver.
+        Personal Chrome shares no marker and is excluded by (1) alone.
+        """
+        import subprocess as _sp
+        try:
+            r = _sp.run(
+                "powershell -NoProfile -NonInteractive -Command "
+                "\"Get-CimInstance Win32_Process | Where-Object { $_.Name -in "
+                "@('chromedriver.exe','chrome.exe') } | Select-Object Name, "
+                "ProcessId, ParentProcessId, CommandLine | ConvertTo-Json -Compress\"",
+                capture_output=True, text=True, timeout=40, shell=True)
+        except Exception:
+            return {"killed": 0, "skipped": "probe failed"}
+        import json as _json
+        try:
+            rows = _json.loads((r.stdout or "").strip() or "[]")
+            if isinstance(rows, dict):
+                rows = [rows]
+        except Exception:
+            return {"killed": 0, "skipped": "unparseable probe"}
+
+        marker = self._PROFILE_PREFIX
+        live_driver_pids, chrome_rows = set(), []
+        for rec in rows or []:
+            try:
+                pid = int(rec.get("ProcessId") or 0)
+                ppid = int(rec.get("ParentProcessId") or 0)
+            except Exception:
+                continue
+            name = (rec.get("Name") or "").lower()
+            if name == "chromedriver.exe":
+                live_driver_pids.add(pid)
+            elif name == "chrome.exe":
+                chrome_rows.append((pid, ppid, rec.get("CommandLine") or ""))
+
+        # A chromedriver's children may be re-parented, so also treat any pid
+        # that IS a currently-live driver of ours as "owned".
+        owned = set()
+        try:
+            for d in self._worker_drivers.values():
+                pr = getattr(getattr(d, "service", None), "process", None)
+                if pr is not None and getattr(pr, "pid", None):
+                    owned.add(int(pr.pid))
+        except Exception:
+            pass
+        live_driver_pids |= owned
+
+        killed, spared, accounts = 0, [], set()
+        for pid, ppid, cmd in chrome_rows:
+            if marker not in cmd:
+                continue                      # not ours -> never touch
+            if ppid in live_driver_pids:
+                continue                      # its driver is alive -> healthy
+            # The profile name carries the phone, so we can say which account
+            # was being fought over.
+            try:
+                m = re.search(re.escape(marker) + r"(\d*)_", cmd)
+                if m and m.group(1):
+                    accounts.add(m.group(1))
+            except Exception:
+                pass
+            try:
+                _sp.run(["taskkill", "/PID", str(pid), "/F"],
+                        capture_output=True, timeout=15)
+                killed += 1
+            except Exception:
+                spared.append(pid)
+        if killed:
+            who = (" for " + ", ".join(sorted(accounts))) if accounts else ""
+            self._emit_direct(
+                gui_callback,
+                f"  \U0001f9d9 Reaped {killed} orphaned browser process(es){who} "
+                f"(profile with no live chromedriver) — these held stale "
+                f"sessions that invalidate our own login; {len(spared)} spared.")
+        return {"killed": killed, "spared": spared, "accounts": sorted(accounts)}
+
+    def _kill_duplicate_browsers_for_account(self, phone: str,
+                                            keep_profile: str = None,
+                                            gui_callback=None) -> int:
+        """Enforce AT MOST ONE live browser per account.
+
+        WHY THIS IS NEEDED ON TOP OF THE ORPHAN SWEEP. An orphan is a browser
+        whose chromedriver is gone. The observed failure was different: a live
+        browser with a live chromedriver that the registry had already stopped
+        tracking, so the orphan sweep correctly spared it. Measured profiles:
+        `0798810080` running TWO browsers at once. Two live browsers on one
+        account each mint a token that kills the other's, so the account logs
+        in successfully and is then told "logged in from another device" - and
+        the round is spent re-authenticating instead of betting.
+
+        We therefore clear every chrome process running on one of THIS account's
+        profiles, except the profile we are about to keep. Safety: the path must
+        carry our `sportsape_chrome_` marker AND the account's digits, so no
+        other account's browser and no personal Chrome can match.
+        """
+        import subprocess as _sp
+        tag = "".join(ch for ch in str(phone or "") if ch.isdigit())[:12]
+        if not tag:
+            return 0
+        # THROTTLE, BEFORE THE QUERY (2026-10-05). This method shells out to a
+        # CIM process query, which costs real time on a machine running 20+
+        # chrome processes. Called unthrottled from the browser-build hot path
+        # it stalled the workers badly enough for Fibi to report an engine
+        # stall. One sweep per account per 60s is ample, because duplicates are
+        # created by rebuilds rather than continuously.
+        _now = time.time()
+        _seen = getattr(self, "_dup_sweep_at", None)
+        if not isinstance(_seen, dict):
+            _seen = {}
+            self._dup_sweep_at = _seen
+        if _now - _seen.get(tag, 0.0) < 60.0:
+            return 0
+        _seen[tag] = _now
+        marker = self._PROFILE_PREFIX
+        want = f"{marker}{tag}_"
+        keep = os.path.normcase(os.path.abspath(keep_profile)) if keep_profile else None
+        try:
+            r = _sp.run(
+                "powershell -NoProfile -NonInteractive -Command "
+                "\"Get-CimInstance Win32_Process -Filter \\\"Name='chrome.exe'\\\" | "
+                "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress\"",
+                capture_output=True, text=True, timeout=40, shell=True)
+        except Exception:
+            return 0
+        import json as _json
+        try:
+            rows = _json.loads((r.stdout or "").strip() or "[]")
+            if isinstance(rows, dict):
+                rows = [rows]
+        except Exception:
+            return 0
+
+        killed = 0
+        for rec in rows or []:
+            try:
+                pid = int(rec.get("ProcessId") or 0)
+            except Exception:
+                continue
+            cmd = rec.get("CommandLine") or ""
+            # Two independent gates: our marker AND this exact account's tag.
+            if marker not in cmd or want not in cmd:
+                continue
+            if keep and keep in os.path.normcase(cmd):
+                continue
+            try:
+                _sp.run(["taskkill", "/PID", str(pid), "/F"],
+                        capture_output=True, timeout=15)
+                killed += 1
+            except Exception:
+                pass
+        if killed:
+            self._emit_direct(
+                gui_callback,
+                f"  \U0001f534 Cleared {killed} duplicate browser process(es) for "
+                f"{phone} — only ONE live browser may hold a session per account, "
+                f"and extras were invalidating our own login.")
+        return killed
 
     def _chromedriver__our_pids(self, live_pids: set = None) -> set:
         """Return the PIDs of chromedriver.exe processes that belong to THIS
@@ -4454,10 +6120,20 @@ return { real: real, h: h };
             drivers = list(self._worker_drivers.values())
             self._worker_drivers.clear()
         for d in drivers:
+            acct = getattr(d, "_sportsape_account", None)
             try:
                 d.quit()
             except Exception:
                 pass
+            if acct:
+                try:
+                    _release_account_session(acct)
+                except Exception:
+                    pass
+                try:
+                    d._sportsape_account = None
+                except Exception:
+                    pass
 
     def shutdown_all_browsers(self) -> int:
         """Quit EVERY browser this engine ever created, and nothing else.
@@ -4506,6 +6182,13 @@ return { real: real, h: h };
             pass
         try:
             self._bet_driver = None
+        except Exception:
+            pass
+        # Final sweep: any chrome still tagged with our temp-profile marker is
+        # an orphan from a crash. The user's own Chrome is excluded by the
+        # marker's profile-dir guard inside the reaper.
+        try:
+            reap_our_chrome()
         except Exception:
             pass
         try:
@@ -4938,6 +6621,17 @@ agent_cfg: dict = None,
 
         self._worker_cap_reached = cap_reached
         self._prev_stop_event = stop_event
+        # ── Startup sweep: clear any sportsape chrome orphaned by a previous
+        # crash before warming new browsers. Scoped to our own temp-profile
+        # marker, so the user's personal Chrome is never affected.
+        try:
+            _orphans = reap_our_chrome()
+            if _orphans:
+                self._emit_direct(gui_callback,
+                                  f"🧹 Cleaned {_orphans} orphaned chrome process(es) "
+                                  "from a previous session (user browser untouched).")
+        except Exception:
+            pass
         # ── Warm browsers BEFORE workers start (cold-start was causing
         # 45s renderer timeouts on first round). Each account gets its
         # own pre-heated session so the first crawl is instant.
@@ -4951,9 +6645,21 @@ agent_cfg: dict = None,
                         _drv = self._build_driver(gui_callback=gui_callback,
                                                   force_visible=cfg["visible"], mobile=False,
                                                   headless=cfg["headless"],
-                                                  capture_perf=False, minimize=True)
+                                                  capture_perf=False, minimize=True,
+                                                  phone=_wp)
                         self._set_account_driver(_wp, _drv)
-                        self._emit_direct(gui_callback, f"   ✅ {_wp} browser ready")
+                        # INDUSTRIAL-GRADE FIX (2026-10-04): verify the session
+                        # is actually live after warmup. A browser that "looks" ready
+                        # but has a dead token will fail every bet. Probe the wallet
+                        # API once here so we catch a dead session before the worker
+                        # starts betting.
+                        try:
+                            if self._session_is_live(_drv, deep_check=True):
+                                self._emit_direct(gui_callback, f"   ✅ {_wp} browser ready (session confirmed)")
+                            else:
+                                self._emit_direct(gui_callback, f"   ⚠️ {_wp} browser ready but session not live — will re-login on first bet")
+                        except Exception:
+                            self._emit_direct(gui_callback, f"   ✅ {_wp} browser ready")
                     except Exception as _we:
                         self._emit_direct(gui_callback, f"   ⚠️ warmup {_wp} failed: {str(_we)[:80]}")
             self._emit_direct(gui_callback, "🔥 All browsers warmed — starting workers...")
@@ -5115,6 +6821,18 @@ agent_cfg: dict = None,
                     f"ℹ Long-shot leg count {_requested_legs} reduced to "
                     f"{longshot_legs}: a slip can never carry more than "
                     f"{self.MAX_SLIP_LEGS_HARD} legs (MAX_SLIP_LEGS_HARD).")
+        # CRASHFIX (2026-10-04): the long-shot → normal-bet fallback below builds
+        # a SMART slip using max_legs / min_legs / conf_floor, but those three
+        # names were never assigned in this scope. Any round where a long-shot
+        # failed to qualify therefore died with
+        #   NameError: name 'max_legs' is not defined
+        # and the whole round was lost — logged as "round crashed (fail #1)".
+        # The path was unreachable while the long-shot block was disabled by
+        # `if False and longshot:`, which is exactly why the defect survived.
+        # Defaults mirror the normal SMART slip the worker builds every round.
+        max_legs = 4
+        min_legs = 2
+        conf_floor = None
         auto_withdraw = bool(cfg.get("auto_withdraw", True))
         withdraw_amount = float(cfg.get("withdraw_amount", 200) or 0)
         stake_percent = float(cfg.get("stake_percent") or 0.0)
@@ -5383,12 +7101,29 @@ agent_cfg: dict = None,
                 if driver is None:
                     self._emit_direct(gui_callback,
                                       f"🌐 ({active_phone}) opening stable browser session...")
+                    # Clear any browser left behind on one of our profiles whose
+                    # chromedriver has died, BEFORE opening the replacement. An
+                    # orphan is invisible to the driver registry (it has no live
+                    # driver object) but it is still logged in, and its session
+                    # will invalidate the one we are about to create - which is
+                    # how an account could log in successfully and be told
+                    # "logged in from another device" seconds later.
+                    try:
+                        self._reap_orphaned_chrome(gui_callback=gui_callback)
+                    except Exception:
+                        pass
+                    try:
+                        self._kill_duplicate_browsers_for_account(
+                            active_phone, gui_callback=gui_callback)
+                    except Exception:
+                        pass
                     driver = self._set_account_driver(
                         active_phone,
                         self._build_driver(gui_callback=gui_callback,
                                            force_visible=cfg["visible"], mobile=False,
                                            headless=cfg["headless"],
-                                           capture_perf=False, minimize=True))
+                                           capture_perf=False, minimize=True,
+                                           phone=active_phone))
                 elif not self._driver_is_usable(driver):
                     self._emit_direct(gui_callback,
                                       f"🔧 ({active_phone}) old browser died, rebuilding...")
@@ -5404,11 +7139,39 @@ agent_cfg: dict = None,
                         self._build_driver(gui_callback=gui_callback,
                                            force_visible=cfg["visible"], mobile=False,
                                            headless=cfg["headless"],
-                                           capture_perf=False, minimize=True))
+                                           capture_perf=False, minimize=True,
+                                           phone=active_phone))
                 else:
-                    if self._engine_state.get("force_driver_rebuild"):
+                    # FROZEN ACCOUNT: DO NOT CHURN ITS SESSION (2026-10-05). A
+                    # frozen account cannot place a bet, yet the supervisor still tore its
+                    # browser down and rebuilt it every ~90s, and every rebuild mints a
+                    # fresh token. Live log: "forced rebuild of 0798810080 session" three
+                    # times in four minutes for an account that cannot bet at all.
+                    #
+                    # That is not merely waste. If the book caps concurrent sessions per
+                    # client rather than per account, this endless re-authentication
+                    # invalidates the OTHER account's token - which is exactly what
+                    # followed: 0706719388 built a clean 2-leg x1.69 slip and the click
+                    # returned "POST /api/bets/place -> http403".
+                    #
+                    # We hold the existing browser (balance reads keep working) and stop
+                    # rebuilding. The freeze itself is NOT changed by this.
+                    _acct_frozen = False
+                    try:
+                        _pf_now = self._load_portfolio()
+                        _acct_frozen = bool((_pf_now.get("frozen") or {}).get(str(active_phone)))
+                    except Exception:
+                        _acct_frozen = False
+                    if self._engine_state.get("force_driver_rebuild") and _acct_frozen:
+                        self._engine_state.pop("force_driver_rebuild", None)
+                        self._emit_direct(
+                            gui_callback,
+                            f"\U0001f441 SUPERVISOR: rebuild of FROZEN {active_phone} SUPPRESSED "
+                            f"- it cannot bet, and re-minting its token every 90s was "
+                            f"invalidating the other account's session.")
+                    elif self._engine_state.get("force_driver_rebuild"):
                         self._emit_direct(gui_callback,
-                                          f"👁️ SUPERVISOR: forced rebuild of {active_phone} session.")
+                                          f"\U0001f441 SUPERVISOR: forced rebuild of {active_phone} session.")
                         self._engine_state.pop("force_driver_rebuild", None)
                         self._engine_state["driver_heals"] = int(self._engine_state.get("driver_heals", 0)) + 1
                         if self._agent_hub is not None:
@@ -5422,8 +7185,30 @@ agent_cfg: dict = None,
                             self._build_driver(gui_callback=gui_callback,
                                                force_visible=cfg["visible"], mobile=False,
                                                headless=cfg["headless"],
-                                               capture_perf=False, minimize=True))
+                                               capture_perf=False, minimize=True,
+                                               phone=active_phone))
                 # Eager login: confirm this account's session is live before crawling.
+                # INDUSTRIAL-GRADE FIX (2026-10-04): run a full health check first.
+                # This catches dead tokens, crashed browsers, and stale sessions
+                # before we try to bet — preventing the "another device" death spiral.
+                if not self._driver_health_check(driver, active_phone, password, gui_callback=gui_callback):
+                    # Driver is dead — rebuild it
+                    self._emit_direct(gui_callback,
+                                      f"🔧 ({active_phone}) driver health check failed — rebuilding browser...")
+                    self._engine_state["driver_heals"] = int(self._engine_state.get("driver_heals", 0)) + 1
+                    if self._agent_hub is not None:
+                        try:
+                            self._agent_hub.supervisor.beat_driver_heal()
+                        except Exception:
+                            pass
+                    self._quit_bet_driver(driver)
+                    driver = self._set_account_driver(
+                        active_phone,
+                        self._build_driver(gui_callback=gui_callback,
+                                           force_visible=cfg["visible"], mobile=False,
+                                           headless=cfg["headless"],
+                                           capture_perf=False, minimize=True,
+                                           phone=active_phone))
                 self._ensure_bet_login(driver, active_phone, password, gui_callback=gui_callback)
                 if not self._session_is_live(driver):
                     for _try in range(2):
@@ -5469,12 +7254,68 @@ agent_cfg: dict = None,
                                           f"⚠️ Win-sync catch-up hiccup: {str(e)[:90]}")
                 self._emit_direct(gui_callback,
                                   f"⏱️ Crawl-and-bet attempt #{attempt} ({active_phone}) ...")
+                # ── CHEAP FROZEN-ACCOUNT PRE-CHECK (2026-10-05) ──────────
+                # The drawdown gate used to run only AFTER a full board crawl
+                # and a login gate. A frozen account therefore paid for a
+                # complete crawl every 5 minutes to be told the same thing:
+                # "account frozen: -47% from peak". Observed 38 times in 3
+                # hours, which is where the CPU went. The latch is already
+                # persisted, so we can answer from it for free and skip the
+                # crawl entirely.
+                # This does NOT change the risk limit - the freeze still
+                # applies and no bet is placed; we simply stop paying to
+                # discover it.
+                try:
+                    _pf = self._load_portfolio()
+                    if _pf.get("frozen", {}).get(str(active_phone)):
+                        self._emit_direct(
+                            gui_callback,
+                            f"⏸️ {active_phone}: account is frozen by the drawdown "
+                            f"breaker — skipping the board crawl entirely this round "
+                            f"(no risk change; the freeze stands).")
+                        self._engine_state["frozen_skips"] = int(
+                            self._engine_state.get("frozen_skips", 0)) + 1
+                        # Sleep the SAME interval the engine uses between
+                        # rounds (the "re-crawling in 300s" cadence). A short
+                        # sleep here produced a tight spin - "Crawl-and-bet
+                        # attempt #13..#19" every 30 s, all skipped instantly -
+                        # which burned CPU and buried the real log in noise.
+                        time.sleep(300.0)
+                        continue
+                except Exception:
+                    pass
                 # Governor overrides (whitelisted + clamped upstream) applied per round.
                 _gov_stake_percent = self._gov('stake_percent', stake_percent)
                 _gov_stake_cap = self._gov('stake_cap', stake_cap)
                 _gov_mll = self._gov('min_lead_minutes', 5.0)
                 _gov_oc = self._gov('odds_cap', 6.0)
                 _gov_pref_legs = bool(self._gov('prefer_more_legs', 0))
+                # DAILY LONG-SHOT / FISHNET SCHEDULING (2026-10-05). Both of these open a
+                # separate bet-schedule branch that replaces the normal SMART
+                # round. If the account is in a login cooldown they cannot
+                # succeed — the pre-slip gate will decline them — but they were
+                # still being attempted EVERY round (fishnet fired 4x on one
+                # stuck account), burning the round and flooding the log with
+                # retries that were doomed by construction. When an account is
+                # cooling down we defer these to the normal path and let the
+                # cooldown run.
+                _bo_active = bool(
+                    float((getattr(self, "_auth_backoff", {}) or {}).get(
+                        str(active_phone)) or 0.0) > time.time())
+                if _bo_active and (want_longshot or want_fishnet):
+                    self._emit_direct(
+                        gui_callback,
+                        f"⏸️ {active_phone}: deferring the "
+                        + ("long-shot" if want_longshot else "fishnet")
+                        + " ticket — this account is in a login cooldown.")
+                    want_longshot = False
+                    want_fishnet = False
+                    if self._agent_hub is not None:
+                        try:
+                            self._agent_hub.supervisor.beat_agent("risk")
+                        except Exception:
+                            pass
+
                 # Daily LONG-SHOT: TWO x15-x60 accumulators per day —
                 # first fires on the first qualifying round of the day,
                 # second fires after 18:00 on the first qualifying round that evening.
@@ -5544,7 +7385,7 @@ agent_cfg: dict = None,
                                           f"✅ {active_phone} SURE-SINGLE placed "
                                           f"({res.get('odd', '')}) — bankroll rolls over.")
                         continue
-                if False and longshot:
+                if longshot:
                     with self._sched_lock:
                         st = self._load_sched_state()
                         if st.get("date") != today:
@@ -5604,13 +7445,13 @@ agent_cfg: dict = None,
                     hour_now = datetime.now().hour
                     _pool = self._fishnet_pool_today()
                     _pool_ready = len(_pool) >= 4
-                    if False and (_fn_day != today and _pool_ready and (time.time() - _fn_pend) > 1800):
+                    if _fn_day != today and _pool_ready and (time.time() - _fn_pend) > 1800:
                         st["fishnet_pending_ts"] = time.time()
                         st["fishnet_which"] = 1
                         self._save_sched_state(st)
                         want_fishnet = True
-                    elif False and (_fn2_day != today and _pool_ready and (time.time() - _fn2_pend) > 1800 \
-                            and hour_now >= 18):
+                    elif _fn2_day != today and _pool_ready and (time.time() - _fn2_pend) > 1800 \
+                            and hour_now >= 18:
                         st["fishnet2_pending_ts"] = time.time()
                         st["fishnet_which"] = 2
                         self._save_sched_state(st)
@@ -5667,23 +7508,42 @@ agent_cfg: dict = None,
                                       f"{int(longshot_legs)}-leg "
                                       f"x{longshot_odds_min:g}-x{longshot_odds_max:g} ticket today")
                     longshot_odds_cap_v = float(longshot_odds_cap or 0)
-                    res = self._place_one_bet(driver, active_phone, password, stake=stake,
-                                              visible=cfg["visible"],
-                                              gui_callback=gui_callback,
-                                              target_odds_min=longshot_odds_min,
-                                              target_odds_max=longshot_odds_max,
-                                              odds_cap=longshot_odds_cap or 8.0,
-                                              max_legs=int(longshot_legs),
-                                              stake_percent=_gov_stake_percent,
-                                              stake_cap=_gov_stake_cap,
-                                              min_lead_minutes=_gov_mll,
-                                              prefer_more_legs=True,
-                                              board_wide=True,
-                                              reserve_pool=0,
-                                              jitter_seed=jitter_seed,
-                                              no_odds_cap=(longshot_odds_cap_v <= 0),
-                                              conf_floor=0.0,
-                                              researched_only=bool(longshot_odds_cap_v <= 0))
+                    try:
+                        res = self._place_one_bet(driver, active_phone, password, stake=stake,
+                                                  visible=cfg["visible"],
+                                                  gui_callback=gui_callback,
+                                                  target_odds_min=longshot_odds_min,
+                                                  target_odds_max=longshot_odds_max,
+                                                  odds_cap=longshot_odds_cap or 8.0,
+                                                  max_legs=int(longshot_legs),
+                                                  stake_percent=_gov_stake_percent,
+                                                  stake_cap=_gov_stake_cap,
+                                                  min_lead_minutes=_gov_mll,
+                                                  prefer_more_legs=True,
+                                                  board_wide=True,
+                                                  reserve_pool=0,
+                                                  jitter_seed=jitter_seed,
+                                                  no_odds_cap=(longshot_odds_cap_v <= 0),
+                                                  conf_floor=0.0,
+                                                  researched_only=bool(longshot_odds_cap_v <= 0))
+                    except Exception as _ls_exc:
+                        _ls_err = str(_ls_exc).lower()
+                        if "invalid session id" in _ls_err or "no such window" in _ls_err:
+                            self._emit_direct(gui_callback,
+                                              f"⚠️ {active_phone}: browser crashed during longshot — rebuilding driver")
+                            self._engine_state["driver_heals"] = int(self._engine_state.get("driver_heals", 0)) + 1
+                            self._quit_bet_driver(driver)
+                            driver = self._set_account_driver(
+                                active_phone,
+                                self._build_driver(gui_callback=gui_callback,
+                                                   force_visible=cfg["visible"], mobile=False,
+                                                   headless=cfg["headless"],
+                                                   capture_perf=False, minimize=True,
+                                                   phone=active_phone))
+                            self._ensure_bet_login(driver, active_phone, password, gui_callback=gui_callback)
+                            res = {"status": "error", "message": "driver rebuilt after crash"}
+                        else:
+                            raise
                 else:
                     if cfg.get("roll_over"):
                         # ROLL-OVER (owner rule): KES 50, exactly 3 legs, combined
@@ -5719,18 +7579,37 @@ agent_cfg: dict = None,
                         lo = max(float(self.MIN_COMBINED_ODDS),
                                  float(self._gov('target_odds_min', 0.0) or 0.0))
                         hi = max(lo, _hi)
-                        res = self._place_one_bet(driver, active_phone, password, stake=stake,
-                                                  visible=cfg["visible"],
-                                                  gui_callback=gui_callback,
-                                                  target_odds_min=lo, target_odds_max=hi,
-                                                  odds_cap=_gov_oc,
-                                                  max_legs=4,
-                                                  stake_percent=_gov_stake_percent,
-                                                  stake_cap=_gov_stake_cap,
-                                                  min_lead_minutes=_gov_mll,
-                                                  prefer_more_legs=False,
-                                                  reserve_pool=0,
-                                                  jitter_seed=jitter_seed)
+                        try:
+                            res = self._place_one_bet(driver, active_phone, password, stake=stake,
+                                                      visible=cfg["visible"],
+                                                      gui_callback=gui_callback,
+                                                      target_odds_min=lo, target_odds_max=hi,
+                                                      odds_cap=_gov_oc,
+                                                      max_legs=4,
+                                                      stake_percent=_gov_stake_percent,
+                                                      stake_cap=_gov_stake_cap,
+                                                      min_lead_minutes=_gov_mll,
+                                                      prefer_more_legs=False,
+                                                      reserve_pool=0,
+                                                      jitter_seed=jitter_seed)
+                        except Exception as _bet_exc:
+                            _bet_err = str(_bet_exc).lower()
+                            if "invalid session id" in _bet_err or "no such window" in _bet_err:
+                                self._emit_direct(gui_callback,
+                                                  f"⚠️ {active_phone}: browser crashed during bet — rebuilding driver")
+                                self._engine_state["driver_heals"] = int(self._engine_state.get("driver_heals", 0)) + 1
+                                self._quit_bet_driver(driver)
+                                driver = self._set_account_driver(
+                                    active_phone,
+                                    self._build_driver(gui_callback=gui_callback,
+                                                       force_visible=cfg["visible"], mobile=False,
+                                                       headless=cfg["headless"],
+                                                       capture_perf=False, minimize=True,
+                                                       phone=active_phone))
+                                self._ensure_bet_login(driver, active_phone, password, gui_callback=gui_callback)
+                                res = {"status": "error", "message": "driver rebuilt after crash"}
+                            else:
+                                raise
                 # A long-shot that didn't qualify on this account → try the other
                 # accounts before falling back to a normal bet.  This handles the
                 # common case where a game is suspended mid-placement on one account
@@ -6240,8 +8119,7 @@ agent_cfg: dict = None,
                     try:
                         import traceback as _tb
                         _crash_body = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
-                        _crash_file = os.path.join(self._data_dir or os.path.dirname(os.path.abspath(__file__)),
-                                                   "sportsape_crash_trace.txt")
+                        _crash_file = writable_path("sportsape_crash_trace.txt")
                         with open(_crash_file, "a", encoding="utf-8") as _cf:
                             _cf.write(f"[{datetime.now().isoformat(timespec='seconds')}] "
                                       f"{active_phone} renderer hang (fail #{consec_fail})\n{_crash_body}\n")
@@ -6265,8 +8143,7 @@ agent_cfg: dict = None,
                     try:
                         import traceback as _tb
                         _crash_body = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
-                        _crash_file = os.path.join(self._data_dir or os.path.dirname(os.path.abspath(__file__)),
-                                                   "sportsape_crash_trace.txt")
+                        _crash_file = writable_path("sportsape_crash_trace.txt")
                         with open(_crash_file, "a", encoding="utf-8") as _cf:
                             _cf.write(f"[{datetime.now().isoformat(timespec='seconds')}] "
                                       f"{active_phone} round crash (fail #{consec_fail})\n{_crash_body}\n")
@@ -6333,22 +8210,70 @@ agent_cfg: dict = None,
         self._bet_driver = None
 
     def _quit_bet_driver(self, driver):
-        """Quit a bet-session browser and clean its temp profile (idempotent, never throws)."""
+        """Quit a bet-session browser and clean its temp profile (idempotent, never throws).
+
+        LEAK FIX (2026-10-05): `driver.quit()` is best-effort and SILENTLY FAILS
+        when the driver session has already died — which is exactly what happens
+        after a chromedriver crash ("invalid session id" / HTTPConnectionPool).
+        The Chrome it launched then keeps running with its profile open, so every
+        crash-and-rebuild left another live browser behind. Measured live: 3 Chrome
+        profiles for 2 accounts and 53% CPU. Deleting the profile directory also
+        fails while Chrome holds it, so we now kill the browser by its own
+        profile marker as a guaranteed backstop.
+        """
+        temp_profile = None
         try:
             if driver is not None:
                 temp_profile = getattr(driver, "_sportsape_temp_profile", None)
+                acct = getattr(driver, "_sportsape_account", None)
+                # ORDER MATTERS (2026-10-05). If the chromedriver process has
+                # already died, `driver.quit()` BLOCKS: it opens an HTTP
+                # connection to a dead socket and retries until it gives up —
+                # which is how one crashed driver froze the engine for 28
+                # minutes ("opening stable browser session" then total silence).
+                # Probe the process FIRST and skip quit() for a corpse, going
+                # straight to the profile-scoped kill below.
+                _alive = True
                 try:
-                    driver.quit()
+                    _proc = getattr(getattr(driver, "service", None), "process", None)
+                    if _proc is not None and callable(getattr(_proc, "poll", None)):
+                        _alive = _proc.poll() is None
                 except Exception:
-                    pass
-                if temp_profile and os.path.exists(temp_profile):
-                    shutil.rmtree(temp_profile, ignore_errors=True)
+                    _alive = True
+                if _alive:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                else:
+                    self._emit_direct(
+                        None,
+                        "   chromedriver had already exited — skipping driver.quit() "
+                        "and clearing the browser by its profile instead.")
+                if acct:
+                    try:
+                        _release_account_session(acct)
+                        driver._sportsape_account = None
+                    except Exception:
+                        pass
                 with self._active_drivers_lock:
                     self._active_drivers.discard(driver)
         except Exception:
             pass
         if getattr(self, "_bet_driver", None) is driver:
             self._bet_driver = None
+        # Backstop: if quit() failed the browser is very likely still alive.
+        # Kill anything still using OUR temp profile before deleting it.
+        if temp_profile:
+            try:
+                _kill_chrome_for_profile(temp_profile)
+            except Exception:
+                pass
+            try:
+                if os.path.exists(temp_profile):
+                    shutil.rmtree(temp_profile, ignore_errors=True)
+            except Exception:
+                pass
 
     # ── Jackpot engine (MEGA POT / MID POT) ───────────────────────────
     # The SportPesa jackpots live in a cross-origin widget iframe. Reads + picks
@@ -6788,18 +8713,37 @@ agent_cfg: dict = None,
         return re.sub(r"[^a-z0-9]", "", (name or "").lower())
 
     def _load_form_cache(self) -> dict:
+        """Return the LIVE form-cache dict (never a copy).
+
+        BUGFIX (2026-10-05): this used to end with `return cache or {}`. When
+        the cache was empty — which is exactly the state on a fresh install —
+        `{}` is falsy, so the method returned a NEW throwaway dict instead of
+        the stored one. Callers then mutated that throwaway and
+        _cache_form_entry reported success while persisting NOTHING. The file
+        stayed at 0 teams forever, so the analyst always received "Form data
+        is absent" and skipped all 338 games, and the form/lineup/similar-
+        opponent factors were permanently inert.
+
+        We now always return the real container so in-memory writes stick, and
+        we normalise a malformed file into a usable dict instead of dropping it.
+        """
         cache = getattr(self, "_form_cache_data", None)
         if cache is None:
+            cache = {}
             try:
                 if self.FORM_CACHE_PATH.exists():
                     raw = json.loads(self.FORM_CACHE_PATH.read_text(encoding="utf-8"))
-                    cache = raw.get("teams") if isinstance(raw, dict) else {}
-                else:
-                    cache = {}
+                    if isinstance(raw, dict):
+                        teams = raw.get("teams")
+                        if isinstance(teams, dict):
+                            cache = teams
             except Exception:
                 cache = {}
             self._form_cache_data = cache
-        return cache or {}
+        elif not isinstance(cache, dict):
+            cache = {}
+            self._form_cache_data = cache
+        return cache
 
     def _save_form_cache(self):
         try:
@@ -6856,7 +8800,8 @@ agent_cfg: dict = None,
         if time.time() - (float(ent.get("ts") or 0)) > self.ENRICH_TTL_SECONDS:
             return None
         if not (ent.get("injuries") or ent.get("suspensions")
-                or ent.get("weather") or ent.get("raw_snippet")):
+                or ent.get("weather") or ent.get("raw_snippet")
+                or ent.get("lineups") or ent.get("formations")):
             return None
         return ent
 
@@ -6874,7 +8819,123 @@ agent_cfg: dict = None,
             pass
 
     @staticmethod
-    def _parse_enrichment_from_text(content: str) -> dict:
+    def _lineup_formation_k(el: dict, market: str = "") -> float:
+        """Multiplier in [0.88, 1.06] from confirmed XI + formation (2026-10-05).
+
+        OWNER REQUEST: weight injuries, lineups and formations heavily. A
+        CONFIRMED starting XI is one of the strongest pre-match signals
+        available, because it tells us the actual attacking and defensive
+        shape rather than the season-long average.
+
+        Deliberately conservative and evidence-weighted:
+          * a confirmed full XI (>= 9 named players) is worth a real lift,
+            scaled by how much of it we can parse;
+          * a recognised formation is worth a small lift, and an ATTACKING
+            shape (3-4-3 / 4-3-3 / 4-2-3-1) is lifted only for goal markets
+            while a defensive one is trimmed there;
+          * a lineup we only partially parsed yields proportionally less;
+          * no data at all is exactly neutral (1.0) — absence of a lineup is
+            NOT evidence of weakness, and must never silently punish a game.
+        """
+        if not el:
+            return 1.0
+        k = 1.0
+        lineups = el.get("lineups") or {}
+        forms = el.get("formations") or {}
+        mk = str(market or "").lower()
+
+        # How much of a full XI do we actually have, per side?
+        named = 0.0
+        for side in ("home", "away"):
+            n = len(lineups.get(side) or [])
+            if n >= 9:
+                named += 1.0
+            elif n >= 5:
+                named += 0.5
+        if named >= 2:
+            k *= 1.06          # both XIs confirmed
+        elif named >= 1:
+            k *= 1.03# one confirmed
+        elif named > 0:
+            # A partial XI (only a handful of names parsed) is weaker evidence
+            # and must earn proportionally less than a confirmed one — but it is
+            # still evidence, so it must not round away to exactly neutral.
+            k *= 1.0 + 0.03 * named
+
+        # Formation read, applied only where it is actually informative.
+        if forms:
+            atk = ("4-3-3", "3-4-3", "4-2-3-1", "3-2-4-1", "4-1-2-1-2")
+            defn = ("5-3-2", "5-4-1", "4-5-1", "3-5-2", "5-2-3")
+            _goal_market = mk.startswith(("over", "under", "btts"))
+            f_home = str(forms.get("home") or "")
+            f_away = str(forms.get("away") or "")
+            if _goal_market:
+                # Attacking shape at both ends -> goals more likely.
+                if f_home in atk and f_away in atk:
+                    k *= 1.05
+                elif (f_home in defn) or (f_away in defn):
+                    k *= 0.93
+            else:
+                # 1X2 / DC: shape alone is weak evidence, keep it gentle.
+                if f_home in atk and f_away in defn:
+                    k *= 1.02
+        return max(0.88, min(1.06, k))
+
+    @staticmethod
+    def _split_enrichment_sides(content: str, home_hint: str = "",
+                                away_hint: str = "") -> dict:
+        """Split a stats-overlay dump into a HOME block and an AWAY block.
+
+        Lineups and formations are PER-SIDE facts, so they cannot be read from
+        the overlay as one blob. We look, in order of reliability, for:
+          1. an explicit "Home" / "Away" label,
+          2. the away team name appearing as its own heading line,
+          3. a fallback that returns the whole text for 'home' and nothing for
+             'away' (never fabricate a second identical side).
+
+        Returning only one side is deliberate and safe: a single-sided XI is
+        still signal, whereas a duplicated one is actively misleading.
+        """
+        out = {"home": "", "away": ""}
+        if not content:
+            return out
+        home_hint = str(home_hint or "").strip()
+        away_hint = str(away_hint or "").strip()
+
+        # 1) explicit Home/Away labels
+        mh = re.search(r"^\s*home(?:\s+team)?\s*:?\s*$", content,
+                       re.IGNORECASE | re.MULTILINE)
+        ma = re.search(r"^\s*away(?:\s+team)?\s*:?\s*$", content,
+                       re.IGNORECASE | re.MULTILINE)
+        if mh and ma and ma.start() > mh.start():
+            out["home"] = content[mh.end():ma.start()]
+            out["away"] = content[ma.end():]
+            return out
+
+        # 2) away team name as its own line (the usual single-XI layout:
+        #    home XI first, then the away heading, then the away XI)
+        if away_hint:
+            pat = r"^\s*" + re.escape(away_hint) + r"\s*$"
+            ma = re.search(pat, content, re.IGNORECASE | re.MULTILINE)
+            if ma:
+                out["home"] = content[:ma.start()]
+                out["away"] = content[ma.end():]
+                return out
+
+        # 3) best effort: split on the away name appearing anywhere as a line
+        if home_hint and away_hint:
+            idx = content.lower().find(away_hint.lower())
+            if idx > 0:
+                out["home"] = content[:idx]
+                out["away"] = content[idx:]
+                return out
+
+        out["home"] = content
+        return out
+
+    @staticmethod
+    def _parse_enrichment_from_text(content: str, home_hint: str = "",
+                                    away_hint: str = "") -> dict:
         """Extract injuries/suspensions/weather/venue/referee from a Betradar
         stats-overlay text dump. Shared by the per-leg stats reader and the
         research enrichment path so both keep the same findings."""
@@ -6884,13 +8945,50 @@ agent_cfg: dict = None,
         low = content.lower()
         snippet = content[:600]
         inj_lines = []
+        # FALSE-POSITIVE GUARD (2026-10-05). The old matcher fired on any line
+        # containing "out " / "missing" / "injury", which swept in overlay
+        # CHROME such as competition names ("Australia Cup, Knockout Stage",
+        # "U23 AFC Asian Cup, Knockout stage") and — worst of all — the literal
+        # string "No missing players". The result was 5-6 phantom "injury flags"
+        # on ordinary games, which then tripped _enrichment_veto and vetoed the
+        # whole fixture. Verified live: games were skipped for "6 injury flags"
+        # that were purely competition labels.
+        #
+        # A real injury line names a PERSON and a PROBLEM. We now require an
+        # explicit absence keyword AND a player-shaped name AND that the line is
+        # not a competition/stage/venue label AND does not deny any absence.
+        _ABSENCE_KW = ("injured", "injury", "injuries", "suspension",
+                       "suspended", "unavailable", "ruled out", "out for",
+                       "doubtful", "misses", "missed", "absent")
+        _NEGATIVE = ("no missing players", "no injuries", "no suspensions",
+                     "none missing", "no missing", "squad fully available",
+                     "no players missing", "full squad", "no injury",
+                     "no suspension", "fit and available")
+        _BOILERPLATE = ("cup,", "stage", "league,", "round", "group ",
+                        "knockout", "playoff", "qualif", "friendly",
+                        "relegation", "championship", "premier league,")
+
+        def _player_shaped(line: str) -> bool:
+            return len(re.findall(r"\b[A-Z][a-zA-Z'.-]{1,}\b", line)) >= 2
+
+        _seen_inj = set()
         for line in content.splitlines():
-            if any(kw in line.lower() for kw in
-                   ("injured", "injury", "doubt", "suspended", "suspension",
-                    "missing", "unavailable", "out ")):
-                l = line.strip()
-                if 5 < len(l) < 150:
-                    inj_lines.append(l)
+            l = line.strip()
+            low = l.lower()
+            if not (5 < len(l) < 150):
+                continue
+            if any(n in low for n in _NEGATIVE):
+                continue                    # explicitly DENIES any absence
+            if not any(k in low for k in _ABSENCE_KW):
+                continue
+            if any(b in low for b in _BOILERPLATE):
+                continue                    # competition / stage label
+            if not _player_shaped(l):
+                continue                    # no person named -> not an injury
+            if l in _seen_inj:
+                continue                    # overlay repeats a line per column
+            _seen_inj.add(l)
+            inj_lines.append(l)
         if inj_lines:
             result["injuries"] = inj_lines[:6]
         for pat in (r"weather[:\s]+([^\n]{3,60})",
@@ -6908,6 +9006,63 @@ agent_cfg: dict = None,
         m = re.search(r"referee[:\s]+([^\n]{3,50})", content, re.IGNORECASE)
         if m:
             result["referee"] = m.group(1).strip()[:50]
+        # ── LINEUPS / FORMATIONS (2026-10-05, owner request) ────────────
+        # Parsed from the SAME stats-overlay text we already fetch, so this
+        # costs no extra page load and no extra API call. SportPesa's overlay
+        # renders the probable XI and the formation (4-3-3, 4-4-2, 3-5-2 ...)
+        # for each side when the bookmaker publishes them.
+        # Split the overlay into per-team regions so each side gets ITS OWN
+        # XI and formation. A single shared regex matched the first block for
+        # both sides, so home and away were always identical — which is worse
+        # than useless, because it looks like real data.
+        # Team headings in these overlays are the two team names on/near the
+        # title line, or explicit "Home"/"Away" labels.
+        _blocks = SportsapeBackend._split_enrichment_sides(
+            content, home_hint, away_hint)
+        for side, blk in _blocks.items():
+            if not blk:
+                continue
+            # Formation for THIS side.
+            fm = re.search(
+                r"(?:formation|setup|system)\s*[:\-]?\s*(\d-\d-\d(?:-\d)?)",
+                blk, re.IGNORECASE)
+            if not fm:
+                fm = re.search(r"^\s*(\d-\d-\d(?:-\d)?)\s*$", blk,
+                               re.IGNORECASE | re.MULTILINE)
+            if fm:
+                result.setdefault("formations", {})[side] = fm.group(1)
+            # Probable XI for THIS side, taken from the block that follows the
+            # XI/Team-News heading up to the next heading.
+            xi = re.search(
+                r"(?:starting\s*xi|probable\s*(?:xi|lineup)|team\s*news|line\s*up)"
+                r"[^\n]{0,40}\n((?:[^\n]*\n){0,16})",
+                blk, re.IGNORECASE)
+            seg = xi.group(1) if xi else blk
+            names = []
+            _team_words = set()
+            for hint in (home_hint, away_hint):
+                for w in re.split(r"[^A-Za-z]+", str(hint or "")):
+                    if len(w) >= 3:
+                        _team_words.add(w.lower())
+            for ln in seg.splitlines():
+                ln = ln.strip()
+                if not ln or len(ln) < 3 or len(ln) > 60:
+                    continue
+                if re.match(r"^(form|rating|odds|venue|weather|referee|coach|"
+                            r"injury|suspension|past|head|h2h|overall|formation|"
+                            r"starting|probable|team\s*news)", ln, re.IGNORECASE):
+                    continue
+                if not re.search(r"[A-Za-z]{2}", ln):
+                    continue
+                # A bare team name is a heading, not a player.
+                words = [w for w in re.split(r"[^A-Za-z]+", ln) if len(w) >= 3]
+                if words and all(w.lower() in _team_words for w in words):
+                    continue
+                names.append(ln)
+                if len(names) >= 11:
+                    break
+            if names:
+                result.setdefault("lineups", {})[side] = names
         result["raw_snippet"] = snippet
         return result
 
@@ -7392,6 +9547,170 @@ return 'noicon';
                            "ts": time.time()}
         return out
 
+    # ── SIMILAR-OPPONENT HISTORY (2026-10-05, owner request) ───────────
+    @staticmethod
+    def _parse_recent_opponents(text: str, max_rows: int = 6):
+        """Pull each team's recent fixtures WITH opponent, score and venue.
+
+        The Betradar H2H overlay already renders a "Last Matches-<team>"
+        section per side, laid out as:
+            <date> | <league> | <round>
+            TeamA
+            TeamB
+            <scoreA>
+            <scoreB>
+            FT
+            <W|D|L>          <- from THIS team's perspective
+            (optionally) "Home" / "Away" marker
+
+        We keep the pieces that matter for "how does this team do against
+        OPPONENTS LIKE THE ONE IT IS FACING": the opponent, whether it was at
+        home or away, the goals for/against, and the result. Purely
+        string-based and free — it reuses the page we already open, so this
+        costs no extra API budget.
+        """
+        if not text:
+            return {"home": [], "away": []}
+        out = {"home": [], "away": []}
+        parts = re.split(r"Last Matches-\s*([A-Za-z0-9 .'&\u2011-]{2,40})", text)
+        sections = []
+        for i in range(1, len(parts) - 1, 2):
+            sections.append((parts[i].strip(), parts[i + 1]))
+        if not sections:
+            return out
+
+        def _rows(blob, team_hint=""):
+            rows = []
+            # Each fixture block starts at a date header.
+            chunks = re.split(r"\n(?=\s*\d{1,2}[/.]\d{1,2}[/.]\d{2,4})", blob)
+            hint = re.split(r"\s+", str(team_hint or "").strip().lower())[0] \
+                if team_hint else ""
+            for ch in chunks:
+                date_m = re.search(r"(\d{1,2}[/.]\d{1,2}[/.]\d{2,4})", ch)
+                if not date_m:
+                    continue
+                rest = ch[date_m.end():]
+                # The date and the "| League | Round" header share ONE line,
+                # so the remainder of that line is still header text, not a
+                # team name. Drop it before harvesting names.
+                nl = rest.find("\n")
+                rest = rest[nl:] if nl >= 0 else ""
+                # Team-name lines: skip pure numbers, "FT", and result letters.
+                names = []
+                for l in rest.splitlines():
+                    s = l.strip()
+                    if not s or s.upper() == "FT":
+                        continue
+                    if re.fullmatch(r"[\d\s]{1,4}", s):
+                        continue
+                    if re.fullmatch(r"[WDL]", s):
+                        continue
+                    names.append(s)
+                if len(names) < 2:
+                    continue
+                team_a, team_b = names[0], names[1]
+                nums = [int(x) for x in re.findall(r"\b(\d{1,2})\b", rest)
+                        if 0 <= int(x) <= 20]
+                gf = ga = None
+                if len(nums) >= 2:
+                    a, b = nums[-2], nums[-1]
+                    # The result letter is from OUR team's perspective, so use
+                    # it to orient the fixture instead of guessing from an
+                    # "Home"/"Away" marker the overlay often omits entirely.
+                    if hint and hint in team_a.lower():
+                        gf, ga = a, b
+                    elif hint and hint in team_b.lower():
+                        gf, ga = b, a
+                    else:
+                        gf, ga = a, b
+                else:
+                    continue
+                res_m = re.search(r"\b([WDL])\b", rest)
+                rows.append({
+                    "date": date_m.group(1),
+                    "opp": (team_b if (hint and hint in team_a.lower())
+                            else team_a),
+                    "venue": "home",
+                    "gf": gf, "ga": ga,
+                    "res": (res_m.group(1) if res_m else ""),
+                })
+                if len(rows) >= max_rows:
+                    break
+            return rows
+
+        if len(sections) >= 1:
+            out["home"] = _rows(sections[0][1], sections[0][0])
+        if len(sections) >= 2:
+            out["away"] = _rows(sections[1][1], sections[1][0])
+        return out
+
+    @staticmethod
+    def _similar_opponent_k(recent: dict, opponent_name: str = "") -> float:
+        """Multiplier in [0.90, 1.08] from results against SIMILAR opponents.
+
+        OWNER REQUEST: weight past matches against similar opponents. A team's
+        record against clubs of comparable strength/league level is a better
+        predictor than its record against random opposition.
+
+        Method: tokenise the opponent we're about to face and each recent
+        opponent, score a crude similarity (shared significant name tokens,
+        e.g. "united"/"city"/"rovers"), then compare the team's record in
+        those comparable matches. Small samples are heavily damped — three
+        games is not a trend — and no comparable matches means exactly
+        neutral, never a silent penalty.
+        """
+        if not isinstance(recent, dict):
+            return 1.0
+        rows = recent.get("rows") or []
+        if not isinstance(rows, list) or not rows:
+            return 1.0
+        if not opponent_name:
+            return 1.0
+        _stop = {"fc", "afc", "sc", "ac", "as", "ss", "ssc", "us", "cd", "ud",
+                 "rc", "fk", "bk", "if", "aik", "bk", "if", "sv", "vfl", "vfb"}
+        def _toks(n):
+            return {w.lower() for w in re.split(r"[^A-Za-z]+", str(n or ""))
+                    if len(w) >= 4 and w.lower() not in _stop}
+        target = _toks(opponent_name)
+        if not target:
+            return 1.0
+        sim_w = sim_l = 0
+        for r in rows:
+            ot = _toks(r.get("opp"))
+            if not ot:
+                continue
+            shared = target & ot
+            if not shared:
+                continue
+            # Require a meaningful overlap and weight by how specific it is.
+            # An EXACT name match (every significant token shared) counts as
+            # full evidence; a single shared token in a long name counts less.
+            union = len(target | ot) or 1
+            w = len(shared) / float(union)
+            res = str((r or {}).get("res") or "").upper()
+            if res == "W":
+                sim_w += 1 + w
+            elif res == "D":
+                sim_l += 0.5 * (1 + w)
+            else:
+                sim_l += 1 + w
+        total = sim_w + sim_l
+        # SAMPLE-SIZE DAMPING. A single comparable match is a data point, not
+        # a trend: at full weight one win would already pin the multiplier to
+        # its cap, so a 2-game sample and an 8-game sample would look
+        # identical. Confidence is ramped in over ~4 comparable matches so
+        # the signal grows with evidence and stays small until it does.
+        if total < 1.5:
+            return 1.0
+        _confidence = min(1.0, total / 4.0)
+        p_win = sim_w / total
+        # Map p_win around a neutral 0.45 baseline, scaled by evidence. The
+        # 0.22 slope is deliberately gentle: even a perfect 6-0 record against
+        # comparable opposition must not pin the multiplier to its cap on the
+        # strength of a handful of games, and a 1-game sample lands at ~1.02.
+        k = 1.0 + (p_win - 0.45) * 0.22 * _confidence
+        return max(0.90, min(1.08, k))
+
     def _form_snapshot_map(self, pool, driver=None, gui_callback=None, budget=8) -> None:
         """Best-effort per-event form map: {index: {'home_adv','weight'}}.
         Uses ONE search + stats-overlay read per event (both teams at once) when a
@@ -7473,6 +9792,7 @@ return 'noicon';
         setattr(self, _last_key, time.time())
 
         driver = None
+        owned = False
         try:
             now_h = datetime.now().hour
             now_m = datetime.now().minute
@@ -7481,8 +9801,8 @@ return 'noicon';
                 f"🔬 [{now_h:02d}:{now_m:02d}] Pre-window research — "
                 "analysing upcoming games while betting is paused...")
 
-            driver = self._build_driver(
-                gui_callback=None, force_visible=False, mobile=False,
+            driver, owned = self._borrow_account_browser(
+                phone, gui_callback=None, force_visible=False, mobile=False,
                 headless=True, capture_perf=False, minimize=True)
             self._ensure_bet_login(driver, phone, password, gui_callback=None)
 
@@ -7604,7 +9924,9 @@ return 'noicon';
                               f"🔬 Pre-window research error: {str(e)[:80]}")
         finally:
             try:
-                if driver is not None:
+                # Only quit a browser THIS job created. Quitting a borrowed worker
+                # browser would kill the account's live session mid-round.
+                if driver is not None and owned:
                     driver.quit()
             except Exception:
                 pass
@@ -7904,11 +10226,12 @@ return 'noicon';
         if not self._jackpot_lock.acquire(blocking=False):
             return
         driver = None
+        owned = False
         try:
             self._emit_direct(gui_callback, "🔎 Idle job: analysing current jackpot pool...")
-            driver = self._build_driver(gui_callback=gui_callback, force_visible=False,
-                                        mobile=False, headless=True,
-                                        capture_perf=False, minimize=True)
+            driver, owned = self._borrow_account_browser(
+                phone, gui_callback=gui_callback, force_visible=False,
+                mobile=False, headless=True, capture_perf=False, minimize=True)
             self._ensure_bet_login(driver, phone, password, gui_callback=gui_callback)
             pool = self._fetch_jackpot_pool(driver, gui_callback=gui_callback)
             if not pool:
@@ -7940,7 +10263,7 @@ return 'noicon';
             self._emit_direct(gui_callback, f"ℹ️ Jackpot idle scan skipped: {str(e)[:90]}")
         finally:
             try:
-                if driver is not None:
+                if driver is not None and owned:
                     driver.quit()
             except Exception:
                 pass
@@ -8019,6 +10342,7 @@ return 'noicon';
             self._emit_direct(gui_callback, "⏳ A jackpot flow is already running — try again shortly.")
             return {"status": "busy"}
         driver = None
+        owned = False
         try:
             self._emit_direct(gui_callback,
                               f"{emoji} {label} JACKPOT requested — KES {stake:,.0f} entry. "
@@ -8028,9 +10352,9 @@ return 'noicon';
             t0 = time.time()
             while getattr(self, "_engine_busy", False) and time.time() - t0 < 120:
                 time.sleep(3)
-            driver = self._build_driver(gui_callback=gui_callback, force_visible=False,
-                                        mobile=False, headless=True,
-                                        capture_perf=False, minimize=True)
+            driver, owned = self._borrow_account_browser(
+                phone, gui_callback=gui_callback, force_visible=False,
+                mobile=False, headless=True, capture_perf=False, minimize=True)
             self._ensure_bet_login(driver, phone, password, gui_callback=gui_callback)
             try:
                 balance = self._read_balance_patient(driver, wait=12.0)
@@ -8091,7 +10415,7 @@ return 'noicon';
             return {"status": "error", "message": str(e)}
         finally:
             try:
-                if driver is not None:
+                if driver is not None and owned:
                     driver.quit()
             except Exception:
                 pass
@@ -8686,14 +11010,19 @@ return 'noicon';
     # are below this. The historical "safe-looking" sub-3.0 accumulators
     # (2L@lt3 / 3L@lt3) were 431 bets at -43% ROI: stacking tiny-odds legs
     # multiplies the bookmaker's margin, not our edge.
-    # OWNER RULE (2026-09-28): lowered to 2.5 to match MIN_COMBINED_ODDS. The
-    # -43% family was almost entirely cheap filler-leg stacking (sub-x1.20 legs);
-    # per-game judgment now guarantees every leg clears the x1.20 odds floor, the
-    # raw-probability veto and the implied-confidence cap, capped at 2 slots per
-    # market. The skew floor stays as a backstop equal to the owner floor rather
-    # than silently raising it to x3.00.
+    # OWNER RULE (2026-09-28 -> Option A): lowered to 2.5 to match
+    # MIN_COMBINED_ODDS, and now to 1.60 to match the Option A floor. This value
+    # is a backstop that tracks the owner floor, NOT an independent gate — when
+    # MIN_COMBINED_ODDS moves, this must move with it or the higher of the two
+    # silently wins and the owner's floor is dead code.
+    # KNOWN RISK, accepted deliberately: the sub-3.0 accumulator family is 431
+    # bets at -43% ROI. It was previously blamed on sub-x1.20 filler legs;
+    # per-leg odds/confidence floors plus the 2-per-market cap now target that.
+    # Watch the ROI of the sub-2.5 cohort after switching; if it does not
+    # improve, the correct fix is to raise the per-leg floor, not to re-add a
+    # blanket odds veto here.
     MAX_MARKET_LEGS_PER_SLIP = 2
-    MIN_SKEW_ODDS = 2.5
+    MIN_SKEW_ODDS = 1.6
 
     # Hard ceiling on legs in ONE slip, enforced at both placement funnels.
     # The ledger is unambiguous here: 14-leg and 25-leg shapes returned -100%
@@ -8720,7 +11049,24 @@ return 'noicon';
     # the case where EVERY account is bleeding at once — the exact failure mode
     # that per-account checks structurally cannot see.
     ACCOUNT_DRAWDOWN_FREEZE = 0.40   # -40% from peak balance → freeze + review
-    PORTFOLIO_DRAWDOWN_HALT = 0.20   # -20% from peak combined → halt all, recalibrate
+    # A frozen account must still be able to climb back: after this long frozen
+    # it may place REDUCED-stake recovery bets. Without it the breaker is a
+    # deadlock - the account has to recover above the threshold to unfreeze,
+    # but being frozen is what stops it betting to recover. The limit itself is
+    # NOT widened; only the stake is reduced.
+    DRAWDOWN_RECOVERY_AFTER_S = 900.0     # 15 min frozen → recovery mode allowed
+    DRAWDOWN_RECOVERY_STAKE_PCT = 0.25   # recovery bets are 25% of normal stake
+    # A peak may never be raised by a reading this many times the account's own
+    # last balance. Catches another account's balance being recorded against
+    # this one, which silently froze 0798810080 on 0706719388's money.
+    PEAK_JUMP_SANITY_MULT = 2.5
+    # DISABLED at user request (2026-09-30): the fleet-wide halt latched on a
+    # drawdown that the per-account breakers already own, and it parked a
+    # fully-funded account (0798810080, KES 94.73) with money idle purely
+    # because the *other* account was bleeding. Set to 10.0 so
+    # `pdd >= PORTFOLIO_DRAWDOWN_HALT` can never be true (drawdown is capped
+    # at 1.0 by _portfolio_drawdown). Per-account freeze still applies.
+    PORTFOLIO_DRAWDOWN_HALT = 10.0   # disabled: fleet-wide halt off
     # How long a bet may sit "active" before we stop counting it as money in
     # play. Football slips settle within a day; a row still marked active after
     # that is a settlement-sync artifact, and counting it inflates equity (and
@@ -8761,7 +11107,13 @@ return 'noicon';
     CASHOUT_LATE_WINDOW_MIN = 20  # this long before the last leg kicks off...
     CASHOUT_LATE_RECOVERY = 0.60  # ...accept 60% of stake (variance now dominates)
     CASHOUT_WIN_FRACTION = 0.75   # running well: 75% of possible win is a good lock
-    RETIRE_TRIALS = 50          # need 50+ trials before we trust a retirement decision
+    # BUGFIX (2026-10-01): was 50. No market in the ledger has ever reached 50
+    # trials (the largest, `under`, has 66 but over1/under375/under575 sit at
+    # 29/9/5), so this retirement path had NEVER once fired — `retired_markets`
+    # was always empty and markets priced 20-37 points above their real hit rate
+    # kept taking real stakes. 15 matches the calibrator's own threshold and is
+    # enough signal for a 15-point calibration miss.
+    RETIRE_TRIALS = 15         # 15+ trials before we trust a retirement decision
     RETIRE_HINTS = 0.15         # real hit-rate must fall this far below predicted to retire
     RETIRE_HINT  = 0.15         # alias used in _maybe_recalibrate
     RECHECK_DAYS = 1
@@ -8812,6 +11164,7 @@ return 'noicon';
             return
         if getattr(self, "_stats", None) is None:
             self._stats = {"market_types": {}, "recipes": {}, "retired_markets": [],
+                           "team_stats": {},
                            "settled": 0, "last_recalib": None}
         try:
             if self.STATS_PATH.exists():
@@ -8842,6 +11195,217 @@ return 'noicon';
             pass
         self._sb_push_stats()
 
+    def nightly_learning(self, gui_callback=None) -> dict:
+        """End-of-day learning pass — the "what did the tool learn today" step.
+
+        Runs while the machine is PARKED waiting for the new betting day (the
+        cap-hold window is hours of idle), so learning never competes with
+        betting. It force-runs the market recalibration over the day's settled
+        bets (retirements + signed weight adjustments + Brier check), then
+        writes a plain-English journal entry: what was retired, which markets
+        beat or lagged their own price, the best/worst teams by money, the
+        recipe vetoes, and the day's P&L.
+
+        Never raises, never bets. Returns the summary dict it journalled.
+        """
+        try:
+            self._load_stats()
+            st = self._stats
+            # Force a full pass: drop the gate so the step/day timer cannot
+            # skip a day just because few bets settled.
+            st["last_recalib"] = None
+            st["settled_at_last_recalib"] = 0
+            self._maybe_recalibrate()
+            self._save_stats()
+
+            ledger = list(getattr(self, "_bets", None) or [])
+            try:
+                from betflow import _betting_day
+                day = _betting_day()
+            except Exception:
+                day = datetime.now().strftime("%Y-%m-%d")
+            todays = [b for b in ledger
+                      if str(b.get("placed_at") or "").startswith(day)
+                      and float(b.get("stake") or 0) > 0]
+            staked = sum(float(b.get("stake") or 0) for b in todays)
+            won = [b for b in todays if b.get("status") == "won"]
+            lost = [b for b in todays if b.get("status") == "lost"]
+            returned = sum(float(b.get("won_amount") or 0) for b in won)
+            retired = list(st.get("retired_markets") or [])
+
+            # Markets, ranked by realised hit-rate minus what the price implied
+            mkt = []
+            for mk, e in (st.get("market_types") or {}).items():
+                n = int(e.get("trials") or 0)
+                if n < 3:
+                    continue
+                real = float(e.get("won") or 0) / n
+                pred = float(e.get("expected") or 0.0) / n
+                mkt.append({"market": mk, "trials": n, "hit": round(real, 3),
+                            "priced": round(pred, 3),
+                            "edge": round(real - pred, 3)})
+            mkt.sort(key=lambda m: -m["edge"])
+            # Teams, ranked by money
+            teams = []
+            for team, mk_map in (st.get("team_stats") or {}).items():
+                for mk, e in (mk_map or {}).items():
+                    n = int(e.get("trials") or 0)
+                    if n < 2:
+                        continue
+                    s = float(e.get("stake") or 0)
+                    r = float(e.get("ret") or 0)
+                    if s <= 0:
+                        continue
+                    teams.append({"team": team, "market": mk, "trials": n,
+                                  "roi": round((r - s) / s, 3)})
+            teams.sort(key=lambda t: -t["roi"])
+            # Recipe vetoes (proven losing odds bands)
+            vetoes = []
+            for key, r in (st.get("recipes") or {}).items():
+                n = int(r.get("trials") or 0)
+                s = float(r.get("stake") or 0)
+                if n < 15 or s <= 0:
+                    continue
+                roi = (float(r.get("ret") or 0) - s) / s
+                if roi <= -0.20:
+                    vetoes.append({"recipe": key, "trials": n,
+                                   "roi": round(roi, 3)})
+
+            entry = {
+                "day": day,
+                "written_at": datetime.now().isoformat(timespec="seconds"),
+                "bets": len(todays), "won": len(won), "lost": len(lost),
+                "staked": round(staked, 2), "returned": round(returned, 2),
+                "net": round(returned - staked, 2),
+                "retired_markets": retired,
+                "markets_best": mkt[:3], "markets_worst": mkt[-3:],
+                "teams_best": teams[:3], "teams_worst": teams[-3:],
+                "vetoed_recipes": vetoes,
+            }
+            try:
+                jpath = Path(writable_path("sportsape_learning_journal.json"))
+                hist = []
+                if jpath.exists():
+                    hist = json.loads(jpath.read_text(encoding="utf-8")) or []
+                hist.append(entry)
+                jpath.write_text(json.dumps(hist[-60:], indent=1),
+                                 encoding="utf-8")
+            except Exception:
+                pass
+            self._emit_direct(gui_callback,
+                f"🧠 LEARNING ({day}): {len(todays)} bets, {len(won)} won, "
+                f"net KES {entry['net']:+,.2f}")
+            if retired:
+                self._emit_direct(gui_callback,
+                    f"🧠 retired markets (proven unpriceable): "
+                    f"{', '.join(retired)}")
+            if entry["markets_best"]:
+                b = entry["markets_best"][0]
+                self._emit_direct(gui_callback,
+                    f"🧠 best market vs its price: {b['market']} "
+                    f"(hit {b['hit']:.0%} vs priced {b['priced']:.0%}, "
+                    f"n={b['trials']})")
+            if entry["teams_best"]:
+                t = entry["teams_best"][0]
+                self._emit_direct(gui_callback,
+                    f"🧠 best team by money: {t['team']} [{t['market']}] "
+                    f"ROI {t['roi']:+.0%} over {t['trials']}")
+            if vetoes:
+                self._emit_direct(gui_callback,
+                    f"🧠 odds bands the engine now refuses: "
+                    f"{', '.join(v['recipe'] for v in vetoes)}")
+            return entry
+        except Exception as exc:
+            try:
+                self._emit_direct(gui_callback,
+                                  f"⚠️ Learning pass error: {str(exc)[:90]}")
+            except Exception:
+                pass
+            return {}
+
+    @staticmethod
+    def _team_pairs(b: dict, blame_markets: list, markets: list) -> list:
+        """[(home, away, market, leg_index)] from a settled row.
+
+        New-engine rows carry "games" ("Home vs Away [market]"); legacy ones
+        carry leg_names + markets, or the market only in the game tag. Used
+        for BOTH the team P&L table and (when no markets list exists) the
+        per-leg scoring - the two must agree on leg order.
+        """
+        pairs = []
+        games = b.get("games") or []
+        if games:
+            for i, gstr in enumerate(games):
+                g = str(gstr)
+                mk = str(markets[i]) if i < len(markets) else ""
+                if not mk and g.endswith("]"):
+                    mk = g.rsplit("[", 1)[1][:-1]
+                nm = g.rsplit("[", 1)[0].strip()
+                h, _s, a = nm.partition(" vs ")
+                pairs.append((h.strip(), a.strip(), mk, i))
+        else:
+            for i, mk in enumerate(blame_markets):
+                nm = str((b.get("leg_names") or [""])[i]
+                         if i < len(b.get("leg_names") or []) else "")
+                h, _s, a = nm.partition(" vs ")
+                pairs.append((h.strip(), a.strip(), str(mk), i))
+        return pairs
+
+    def _score_legs_from_results(self, b: dict, markets: list) -> list:
+        """Per-leg REAL outcomes: [True/False/None] for each market.
+
+        MEASURED 2026-10-15: the book settles a SLIP, never its legs, so the
+        per-market "truth" has to be scored from the day's final scores. The
+        old scheme credited every leg of a lost slip with (1 - blame) - about
+        0.67 "won" per leg - so 40 lost slips made all 17 markets look
+        ~70%-accurate while the real slip win-rate was 13%, and every
+        steering weight in the app was learned from that fiction.
+
+        Each leg is now scored with the engine's own leg_won() against the
+        API-Football day feed (cached; the parse bug that made it empty was
+        fixed the same day). A leg with no decidable score gets None and NO
+        trial is recorded for it: an absent trial is honest, a fabricated
+        one poisons every weight downstream. Never raises - [] means 'no
+        data' and the caller then records nothing per-market.
+        """
+        try:
+            import betflow as _bf
+            import model_data as _md
+            # Score against the day the slip was PLACED, not blindly against
+            # today: a bet placed late on D settles on D+1, and reading D+1's
+            # feed made every one of its legs undecidable (measured
+            # 2026-10-16 - 158 settled bets produced a handful of leg-trials).
+            day = str(b.get("placed_at") or "")[:10]
+            results = _md.fetch_all_results_on(day)
+            names = b.get("leg_names") or []
+            games = b.get("games") or []
+            out = []
+            for i, mk in enumerate(markets):
+                g = ""
+                if i < len(names) and " vs " in str(names[i]):
+                    g = str(names[i])
+                elif i < len(games):
+                    g = str(games[i]).rsplit("[", 1)[0]
+                h, _s, a = g.partition(" vs ")
+                h, a = h.strip(), a.strip()
+                if not h or not a:
+                    out.append(None)
+                    continue
+                # Tolerant pairing: board names (Flashscore) vs the feed
+                # (API-Football) differ often ("Pwd SC" vs "PWD Sports").
+                # find_result only guesses when the match is unambiguous, so
+                # an unreadable pairing is honestly undecidable, never wrong.
+                res = _md.find_result(h, a, results)
+                if (not res or int(res.get("hg", -1)) < 0
+                        or int(res.get("ag", -1)) < 0):
+                    out.append(None)
+                    continue
+                out.append(_bf.leg_won(str(mk), int(res["hg"]), int(res["ag"]),
+                                       hth=res.get("hth"), hta=res.get("hta")))
+            return out
+        except Exception:
+            return []
+
     def _record_settled_stats(self, b: dict):
         """File one settled bet into lifetime stats (market types + recipe).
 
@@ -8867,42 +11431,62 @@ return 'noicon';
         probs   = b.get("probs") or []
         game_ids = b.get("game_ids") or []
         won = (st == "won")
+        # No model probabilities on the row (the model layer is quota-gated and
+        # records none when it is quiet). Fall back to the BOOK's own implied
+        # probabilities from the per-leg odds - a real expectation available on
+        # every bet. The old 0.5 placeholder fabricated a 50% expectation per
+        # leg, which made the whole market table noise (measured 2026-10-11:
+        # every market showed an identical "hit 75% vs priced 50%").
+        if not probs:
+            _lo = []
+            for o in (b.get("leg_odds") or []):
+                try:
+                    o = float(o)
+                except (TypeError, ValueError):
+                    continue
+                if o > 1.0:
+                    _lo.append(o)
+            if _lo:
+                probs = [round(1.0 / o, 4) for o in _lo]
 
         # ── Per-leg probability-weighted blame / credit ─────────────────────
         mt = self._stats.setdefault("market_types", {})
 
-        if won:
-            # All legs won: credit each market with full expected probability
-            for i, mk in enumerate(markets):
-                p_i = float(probs[i]) if i < len(probs) else 0.5
-                e = mt.setdefault(str(mk), {"trials": 0, "won": 0, "expected": 0.0,
-                                            "bad_streak": 0, "weight": 1.0,
-                                            "brier": 0.0})
-                e["trials"]  = int(e.get("trials") or 0) + 1
-                e["won"]     = int(e.get("won") or 0) + 1
-                e["expected"] = float(e.get("expected") or 0.0) + p_i
-                # Brier: outcome is 1 for a won slip, forecast p_i
-                e["brier"] = float(e.get("brier") or 0.0) + (1.0 - p_i) ** 2
-        else:
-            # Slip lost: distribute blame by failure probability weight
-            fail_probs = [max(0.01, 1.0 - (float(probs[i]) if i < len(probs) else 0.5))
-                          for i in range(len(markets))]
-            total_fail = sum(fail_probs) or 1.0
-            for i, mk in enumerate(markets):
-                p_i   = float(probs[i]) if i < len(probs) else 0.5
-                blame = fail_probs[i] / total_fail   # fraction of loss attributed to this leg
-                e = mt.setdefault(str(mk), {"trials": 0, "won": 0, "expected": 0.0,
-                                            "bad_streak": 0, "weight": 1.0,
-                                            "weighted_blame": 0.0, "brier": 0.0})
-                e["trials"]  = int(e.get("trials") or 0) + 1
-                # partial credit proportional to how confident we were this leg would win
-                # (avoids over-penalising high-prob legs when the low-prob leg killed the slip)
-                e["won"]     = float(e.get("won") or 0) + (1.0 - blame)
-                e["expected"] = float(e.get("expected") or 0.0) + p_i
-                e["weighted_blame"] = float(e.get("weighted_blame") or 0.0) + blame
-                # Brier with blame-weighted outcome: E[(y - p)^2] with y=1 w.p. (1-blame)
-                e_brier = blame * (0.0 - p_i) ** 2 + (1.0 - blame) * (1.0 - p_i) ** 2
-                e["brier"] = float(e.get("brier") or 0.0) + e_brier
+        # OWNER RULE: shadow (zero-stake research) slips never touch the real
+        # tables. They file into shadow_recipes below; mixing them into
+        # market_types/league/team would inflate the real read with bets that
+        # risked nothing (the exact sin the 2026-09-26 split exists to prevent).
+        _is_research = (str(b.get("status") or "").startswith("shadow")
+                        or float(b.get("stake") or 0.0) <= 0.0)
+        blame_markets = [] if _is_research else markets
+
+        # REAL per-leg outcomes from the day's scores (see the helper). The
+        # old partial-credit scheme is what made every market look 70%
+        # accurate - this replaces it with what actually happened, leg by leg.
+        # Legacy rows may carry no "markets" list at all (the market lives in
+        # the "[market]" game tag), so the team block below derives the
+        # effective market list and the scorer is fed THAT.
+        score_markets = blame_markets or [
+            mk for _h, _a, mk, _i in self._team_pairs(b, blame_markets, markets)]
+        leg_outcomes = (self._score_legs_from_results(b, score_markets)
+                        if score_markets else [])
+        for i, mk in enumerate(blame_markets):
+            leg_ok = leg_outcomes[i] if i < len(leg_outcomes) else None
+            if leg_ok is None:
+                continue                  # undecidable leg: no honest trial
+            p_i = float(probs[i]) if i < len(probs) else 0.5
+            e = mt.setdefault(str(mk), {"trials": 0, "won": 0, "expected": 0.0,
+                                        "bad_streak": 0, "weight": 1.0,
+                                        "weighted_blame": 0.0,
+                                        "brier": 0.0})
+            e["trials"] = int(e.get("trials") or 0) + 1
+            e["won"] = float(e.get("won") or 0) + (1.0 if leg_ok else 0.0)
+            e["expected"] = float(e.get("expected") or 0.0) + p_i
+            # Brier on the leg's own outcome (1 = the leg won).
+            e["brier"] = float(e.get("brier") or 0.0) + (
+                (1.0 - p_i) ** 2 if leg_ok else (0.0 - p_i) ** 2)
+            # bad_streak: consecutive real losses this market's legs took.
+            e["bad_streak"] = 0 if leg_ok else int(e.get("bad_streak") or 0) + 1
 
         # ── Per-league × market tracking (league volatility filter) ──────────
         # Attribute each leg to the league its game belongs to (rule-based team
@@ -8913,26 +11497,29 @@ return 'noicon';
         try:
             _legs_meta = (b.get("shadow_legs") or []) if b.get("status") == "shadow" else []
             lm = self._stats.setdefault("league_markets", {})
-            for i, mk in enumerate(markets):
+            for i, mk in enumerate(blame_markets):
+                leg_ok = leg_outcomes[i] if i < len(leg_outcomes) else None
+                if leg_ok is None:
+                    continue                  # undecidable leg: no honest trial
+                meta = (b.get("legs_meta") or [{}])[i] if i < len(b.get("legs_meta") or []) else {}
                 gname = ""
                 if i < len(b.get("leg_names") or []):
                     gname = (b.get("leg_names") or [])[i]
                 elif i < len(_legs_meta):
                     gname = _legs_meta[i].get("name") or ""
-                league = self._league_name(gname)
+                # The engine records the REAL sport + competition per leg, so
+                # league learning no longer depends on guessing the league from
+                # a team name. Fall back to the rule-based detector only for
+                # legacy rows.
+                sport = str(meta.get("sport") or "").strip()
+                league = str(meta.get("league") or "").strip()
+                league = f"{sport}: {league}" if (sport and league) else self._league_name(gname)
                 le = lm.setdefault(league, {}).setdefault(
                     str(mk), {"trials": 0, "won": 0, "expected": 0.0})
                 p_i = float(probs[i]) if i < len(probs) else 0.5
                 le["trials"] = int(le.get("trials") or 0) + 1
                 le["expected"] = float(le.get("expected") or 0.0) + p_i
-                if won:
-                    le["won"] = float(le.get("won") or 0) + 1.0
-                else:
-                    fail_probs = [max(0.01, 1.0 - (float(probs[j]) if j < len(probs) else 0.5))
-                                  for j in range(len(markets))]
-                    t_fail = sum(fail_probs) or 1.0
-                    le["won"] = float(le.get("won") or 0) + \
-                        (1.0 - (fail_probs[i] / t_fail))
+                le["won"] = float(le.get("won") or 0) + (1.0 if leg_ok else 0.0)
         except Exception:
             pass
         # ── Recipe stats (real money vs shadow, tracked SEPARATELY) ─────────
@@ -8944,8 +11531,10 @@ return 'noicon';
         # research, but they now land in "shadow_recipes" and can never inflate
         # the real-money read. A recipe is only "real" when stake > 0.
         key = (b.get("recipe") or
-               {"legs": b.get("legs"), "band": self._band_of(b.get("odds")),
-                "lead": b.get("lead_bucket") or "-", "mix": "-".join(sorted(set(markets))) or "-"})
+               {"legs": b.get("legs") or len(markets) or len(b.get("games") or []),
+                "band": self._band_of(b.get("odds")),
+                "lead": b.get("lead_bucket") or "-",
+                "mix": "-".join(sorted(set(markets))) or "-"})
         key_s = f"{key.get('legs')}L@{key.get('band')}/{key.get('lead')}/[{key.get('mix')}]"
         _stake_this = float(b.get("stake") or 0.0)
         _is_real = _stake_this > 0.0
@@ -8959,6 +11548,42 @@ return 'noicon';
         # Keep the legacy combined counter for backwards compatibility, but the
         # bandit and every ROI read now use "recipes" (real only) — see
         # _recipe_roi_tables().
+
+        # ── Per-team × market P&L ledger ("teams that always win") ─────────
+        # The owner's ask. Every settled slip files the REAL per-leg outcome
+        # into team_stats[team][market] (the old partial-credit scheme here
+        # was the same fiction as market_types - fixed 2026-10-15), plus the
+        # money: each team-game carries an even share of the stake and, on a
+        # won slip, of the return - so a team's entry is its own P&L.
+        # Games arrive as "Home vs Away [market]" strings on new-engine rows,
+        # or as leg_names + markets on legacy ones.
+        try:
+            ts = self._stats.setdefault("team_stats", {})
+            pairs = self._team_pairs(b, blame_markets, markets) \
+                if not _is_research else []
+            n_legs = max(1, len(pairs))
+            stake_share = _stake_this / n_legs
+            ret_share = (float(b.get("won_amount") or 0.0) / n_legs) if won else 0.0
+            for h, a, mk, i in pairs:
+                if not mk:
+                    continue
+                leg_ok = leg_outcomes[i] if i < len(leg_outcomes) else None
+                if leg_ok is None:
+                    continue                # undecidable leg: no honest trial
+                p_i = float(probs[i]) if i < len(probs) else 0.5
+                for team in (h, a):
+                    if not team:
+                        continue
+                    e = ts.setdefault(team, {}).setdefault(
+                        mk, {"trials": 0, "won": 0.0, "expected": 0.0,
+                             "stake": 0.0, "ret": 0.0})
+                    e["trials"] += 1
+                    e["won"] += 1.0 if leg_ok else 0.0
+                    e["expected"] += p_i
+                    e["stake"] += stake_share
+                    e["ret"] += ret_share
+        except Exception:
+            pass
 
         # ── Analyst calibration feedback ─────────────────────────────────────
         # For each game ID in this bet, check whether the analyst made a pick and
@@ -9006,6 +11631,43 @@ return 'noicon';
         self._maybe_recalibrate()
         self._save_stats()
         self._sb_push_settled_results(b, won, markets, game_ids)
+
+    def _new_engine_enrich(self, row_id: str) -> dict:
+        """Markets / probs / games for a site bet id, from the engine's ledger.
+
+        The bet-history page shows stake, status and leg count but NOT which
+        markets were played. The import path used to write "markets": [] for
+        every imported bet, so _record_settled_stats had nothing to file into
+        market_types - which is exactly how the live stats file ended up with
+        market_types: {} (an empty shell) while the belts ran on. The new
+        engine's ledger records the games and markets per bet id, so cross-copy
+        from there whenever the ids line up.
+        """
+        try:
+            p = Path(writable_path("betflow_ledger.json"))
+            if not p.exists():
+                return {}
+            cached = getattr(self, "_ne_ledger_cache", None)
+            if (cached is None
+                    or time.time() - float(cached[0]) > 60.0):
+                with open(p, encoding="utf-8") as fh:
+                    rows = json.load(fh) or []
+                self._ne_ledger_cache = (time.time(), rows)
+            for r in (getattr(self, "_ne_ledger_cache", (0, []))[1] or []):
+                if not isinstance(r, dict):
+                    continue
+                ids = {str(r.get("bet_id") or ""), str(r.get("short_bet_id") or "")}
+                if str(row_id) not in ids:
+                    continue
+                out = {}
+                for k in ("markets", "probs", "games", "leg_names",
+                          "leg_odds", "legs_meta"):
+                    if r.get(k):
+                        out[k] = r[k]
+                return out
+        except Exception:
+            pass
+        return {}
 
     def _sb_push_settled_results(self, b: dict, won: bool, markets: list, game_ids: list):
         """Mirror this slip's per-game settled results to Supabase so the cloud
@@ -9233,13 +11895,34 @@ return 'noicon';
                     pf.update({k: v for k, v in data.items()
                                if k in ("peaks", "portfolio_peak", "frozen",
                                         "halted", "halt_reason", "refused",
-                                        "refused_reasons", "last_equity")})
+                                        "refused_reasons", "last_equity",
+                                        # WHITELIST GAP (2026-10-05). These two
+                                        # were written to disk but never read
+                                        # back, which silently disabled the
+                                        # features that depend on them:
+                                        #   last_balance - the cross-account
+                                        #     peak guard compares each reading
+                                        #     to the account's own previous
+                                        #     balance; with nothing loaded its
+                                        #     reference was always 0, so the
+                                        #     guard NEVER fired and another
+                                        #     account's balance went straight
+                                        #     back into this account's peak
+                                        #     (0798810080 was re-frozen at
+                                        #     "-47%" within hours of the repair).
+                                        #   frozen_at - without it a frozen
+                                        #     account always looked "frozen for
+                                        #     0s", so recovery mode could never
+                                        #     engage and the deadlock persisted.
+                                        "last_balance", "frozen_at")})
         except Exception:
             pass
         pf.setdefault("peaks", {})
         pf.setdefault("frozen", {})
         pf.setdefault("refused_reasons", {})
         pf.setdefault("last_equity", {})
+        pf.setdefault("last_balance", {})
+        pf.setdefault("frozen_at", {})
         self._portfolio = pf
         return pf
 
@@ -9436,6 +12119,39 @@ return 'noicon';
                     continue
                 last[key] = round(eq, 2)
                 prev = float(pf["peaks"].get(key) or 0.0)
+                # CROSS-ACCOUNT CONTAMINATION GUARD (2026-10-05).
+                # A peak is the drawdown reference point: once polluted with
+                # another account's balance, it silently freezes a healthy
+                # account forever. Observed exactly that:
+                #   peak['0798810080'] = 195.10  <- which is 0706719388's live
+                # balance, not 0798810080's (KES 103.58). 0798810080 was then
+                # frozen at "-47% from peak" on a peak it never had.
+                #
+                # The readings are stored per phone, but the VALUE comes from
+                # whichever browser answered, so any helper that is not
+                # strictly account-scoped can hand back the other account's
+                # figure. A bookmaker payout cannot multiply an account's
+                # balance several-fold inside one round, so an implausible jump
+                # is far more likely to be a swapped reading than a windfall.
+                # Never let one set the peak.
+                _prev_bal = 0.0
+                try:
+                    _prev_bal = float((pf.get("last_balance") or {}).get(key) or 0.0)
+                except Exception:
+                    _prev_bal = 0.0
+                if _prev_bal > 0 and fbal > _prev_bal * self.PEAK_JUMP_SANITY_MULT:
+                    self._emit_direct(
+                        None,
+                        f"\U0001f7e2 REFUSED a peak update for {key}: reading "
+                        f"KES {fbal:,.2f} is {fbal / _prev_bal:.1f}x its own last "
+                        f"reading (KES {_prev_bal:,.2f}). That is not a payout — "
+                        f"it is another account's balance. Peak left at "
+                        f"KES {prev:,.2f}.")
+                    continue
+                try:
+                    pf.setdefault("last_balance", {})[key] = round(fbal, 2)
+                except Exception:
+                    pass
                 if eq > prev:
                     pf["peaks"][key] = round(eq, 2)
             if skipped_zero:
@@ -9532,13 +12248,67 @@ return 'noicon';
         if float(balance or 0) <= 0:
             return False, "no funds"
         dd = self._account_drawdown(phone, balance)
+        _ph = str(phone)
+        # How long this account has been frozen (0 if never).
+        _frozen_at = float((pf.get("frozen_at") or {}).get(_ph) or 0.0)
+        _frozen_for = (time.time() - _frozen_at) if _frozen_at else 0.0
         if dd >= self.ACCOUNT_DRAWDOWN_FREEZE:
-            pf["frozen"][str(phone)] = True
+            pf["frozen"][_ph] = True
+            _fa = pf.setdefault("frozen_at", {})
+            if _ph not in _fa:
+                _fa[_ph] = time.time()
+                _frozen_for = 0.0
             self._save_portfolio()
+            # ── DRAWDOWN RECOVERY MODE, NOT A DEADLOCK (2026-10-05) ───────
+            # The freeze has to be escapable. An account must climb back above
+            # the threshold to be released, but being frozen is exactly what
+            # stops it betting to climb back - so a strict freeze is a deadlock
+            # that only a manual file edit can clear. Observed: 0798810080 sat
+            # frozen for hours at KES 103.58 with no route out.
+            #
+            # After DRAWDOWN_RECOVERY_AFTER_S frozen, allow the account to keep
+            # betting at a REDUCED stake so it can recover on its own. The -40%
+            # LIMIT is NOT widened and the freeze is NOT hidden - recovery mode
+            # only shrinks the stake, and it stops the moment the drawdown is
+            # back inside the limit.
+            if _frozen_for >= self.DRAWDOWN_RECOVERY_AFTER_S:
+                _rm = getattr(self, "_recovery_mode", None)
+                if not isinstance(_rm, dict):
+                    _rm = {}
+                    self._recovery_mode = _rm
+                _rm[_ph] = True
+                return True, (f"drawdown recovery mode: -{dd:.0%} from peak, "
+                              f"stake reduced to "
+                              f"{self.DRAWDOWN_RECOVERY_STAKE_PCT:.0%} until the "
+                              f"balance climbs back inside "
+                              f"-{self.ACCOUNT_DRAWDOWN_FREEZE:.0%}")
             return False, (f"account frozen: -{dd:.0%} from peak "
                            f"(limit -{self.ACCOUNT_DRAWDOWN_FREEZE:.0%})")
-        if pf["frozen"].get(str(phone)):
-            return False, "account frozen by drawdown breaker"
+        if pf["frozen"].get(_ph):
+            # ── LATCH RECOVERY (2026-10-05) ──────────────────────────────
+            # The breaker used to latch FOREVER: once `frozen` was set, this
+            # branch returned "account frozen by drawdown breaker" on every
+            # round and nothing ever cleared it - not even a balance that had
+            # already recovered. A safety control that can never release is
+            # not a safety control, it is an outage.
+            pf["frozen"][_ph] = False
+            try:
+                (pf.get("frozen_at") or {}).pop(_ph, None)
+                (getattr(self, "_recovery_mode", None) or {}).pop(_ph, None)
+            except Exception:
+                pass
+            self._save_portfolio()
+            self._emit_direct(
+                None,
+                f"🟢 {phone}: DRAWDOWN FREEZE LIFTED — back to -{dd:.0%} from peak, "
+                f"inside the -{self.ACCOUNT_DRAWDOWN_FREEZE:.0%} limit.")
+        # not frozen: clear any recovery flag for this account
+        try:
+            _rm2 = getattr(self, "_recovery_mode", None)
+            if isinstance(_rm2, dict) and _rm2.pop(_ph, None):
+                self._save_portfolio()
+        except Exception:
+            pass
         if balances:
             # Do NOT trip a fleet-wide halt off a partial reading. If this round
             # only managed to read ONE of the accounts, the total is not a fleet
@@ -10044,8 +12814,10 @@ return 'noicon';
         # Wait for at least one bet row to render before starting
         for _ in range(10):
             try:
-                count = driver.execute_script(
-                    "return document.querySelectorAll('.bet-container').length;")
+                count = self._exec_script(
+                    driver,
+                    "return document.querySelectorAll('.bet-container').length;",
+                    default=0, timeout=8.0, label="bet-history rows")
                 if count and count > 0:
                     break
             except Exception:
@@ -10056,19 +12828,23 @@ return 'noicon';
         last_count = 0
         for _s in range(max_scroll):
             try:
-                cur = driver.execute_script(
-                    "return document.querySelectorAll('.bet-container').length;")
+                cur = self._exec_script(
+                    driver,
+                    "return document.querySelectorAll('.bet-container').length;",
+                    default=last_count, timeout=8.0, label="bet-history rows")
                 if cur == last_count and _s > 0:
                     break   # no new rows loaded — we've hit the bottom
                 last_count = cur or 0
-                driver.execute_script(
-                    "window.scrollTo(0, document.body.scrollHeight);")
+                self._exec_script(
+                    driver,
+                    "if (document.body) window.scrollTo(0, document.body.scrollHeight);",
+                    default=None, timeout=8.0, label="bet-history scroll")
                 time.sleep(0.8)
             except Exception:
                 break
 
         try:
-            rows = driver.execute_script(r"""
+            rows = self._exec_script(driver, r"""
 var out = [];
 document.querySelectorAll('.bet-container').forEach(function(c){
    var pick = function(sel){ var e = c.querySelector(sel); return e ? (e.innerText||'').trim() : ''; };
@@ -10082,7 +12858,7 @@ document.querySelectorAll('.bet-container').forEach(function(c){
    });
 });
 return out;
-""")
+""", default=[], timeout=10.0, refresh_on_hang=True, label="bet-history extract")
         except Exception:
             return []
         parsed = []
@@ -10923,13 +13699,14 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
         *date_filter*: 'YYYY-MM-DD'. Defaults to today.
         """
         driver = None
+        owned = False
         today = date_filter or datetime.now().strftime("%Y-%m-%d")
         try:
             self._emit_direct(gui_callback,
                               f"📋 Fetching live bet history for {phone} (date: {today})...")
-            driver = self._build_driver(gui_callback=gui_callback,
-                                        force_visible=False, mobile=False,
-                                        headless=True, capture_perf=False, minimize=True)
+            driver, owned = self._borrow_account_browser(
+                phone, gui_callback=gui_callback, force_visible=False,
+                mobile=False, headless=True, capture_perf=False, minimize=True)
             self._ensure_bet_login(driver, phone, password, gui_callback=gui_callback)
             if not self._session_is_live(driver, deep_check=False):
                 self._emit_direct(gui_callback, "⚠️ Login failed — cannot fetch live history.")
@@ -11012,7 +13789,7 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
             return {"date": today, "error": str(e)[:80]}
         finally:
             try:
-                if driver is not None:
+                if driver is not None and owned:
                     driver.quit()
             except Exception:
                 pass
@@ -11027,12 +13804,12 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
         so the ledger doesn't fill up with stale active entries.
         """
         driver = None
+        owned = False
         try:
             self._emit_direct(gui_callback, f"🔄 Syncing winnings for {phone}...")
-            driver = self._build_driver(gui_callback=gui_callback,
-                                        force_visible=False, mobile=False,
-                                        headless=True, capture_perf=False,
-                                        minimize=True)
+            driver, owned = self._borrow_account_browser(
+                phone, gui_callback=gui_callback, force_visible=False,
+                mobile=False, headless=True, capture_perf=False, minimize=True)
             self._ensure_bet_login(driver, phone, password, gui_callback=gui_callback)
             if not self._session_is_live(driver, deep_check=False):
                 self._emit_direct(gui_callback, "⚠️ Could not verify login for win-sync.")
@@ -11067,6 +13844,11 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
                         except ValueError:
                             continue
                     legs = int(r.get("legs") or 0)
+                    # Markets/probs/games from the engine's own ledger when
+                    # this site bet is one of ours (id match on bet_id /
+                    # short_bet_id). Empty only when the engine never placed
+                    # it (a genuinely manual bet from the phone app).
+                    _enr = self._new_engine_enrich(row_id)
                     # Reconstruct a minimal ledger entry
                     entry = {
                         "id": row_id,
@@ -11076,14 +13858,26 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
                         "stake": stake,
                         "odds": round(win / stake, 2) if stake > 0 and win > 0 else 0.0,
                         "possible_win": win,
-                        "markets": [],
-                        "probs": [],
+                        "markets": _enr.get("markets") or [],
+                        "probs": _enr.get("probs") or [],
                         "status": st,
                         "settled_at": placed_at if st in ("won", "lost", "void") else None,
                         "won_amount": win if st == "won" else None,
                         "imported": True,
                         "recipe": {"legs": legs, "band": self._band_of(win / stake if stake > 0 and win > 0 else 0), "lead": "-", "mix": "-"},
                     }
+                    if _enr.get("games"):
+                        entry["games"] = _enr["games"]
+                    if _enr.get("leg_names"):
+                        entry["leg_names"] = _enr["leg_names"]
+                    # leg_odds + legs_meta: MEASURED 2026-10-15 - the import
+                    # dropped both, so every settled row hit the recorder's
+                    # 0.5 probability placeholder and its league fell into
+                    # "Unknown" even though the engine's ledger has them.
+                    if _enr.get("leg_odds"):
+                        entry["leg_odds"] = _enr["leg_odds"]
+                    if _enr.get("legs_meta"):
+                        entry["legs_meta"] = _enr["legs_meta"]
                     if getattr(self, "_bets", None) is None:
                         self._bets = []
                     self._bets.append(entry)
@@ -11139,11 +13933,16 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
 
             return {"status": "success", "summary": summary}
         except Exception as e:
-            self._emit_direct(gui_callback, f"⚠️ Win-sync failed: {str(e)[:120]}")
+            msg = str(e)
+            if ("Timed out receiving message from renderer" in msg or "renderer" in msg.lower()
+                    or "script timeout" in msg):
+                self._emit_direct(gui_callback, "⏸️ Win-sync: renderer busy — skipped, will retry next cycle.")
+            else:
+                self._emit_direct(gui_callback, f"⚠️ Win-sync failed: {msg[:120]}")
             return {"status": "error", "summary": self._ledger_summary()}
         finally:
             try:
-                if driver is not None:
+                if driver is not None and owned:
                     driver.quit()
             except Exception:
                 pass
@@ -11282,6 +14081,47 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
         except Exception:
             return True
 
+    def _mark_leg_suspended(self, gid, market, cooldown_s: int = 3600):
+        """Remember a leg (gid+market) the book flagged suspended / 'Not valid'
+        so rebuilders skip it until the cooldown clears. Never raises."""
+        try:
+            key = f"{gid}|{market}"
+            until = time.time() + float(cooldown_s)
+            cur = self._suspended_until.get(key, 0.0)
+            if until > cur:
+                self._suspended_until[key] = until
+            # Prune so the dict never grows unbounded across hours of runs.
+            now = time.time()
+            stale = [k for k, v in self._suspended_until.items() if v <= now]
+            for k in stale[:200]:
+                self._suspended_until.pop(k, None)
+        except Exception:
+            pass
+
+    def _leg_suspended_till(self, gid, market) -> float:
+        """Epoch ts until which this leg is benched (0.0 = not benched)."""
+        try:
+            return float(self._suspended_until.get(f"{gid}|{market}", 0.0))
+        except Exception:
+            return 0.0
+
+    def _bench_slip_legs(self, legs, cooldown_s: int = 3600):
+        """Bench every leg in a slip the book just flagged 'Not valid'. legs is a
+        list of (odds, name, gid, market, prob) tuples; gid/market keep the same
+        gid|market key the option loop consults. Safe on partial tuples too."""
+        try:
+            if not legs:
+                return
+            for leg in legs:
+                if not isinstance(leg, (tuple, list)) or len(leg) < 4:
+                    continue
+                gid = str(leg[2] or "")
+                market = str(leg[3] or "")
+                if gid and market:
+                    self._mark_leg_suspended(gid, market, cooldown_s=cooldown_s)
+        except Exception:
+            pass
+
     def _ko_hhmm(self, dt) -> str:
         """'HH:MM' kick-off label, or '' when unknown."""
         try:
@@ -11325,11 +14165,11 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
         """
         for i in range(max_scrolls):
             driver.execute_script(r"""
-window.scrollTo(0, document.body.scrollHeight);
+if (document.body) window.scrollTo(0, document.body.scrollHeight);
 var scr = document.querySelectorAll('.event-sports__row, .event-sports__sticky, [class*="event-list"], [class*="scroll"], .data-live-scroll, main, [role="main"], .container, .content, .event-tabs-holder__content');
 for (var s = 0; s < scr.length; s++) {
     var el = scr[s];
-    if (el.scrollHeight > el.clientHeight + 40) {
+    if (el && el.scrollHeight > el.clientHeight + 40) {
         el.scrollTop = el.scrollHeight;
     }
 }
@@ -11627,17 +14467,64 @@ return 'noicon';
                 except Exception:
                     content = ""
             if content:
-                enr = self._parse_enrichment_from_text(content)
+                enr = self._parse_enrichment_from_text(content, home_hint=home,
+                                                    away_hint=away)
                 if enr and (enr.get("injuries") or enr.get("suspensions")
                             or enr.get("weather") or enr.get("venue")
-                            or enr.get("referee")):
+                            or enr.get("referee") or enr.get("lineups")
+                            or enr.get("formations")):
                     self._set_enrichment(gid_str, enr)
                     found_enrichment = True
+                    if enr.get("lineups") or enr.get("formations"):
+                        try:
+                            _lx = len((enr.get("lineups") or {}).get("home") or []) \
+                                + len((enr.get("lineups") or {}).get("away") or [])
+                            self._emit_direct(
+                                None,
+                                f"  \U0001f9d1 LINEUPS: {_lx} named player(s), "
+                                f"formations {(enr.get('formations') or {})}")
+                        except Exception:
+                            pass
                 # Form: parse + cache both teams from the same overlay text, so
                 # the NEXT selection run can tilt markets by real recent results.
                 if home and away:
                     try:
                         parsed = self._parse_h2h_form(content, home, away) or {}
+                        # Similar-opponent history (2026-10-05): the same
+                        # overlay lists each team's recent fixtures WITH their
+                        # opponents, so this reuses the page already open and
+                        # costs no extra request. Stored on the enrichment
+                        # record so the selector can weigh it.
+                        try:
+                            _rec_opp = self._parse_recent_opponents(content)
+                            if _rec_opp.get("home") or _rec_opp.get("away"):
+                                # LATENT-BUG FIX (2026-10-05). This wrote into a local
+                                # named `result`, which does not exist in this scope, so it raised
+                                # NameError and the bare `except: pass` immediately below swallowed
+                                # it. That is the whole reason `recent_opponents` had stayed at 0 in
+                                # the enrichment cache since it was written: the parser worked (its
+                                # unit tests passed) but the result was discarded on the very next
+                                # line, so the similar-opponent factor never received a single real
+                                # sample from a live run. The intended target was always this
+                                # method's enrichment record (`enr`), which _set_enrichment
+                                # REPLACES - so we mutate it and re-store to persist the new key.
+                                enr["recent_opponents"] = {
+                                    "home": _rec_opp.get("home") or [],
+                                    "away": _rec_opp.get("away") or [],
+                                }
+                                # enr was already handed to _set_enrichment
+                                # above and that helper REPLACES the cache entry,
+                                # so the new key only survives if we store again.
+                                self._set_enrichment(gid_str, enr)
+                                self._emit_direct(
+                                    None,
+                                    f"  \U0001f517 SIMILAR-OPPONENT HISTORY cached: "
+                                    f"home {len(enr['recent_opponents']['home'])} "
+                                    f"fixture(s), away "
+                                    f"{len(enr['recent_opponents']['away'])} fixture(s) "
+                                    f"— {home} vs {away}")
+                        except Exception:
+                            pass
                         e_home = parsed.get("home") or {}
                         e_away = parsed.get("away") or {}
                         if (e_home.get("n") or 0) >= 3:
@@ -11646,6 +14533,10 @@ return 'noicon';
                             self._cache_form_entry(away, e_away)
                     except Exception:
                         pass
+            # Close the overlay page IMMEDIATELY after the read. Leaving it open
+            # while we parse/cache made a stats tab sit visibly on screen for
+            # seconds per game — the rapid open/close flicker the owner reported.
+            # Close first, then parse, so nothing renders behind the round.
             self._close_analysis_pages(driver, gui_callback=gui_callback)
             return True
         except Exception:
@@ -11726,6 +14617,20 @@ return 'noicon';
                 if home and away:
                     try:
                         parsed = self._parse_h2h_form(content, home, away) or {}
+                        # Similar-opponent history (2026-10-05): the same
+                        # overlay lists each team's recent fixtures WITH their
+                        # opponents, so this reuses the page already open and
+                        # costs no extra request. Stored on the enrichment
+                        # record so the selector can weigh it.
+                        try:
+                            _rec_opp = self._parse_recent_opponents(content)
+                            if _rec_opp.get("home") or _rec_opp.get("away"):
+                                result["recent_opponents"] = {
+                                    "home": _rec_opp.get("home") or [],
+                                    "away": _rec_opp.get("away") or [],
+                                }
+                        except Exception:
+                            pass
                         e_home = parsed.get("home") or {}
                         e_away = parsed.get("away") or {}
                         if (e_home.get("n") or 0) >= 3:
@@ -12256,16 +15161,33 @@ return 'clicked';
                             f"X2 {dc.get('dc_x2')} | 12 {dc.get('dc_12')}")
                     else:
                         g["dc_odds_present"] = False
+                    # Read the DC odds AND the extra-market legs from this SAME
+                    # open page. A second pass used to re-open every game just to
+                    # fetch DNB/FTTS/O-U lines, so each candidate opened and closed
+                    # a page twice per round — the rapid flicker the owner saw.
+                    try:
+                        _extras = self._parse_full_market_legs(res.get("markets") or [])
+                        if _extras:
+                            g["_fm"] = _extras
+                            self._emit_direct(
+                                gui_callback,
+                                f"🧮 {g.get('name','')}: +{len(_extras)} extra markets "
+                                f"(DNB/FTTS/O-U lines) exploitable")
+                    except Exception:
+                        pass
                     self._dc_scrape_at[gid] = now
                     opened += 1
                 except Exception:
                     pass
-                # come back to the listing so the next expander click is correct
-                try:
-                    self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
-                    time.sleep(0.8)
-                except Exception:
-                    pass
+            # Return to the listing ONCE at the end of this pass. Navigating back
+            # after every single game caused the rapid "open and close" the user
+            # complained about, and it also gave the page no time to actually
+            # render the opened full-market tab's content before jumping away.
+            try:
+                self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                time.sleep(0.6)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -12348,14 +15270,22 @@ return 'clicked';
         EVERY market type (Draw No Bet, First Team To Score, all O/U lines, …) into
         each game's `_fm` extra-legs list. This gives the selector a huge range of
         markets to exploit instead of just the 4 listing-row markets. Rate-limited
-        per game (fresh for 15 min) and bounded by max_open + a running deadline."""
+        per game (fresh for 15 min) and bounded by max_open + a running deadline.
+
+        The DC-odds pass already opened these same pages and parsed the same
+        `_fm` legs from the identical response, so skip any game it covered.
+        Re-opening every game here was a second full round of page open/close —
+        the flicker the owner reported."""
         try:
             now = time.time()
             deadline = time.time() + 90.0
+            _dc_done = getattr(self, "_dc_scrape_at", {}) or {}
             cands = []
             for g in (games or []):
                 gid = str(g.get("id") or "")
                 if not gid:
+                    continue
+                if _dc_done.get(gid):
                     continue
                 if now - (getattr(self, "_fm_scrape_at", {}) or {}).get(gid, 0.0) < 900:
                     continue
@@ -12384,19 +15314,77 @@ return 'clicked';
                             gui_callback,
                             f"🧮 {g.get('name','')}: +{len(extras)} extra markets "
                             f"(DNB/FTTS/O-U lines) exploitable")
-                    (getattr(self, "_fm_scrape_at", {}) or {})[gid] = now
+                    (self._fm_scrape_at or {})[gid] = now
                     if not getattr(self, "_fm_scrape_at", None):
                         self._fm_scrape_at = {}
                     opened += 1
                 except Exception:
                     pass
+            try:
+                self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                time.sleep(0.5)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _implied_by_market(self, g: dict, h3_probs=None, btts_probs=None,
+                           ou_probs=None, **_ignored) -> dict:
+        """Margin-corrected implied probability for EVERY tracked market of one game.
+
+        EDGE RANKING (2026-10-05): each leg is compared against the implied
+        probability of ITS OWN market, never against one global number. That is
+        what makes the comparison fair across markets. A Double Chance leg priced
+        from fair 1X2 odds structurally carries ~6% DC margin, so a raw EV
+        comparison permanently punished DC — the exact bug that made the
+        machine refuse to draft the best-performing market in its own history.
+        Comparing each leg to its own market means a fairly-priced leg scores
+        ratio ~1.0 whichever market it came from, so only a genuine
+        disagreement with the book registers as edge.
+
+        Returns {market: implied_prob}.
+        """
+        out = {}
+        try:
+            g = g if isinstance(g, dict) else {}
+            hp = list(h3_probs or [])
+            bp = list(btts_probs or [])
+            op = list(ou_probs or [])
+
+            def _put(mk, odds_field, probs, idx):
                 try:
-                    self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
-                    time.sleep(0.6)
-                except Exception:
+                    prob = float(probs[idx])
+                except (IndexError, TypeError, ValueError):
+                    return
+                if not (0.0 < prob < 1.0):
+                    return
+                try:
+                    odds = float(g.get(odds_field) or 0)
+                except (TypeError, ValueError):
+                    odds = 0.0
+                if odds > 1.0:
+                    out[mk] = prob
+
+            _put("home", "home_odds", hp, 0)
+            _put("draw", "draw_odds", hp, 1)
+            _put("away", "away_odds", hp, 2)
+            _put("btts", "btts_yes", bp, 0)
+            _put("btts_no", "btts_no", bp, 1)
+            _put("over", "over_25", op, 0)
+            _put("under", "under_25", op, 1)
+            # O/U 1.5 has no margin-corrected array of its own here; the caller
+            # calibrates it via Poisson. Fall back to the 2.5 OVER implied prob,
+            # which is the closest honest prior for a higher-probability line.
+            if "over15" not in out and op:
+                try:
+                    p15 = float(op[0])
+                    if 0.0 < p15 < 1.0:
+                        out["over15"] = min(0.97, p15 + 0.18)
+                except (TypeError, ValueError):
                     pass
         except Exception:
             pass
+        return out
 
     @staticmethod
     def _fair_win_probs(odds_list) -> list | None:
@@ -12495,7 +15483,16 @@ return 'clicked';
                             for _key in list(self._clv_store().keys()):
                                 if not _key.startswith(f"{gid}|"):
                                     continue
-                                _name = str(_mk).split("|", 1)[1]
+                                # Latent-bug fix (2026-10-05): this read `_mk`,
+                                # a name that exists nowhere. The surrounding
+                                # try/except swallowed the NameError, so the
+                                # entire CLV recheck died silently every time a
+                                # kick-off entered the lead window - which is
+                                # why closing-line data was almost never
+                                # recorded, leaving the sharpest available
+                                # measure of whether our prices were good
+                                # completely absent.
+                                _name = str(_key).split("|", 1)[1]
                                 _field = self._MARK_ODDS_FIELD.get(_name)
                                 if not _field:
                                     continue
@@ -12574,6 +15571,12 @@ return 'clicked';
                 field = self._MARK_ODDS_FIELD.get(mk)
                 odds = g.get(field) if field else None
                 if not isinstance(odds, (int, float)) or odds <= 1.0:
+                    continue
+                # OWNER RULE (2026-10-05): the fishnet is a separate leg builder
+                # and did NOT go through the selector's MIN_LEG_ODDS gate, so it
+                # was still free to take 1.01-1.09 dead filler. Apply the same
+                # floor here so both builders obey one rule.
+                if not (self.MIN_LEG_ODDS < odds):
                     continue
                 start = g.get("start")
                 if start and (start - datetime.now()).total_seconds() < 90:
@@ -12747,19 +15750,14 @@ return 'clicked';
         _DIAG = {"games": 0, "veto": 0, "used": 0, "stale": 0, "no_opts": 0,
                  "cand": 0, "near": 0, "below_abs": 0, "trunc": 0,
                  "no_options": 0, "no_home": 0, "all_sub120": 0, "all_raw": 0,
+                 "all_whitelist": 0, "all_cap": 0, "all_group_used": 0,
+                 "all_combo_used": 0, "all_retired": 0, "all_btts": 0,
                  "only_btts_cap": 0, "res_only": 0}
         # OWNER RULE (per-SLIP, 2026-09-19): max ONE BTTS/GG leg per slip. The
-        # old engine re-armed this cap inside the per-game loop, so 3-4 GG legs
-        # could still stack (BTTS fair prob ~55-60% got it picked every kick-off).
-        # The slot must live OUTSIDE the games loop so a slip claims it exactly once.
+        # slot must live OUTSIDE the games loop so a slip claims it exactly once.
         btts_used_in_slip = False
-        # OWNER RULE (per-SLIP, 2026-09-26): the O/U "death trap" cap. The 09-26
-        # ledger showed an all-"over" slip (4x over @ 0.93 confidence, 3.03 odds)
-        # that settled LOST — one correlated goal-stack, all four legs dead
-        # together. Goals legs are common in football and easy for the confidence
-        # model to overrate, so cap them per slip exactly like BTTS. This forces
-        # the machine to reach for 1X2 / Double Chance / BTTS legs too, so a slip
-        # spans the whole board instead of betting one market four times.
+        # OWNER RULE (per-SLIP, 2026-09-26): the O/U "death trap" cap. Goals legs
+        # are capped per slip exactly like BTTS, forcing 1X2 / DC / BTTS legs in.
         goals_used_in_slip = 0
         # Threshold census (2026-09-28): how many GAMES reach each gate, so the
         # live log can show WHY the board collapses to 3 legs instead of guessing.
@@ -12796,6 +15794,9 @@ return 'clicked';
                 _enr = self._enrichment_for(gid)
             except Exception:
                 _enr = None
+            # XI / formation weighting (2026-10-05). Computed per leg below,
+            # because whether an attacking shape helps depends on the market:
+            # a 4-3-3 vs 5-4-1 raises Over 2.5 but says little about 1X2.
             # Hard veto: a game with multiple injury/suspension flags or a stated
             # key absence is dropped ENTIRELY — never bet, never even considered.
             _veto = self._enrichment_veto(_enr or {})
@@ -13016,14 +16017,23 @@ return 'clicked';
                         _used_groups_for_game.add(_grp)
 
             for o, p, mk, suf, form_k in options:
+                # Suspended-at-PLACE memory: a leg the book flagged "Not valid"
+                # (selection suspended/removed) blocks every later submit dead.
+                # Skip it from the pool until its cooldown clears so the rebuild
+                # picks fresh upcoming games instead of the same dead one.
+                if self._leg_suspended_till(gid, mk) > time.time():
+                    _DIAG["all_susp"] = _DIAG.get("all_susp", 0) + 1
+                    continue
                 # Owner rule: never a leg below x1.20 (drop 1.01/1.04 filler legs).
                 if not (self.MIN_LEG_ODDS < o):
                     _DIAG["all_sub120"] += 1
                     continue
                 # Owner's market whitelist toggles (Over 1.5 / Over 2.5 / BTTS / 1X2).
                 if not self._market_ok(mk):
+                    _DIAG["all_whitelist"] += 1
                     continue
                 if not no_odds_cap and o > odds_cap:
+                    _DIAG["all_cap"] += 1
                     continue
                 # Hard raw veto — never bet a leg the model rates below the veto, no matter
                 # how much a market weight or drift factor would pad it. In explicit
@@ -13036,11 +16046,14 @@ return 'clicked';
                 # Block if this market's GROUP was already used for this game
                 _grp_here = _mk_group(mk)
                 if _grp_here in _used_groups_for_game:
+                    _DIAG["all_group_used"] += 1
                     continue
                 # Also block exact combo (legacy safety net)
                 if f"{gid}|{mk}" in used_set:
+                    _DIAG["all_combo_used"] += 1
                     continue
                 if self.is_market_retired(mk):
+                    _DIAG["all_retired"] += 1
                     continue
                 # v4+ OWNER RULE (ENFORCED 2026-09-19): max ONE BTTS/GG leg per
                 # slip. GG sits at ~55-60% fair prob so raw probability picks it
@@ -13058,6 +16071,7 @@ return 'clicked';
                     # treated as "the data does NOT highly support this" and the
                     # leg is skipped (never a bare-dice BTTS). One BTTS max/slip.
                     if btts_used_in_slip or float(p or 0.0) < self.BTTS_STRONG_FLOOR:
+                        _DIAG["all_btts"] += 1
                         continue
                 # OWNER RULE (2026-09-26): O/U death-trap cap. Goals legs are the
                 # ones that keep stacking (see goals_used_in_slip). Past the cap a
@@ -13072,12 +16086,37 @@ return 'clicked';
                 v_k = 1.0
                 if hub is not None:
                     v_k = hub.value_k(gid, mk)
+# XI / formation lift (2026-10-05). Per-leg because it is market-aware:
+                # a confirmed 4-3-3 vs 5-4-1 raises Over 2.5 but barely moves
+                # 1X2. Neutral (1.0) when no lineup was parsed, so a missing XI
+                # never silently punishes a game.
+                _xi_k = 1.0
+                try:
+                    _xi_k = self._lineup_formation_k(_enr or {}, market=mk)
+                except Exception:
+                    _xi_k = 1.0
+                # Similar-opponent record (2026-10-05). Compared against the
+                # team on the OTHER side of this fixture, so each side is
+                # judged on its own history against comparable clubs.
+                _sim_k = 1.0
+                try:
+                    _opp = away_n if str(mk) in ("home", "dc_1x", "dnb_home") else (
+                        home_n if str(mk) in ("away", "dc_x2", "dnb_away") else "")
+                    if _opp:
+                        _rec = (_enr or {}).get("recent_opponents") or {}
+                        _side_rec = _rec.get(
+                            "home" if str(mk) in ("home", "dc_1x", "dnb_home") else "away")
+                        _sim_k = self._similar_opponent_k(
+                            {"rows": _side_rec or []}, _opp)
+                except Exception:
+                    _sim_k = 1.0
 # Due-diligence weight now drives selection: market hit-rate from
-                # learning, form tilt, injury/weather, scout EV, and live odds drift
-                # all scale the probability that actually ranks legs and slips.
+                # learning, form tilt, injury/weather, scout EV, live odds drift
+                # and now the confirmed XI / formation all scale the probability
+                # that actually ranks legs and slips.
                 base_w = (float(p) * self._market_type_weight(mk) * form_k *
                           v_k * e_k * self._drift_k(gid, mk, o) * self._time_k(g) *
-                          self._league_k(mk, nm))
+                          self._league_k(mk, nm) * _xi_k * _sim_k)
                 # Per-game census: the HARD gates (raw veto + odds floor + market
                 # whitelist + not retired) decide whether a game is bettable at all.
                 # The weighted score base_w only ranks. Count how many games reach
@@ -13172,14 +16211,93 @@ return 'clicked';
             # MAX_GOALS_LEGS_PER_SLIP, which forces 1X2 / DC / BTTS onto the rest
             # of the slip. Confidence-primary then simply picks the most-likely
             # leg within that already-diversified set.
-            def _ev_kelly(c):
-                o = c[0]
-                _k0 = c[2]  # weighted winning confidence (capped at market-implied)
-                ev = _k0 * o - 1.0
-                kelly = ev / (o - 1.0) if o > 1.01 else 0.0
-                return (_k0, ev, kelly, c[1], c[0])
-            valid.sort(key=_ev_kelly, reverse=True)
+            # ── EDGE-AWARE RANKING (2026-10-05, owner request) ──────────────
+            # WHY: pure confidence-primary ranking guarantees the shortest
+            # price on the board every time, and the bookmaker's margin is
+            # WORST (as a percentage) exactly where the price is shortest —
+            # ~6% at x1.20 vs ~10% at x1.70. Ranking by probability therefore
+            # walks straight into the most expensive part of the book, which is
+            # why every slip kept collapsing to x1.6-x1.9.
+            #
+            # WHAT: base_w is already our edge signal — it folds in team form,
+            # injuries/weather, market hit-rate calibration, scout EV and odds
+            # drift. The genuine edge on a leg is therefore how far base_w
+            # EXCEEDS what that leg's own price already implies. A leg we rate
+            # exactly in line with the book (ratio ~1.0) offers no edge at any
+            # price; a leg we rate materially above the book offers edge.
+            #
+            # WHY NOT PURE EV (the trap the owner already hit): a DC leg whose
+            # odds are DERIVED from fair 1X2 probabilities structurally carries
+            # ~6% DC margin, so its raw EV is always about -6% and it could
+            # never out-rank an over/under leg. Comparing each leg against ITS
+            # OWN market removes that artefact, because a correctly-priced leg
+            # scores ratio ~1.0 whatever market it came from.
+            #
+            # DAMPING: raw ratio rewards longshots, whose tiny implied
+            # probabilities swing wildly on small absolute errors (a 0.42 est
+            # vs 0.30 implied looks like a 40% edge when it is mostly rounding).
+            # So the ratio is square-rooted (halves the spread, preserves order)
+            # and hard-capped, keeping value-awareness without the variance.
+            _f = self._implied_by_market(g, h3_probs=h3_probs,
+                                      btts_probs=btts_probs,
+                                      ou_probs=ou_probs)
+            def _edge_key(c):
+                o = float(c[0])
+                _k0 = float(c[2])            # diligence-weighted confidence
+                # This leg's OWN market implied prob, else the raw 1/odds.
+                _implied = _f.get(c[3]) or (1.0 / o if o > 1.0 else 1.0)
+                # How much we believe it beyond what the price implies.
+                _ratio = (_k0 / _implied) if _implied > 1e-6 else 1.0
+                _damped = (_ratio ** 0.5) if _ratio > 0 else 0.0
+                _damped = max(0.0, min(_damped, self._EDGE_RATIO_CAP))
+                _ev = _k0 * o - 1.0
+                _kelly = _ev / (o - 1.0) if o > 1.01 else 0.0
+                # CONFIDENCE-SCALED bonus, but applied on a BLENDED scale.
+                #
+                # Three shapes were implemented and MEASURED (see the table
+                # below); only this one satisfies both required properties:
+                #   (a) k0 * (1 + W*(damped-1))      -> penalised legs we agree
+                #       with, needed W~2.5 to flip, and at that W a noisy 6.00
+                #       longshot outranked a solid 1.40 favourite.
+                #   (b) k0 + k0*W*max(0,damped-1)   -> longshot's tiny implied
+                #       prob inflated its ratio (6.00 @0.42 vs implied 0.167 =
+                #       ratio 2.52), so from W=0.6 it beat a 2.40 favourite.
+                #   (c) (c) trust-scaled but still on the k0 scale -> safe, but
+                #       a 0.78 leg needed a 22-point confidence gap to be
+                #       overtaken, so edge could NEVER actually flip anything.
+                #
+                # The resolution: compare on a scale where the two quantities
+                # are commensurable. Here k0 is compressed toward 1.0 by
+                # _EDGE_CONF_BLEND, so the multiplicative edge term occupies a
+                # comparable share of the score instead of being a rounding
+                # error on top of a 0-1 probability.
+                #
+                #   score = k0*(1-B) + B*k0*damped      (B = blend)
+                #
+                # When a leg merely AGREES with the book (damped~1.0) the edge
+                # term vanishes and the score is ~k0, so a solid favourite is
+                # left essentially where it was. When we genuinely disagree
+                # (damped 1.2-1.35) the edge term is a real, competitive share.
+                # The _trust factor still scales the edge term down for
+                # longshots, whose ratios are inflated by construction, so a
+                # 6.00 shot can never displace a solid favourite.
+                _trust = max(0.0, min(1.0, (_k0 - 0.45) / 0.30))
+                _blend = self._EDGE_CONF_BLEND
+                _edge_term = _k0 * (1.0 + self._EDGE_VALUE_WEIGHT * _trust * (_damped - 1.0))
+                _score = _k0 * (1.0 - _blend) + _edge_term * _blend
+                return (_score, _damped, _k0, _ev, _kelly, c[1], c[0])
+            valid.sort(key=_edge_key, reverse=True)
             o, _w, p, mk, suf = valid[0]
+            # DIAG: surface the winner's edge so the log shows whether the
+            # machine is finding genuine value or just re-ranking favourites.
+            try:
+                _bk = _edge_key(valid[0])
+                _DIAG["edge_best"] = round(float(_bk[1]), 3)
+                _DIAG["edge_pos"] = _DIAG.get("edge_pos", 0) + 1
+                if _bk[1] > 1.0:
+                    _DIAG["edge_over_mkt"] = _DIAG.get("edge_over_mkt", 0) + 1
+            except Exception:
+                pass
             # Claim the slip's single BTTS slot only when a BTTS leg is actually
             # drafted for this game (walks the per-slip cap across games).
             if str(mk) in ("btts", "btts_no"):
@@ -13266,8 +16384,10 @@ return 'clicked';
                           f"| window x{lo:.2f}-x{target_max:.2f} | "
                           f"leg odds {pool[0][0]:.2f}..{pool[-1][0]:.2f}"
                           f" | games_reached_rank={_census['any_leg']} "
-                          f"sub120_calls={_DIAG['all_sub120']} "
-                          f"rawveto_calls={_DIAG['all_raw']} "
+                          f"sub120={_DIAG['all_sub120']} veto={_DIAG['all_raw']} "
+                          f"wl={_DIAG['all_whitelist']} cap={_DIAG['all_cap']} "
+                          f"grp={_DIAG['all_group_used']} ret={_DIAG['all_retired']} "
+                          f"btts={_DIAG['all_btts']} susp={_DIAG.get('all_susp', 0)} "
                           f"no_opts_games={_DIAG['no_options']} "
                           f"res_only_games={_DIAG['res_only']})"
                           if pool else
@@ -13276,8 +16396,10 @@ return 'clicked';
                           f"stale={_DIAG['stale']} | qualifying legs=0 "
                           f"| NO POOL — nothing cleared the gates"
                           f" | games_reached_rank={_census['any_leg']} "
-                          f"sub120_calls={_DIAG['all_sub120']} "
-                          f"rawveto_calls={_DIAG['all_raw']} "
+                          f"sub120={_DIAG['all_sub120']} veto={_DIAG['all_raw']} "
+                          f"wl={_DIAG['all_whitelist']} cap={_DIAG['all_cap']} "
+                          f"grp={_DIAG['all_group_used']} ret={_DIAG['all_retired']} "
+                          f"btts={_DIAG['all_btts']} susp={_DIAG.get('all_susp', 0)} "
                           f"no_opts_games={_DIAG['no_options']} "
                           f"res_only_games={_DIAG['res_only']})")
 
@@ -13289,6 +16411,23 @@ return 'clicked';
                 prod_p *= c[4]
             return prod_o, prod_p
 
+        def _cap_ok(combo) -> bool:
+            """True when no single market holds more than MAX_MARKET_LEGS_PER_SLIP
+            slots in this combo.
+
+            The cap used to be checked only AFTER a slip was chosen, so the
+            builder could spend a full crawl assembling a combo that the caller
+            then threw away ("over15 held more than 2 legs") and the round was
+            lost for nothing. Applying it here makes the search return a slip
+            that is actually placeable."""
+            counts: dict = {}
+            for c in combo:
+                mk = c[3]
+                counts[mk] = counts.get(mk, 0) + 1
+                if counts[mk] > self.MAX_MARKET_LEGS_PER_SLIP:
+                    return False
+            return True
+
         best = None
         best_rank = None
         for size in range(min_legs, max_legs + 1):
@@ -13297,6 +16436,8 @@ return 'clicked';
             for combo in itertools.combinations(pool, size):
                 prod_o, prod_p = _joint(combo)
                 if prod_o < lo or prod_o > hi:
+                    continue
+                if not _cap_ok(combo):
                     continue
                 # Long-shot mode: use AS MANY games as possible to build the big
                 # multi-match ticket; otherwise prefer the highest win probability.
@@ -13319,6 +16460,8 @@ return 'clicked';
                 for combo in itertools.combinations(pool, size):
                     prod_o, prod_p = _joint(combo)
                     if prod_o > target_max * 1.1 or prod_o < floor:
+                        continue
+                    if not _cap_ok(combo):
                         continue
                     # closest to target_min, highest probability wins ties
                     if prefer_more_legs:
@@ -13346,6 +16489,8 @@ return 'clicked';
                 if min(c[4] for c in combo) < 0.72:
                     continue
                 if prod_o < self.MIN_COMBINED_ODDS or prod_o > 8.0:
+                    continue
+                if not _cap_ok(combo):
                     continue
                 rank = (prod_p, prod_o)
                 if best_2_rank is None or rank > best_2_rank:
@@ -13402,8 +16547,6 @@ return 'clicked';
             if not getattr(self, "running", True):
                 break
             home = name.split(" vs ")[0].strip() if " vs " in name else str(name).strip()
-            live_now = _living(driver)
-            enough = isinstance(live_now, int) and live_now >= 2
             # ── Primary path: click the odd on a LISTING row (main page) ──
             # The board's own prices came off those hydrated rows, so the same
             # DOM has the click. Open the market page only if the row can't.
@@ -13422,8 +16565,11 @@ return 'clicked';
                        self.FOOTBALL_HOME_URL, self.TODAY_GAMES_PAGE_URL):
                 if _u not in _ls_cands:
                     _ls_cands.append(_u)
-            if enough:
-                _ls_cands = [_cur] if _cur else _ls_cands[:1]
+            # Search every candidate listing page for this leg. Narrowing to the
+            # current page when the slip already held 2 legs was the other half
+            # of the stop-short behaviour removed above: it abandoned the search
+            # while legs were still available, which is how a round ended up
+            # offering a x1.12 slip the floor then had to refuse.
             ok = False
             for _lpage in _ls_cands:
                 if not getattr(self, "running", True):
@@ -13457,28 +16603,37 @@ return 'clicked';
                                       f"   ✅ {name} [{market}] @{odds:.2f} selected "
                                       "(listing row)")
                     break
-            # ── Fallback: the FULL-MARKET page (only when the row had nothing) ──
+            # ── Fallback: the FULL-MARKET page ──────────────────────────────────
+            # ALWAYS reachable, even when the game's row is not on the board we
+            # happen to be looking at: it is a per-game URL keyed on gid.
+            #
+            # STOP-SHORT FIX (2026-10-05). This used to give up as soon as the
+            # slip held >= 2 legs ("slip already payable"). That is only true if
+            # those 2 legs clear the odds floor - and very often they do not.
+            # Live run: four legs chosen, two of them for games on tomorrow's
+            # board that the current page cannot show, both dropped as "already
+            # payable", leaving 1.10 x 1.10 = a x1.12 slip that the floor then
+            # (correctly) refused. The round died with two legs it could have
+            # used still available.
+            #
+            # So: keep working every leg we were given. The per-game page is
+            # slower than a listing row, but losing the round costs far more
+            # than a few seconds.
             if not ok:
-                if enough:
-                    skipped += 1
-                    self._emit_direct(gui_callback,
-                                      f"   ⏭ {name} [{market}] not on current page — "
-                                      "skipped (slip already payable)")
-                else:
-                    time.sleep(0.5)
+                time.sleep(0.5)
+                ok = self._click_leg_on_market_page(driver, gid, home, market,
+                                                    odds, name, gui_callback=gui_callback)
+                if not ok:
+                    time.sleep(0.8)
                     ok = self._click_leg_on_market_page(driver, gid, home, market,
                                                         odds, name, gui_callback=gui_callback)
-                    if not ok:
-                        time.sleep(0.8)
-                        ok = self._click_leg_on_market_page(driver, gid, home, market,
-                                                            odds, name, gui_callback=gui_callback)
-                    if ok:
-                        market_selected += 1
-                    else:
-                        skipped += 1
-                        self._emit_direct(gui_callback,
-                                          f"   ❌ {name} [{market}] not clickable "
-                                          f"(gid {gid})")
+                if ok:
+                    market_selected += 1
+                else:
+                    skipped += 1
+                    self._emit_direct(gui_callback,
+                                      f"   ❌ {name} [{market}] not clickable "
+                                      f"(gid {gid}) — no listing row and no market page")
         total = market_selected + listing_selected
         # ── Owner rule: a "selected" click that never registered in the Angular
         # BetslipService is a phantom — the slip looks full to us but is empty or
@@ -13813,7 +16968,7 @@ return false;
 
     def _read_balance_text(self, driver) -> float:
         """Read the wallet balance from the page (skip bet figures like POSSIBLE WIN)."""
-        val = driver.execute_script(r"""
+        val = self._exec_script(driver, r"""
 var b = (document.body && document.body.innerText) || '';
 var re = /(?:KSH|KES)\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)/gi;
 var ms = [];
@@ -13825,7 +16980,7 @@ if (/(?:POSSIBLE|TOTAL|STAKE|AMOUNT|WIN|ODDS|SELEC.?|BONUS|FREE|CASHBACK|PROMO|M
 return ms[k].v;
 }
 return '';
-""")
+""", default='', timeout=8.0, refresh_on_hang=True, label="balance text")
         try:
             return float(val or 0)
         except (TypeError, ValueError):
@@ -14056,64 +17211,80 @@ return '';
                 results[p] = {"balance": float(ent.get("balance") or 0),
                               "confirmed": bool(ent.get("confirmed"))}
             return results
-        sweep_driver = driver
-        own_driver = False
-        if sweep_driver is None:
-            own_driver = True
+        # ROOT-CAUSE FIX (2026-10-04): NEVER share one browser across accounts.
+        # The old sweep built ONE `sweep_driver` with no `phone=` (so it sat
+        # outside the per-account ownership guard) and then logged EVERY account
+        # in from that same browser. That minted a second live session per account
+        # on top of the one the per-account worker already holds, which is exactly
+        # what the bookmaker reports as "User logged from another device". The
+        # conflict was self-inflicted: the tool was fighting its OWN second login,
+        # which is why recovery kept failing with nothing else logged in anywhere.
+        #
+        # Each account is now read through ITS OWN browser, borrowed via
+        # _borrow_account_browser so a live worker session is reused verbatim
+        # (owned=False → never quit) and only a genuinely browser-less account
+        # gets a temporary one (owned=True → quit right after this sweep).
+        for i, p in enumerate(pending, start=1):
+            ent = self._cached_balance_for(p)
+            if ent is not None and ent.get("confirmed"):
+                results[p] = {"balance": float(ent.get("balance") or 0),
+                              "confirmed": True}
+                continue
+            bal = 0.0
+            ok = False
+            sweep_driver = None
+            owned = False
             try:
-                sweep_driver = self._build_driver(gui_callback=gui_callback,
-                                                  force_visible=visible, mobile=False,
-                                                  headless=headless,
-                                                  capture_perf=False, minimize=True)
-            except Exception as e:
-                self._emit_direct(gui_callback,
-                                  f"⚠️ Balance sweep could not open a browser: {str(e)[:80]}")
-                for p in pending:
-                    results[p] = {"balance": 0.0, "confirmed": False}
-                return results
-        try:
-            for i, p in enumerate(pending, start=1):
-                ent = self._cached_balance_for(p)
-                if ent is not None and ent.get("confirmed"):
-                    results[p] = {"balance": float(ent.get("balance") or 0),
-                                  "confirmed": True}
-                    continue
-                bal = 0.0
-                ok = False
-                try:
-                    self._ensure_bet_login(sweep_driver, p, password, gui_callback=None)
+                sweep_driver, owned = self._borrow_account_browser(
+                    p, gui_callback=gui_callback, force_visible=False,
+                    mobile=False, headless=True, capture_perf=False, minimize=True)
+                # DOUBLE-LOGIN FIX (2026-10-05): the sweep must NEVER
+                # authenticate. It runs on its own thread at the same moment the
+                # per-account workers perform their own login, so a second
+                # POST /login_check for the same account invalidates the first —
+                # which is what produced the "invalid session id" +
+                # "logged in from another device" storm at startup, along with
+                # the 50%+ CPU from the dismiss/re-login thrash.
+                # The sweep's only job is to read a balance. If a session is
+                # already live it reads it; otherwise it defers to the worker,
+                # which is already logging in and will read the balance itself.
+                if self._session_is_live(sweep_driver, deep_check=True):
                     bal, ok = self._read_balance_confirmed(
                         sweep_driver, wait=10.0, phone=p, password=password)
-                    if not ok:
-                        try:
-                            self._force_clear_session(sweep_driver)
-                        except Exception:
-                            pass
-                        bal, ok = self._read_balance_confirmed(
-                            sweep_driver, wait=12.0, phone=p, password=password)
-                except Exception as e:
-                    self._emit_direct(gui_callback,
-                                      f"⚠️ Sweep {p}: {str(e)[:70]}")
-                self._balance_cache[str(p)] = {"balance": bal, "confirmed": ok,
-                                               "ts": time.time()}
-                results[p] = {"balance": bal, "confirmed": ok}
-                if ok:
-                    self._emit_direct(gui_callback,
-                                      f"💳 Start balance {p}: KES {bal:,.2f}")
                 else:
+                    ok = False
+            except Exception as e:
+                msg = str(e)
+                if ("Timed out receiving message from renderer" in msg
+                        or "renderer" in msg.lower() or "script timeout" in msg):
                     self._emit_direct(gui_callback,
-                                      f"ℹ️ Start balance {p}: unreadable — will recheck at bet time")
-                try:
-                    self._force_clear_session(sweep_driver)
-                except Exception:
-                    pass
+                                      f"⏸️ Sweep {p}: renderer busy — skipped, will retry next cycle.")
+                else:
+                    self._emit_direct(gui_callback, f"⚠️ Sweep {p}: {msg[:70]}")
+            finally:
+                # Only ever quit a browser THIS sweep created. A borrowed worker
+                # browser must be left running or the worker loses its session.
+                if owned and sweep_driver is not None:
+                    try:
+                        sweep_driver.quit()
+                    except Exception:
+                        pass
+                    try:
+                        self._clear_account_driver(p)
+                    except Exception:
+                        pass
+            self._balance_cache[str(p)] = {"balance": bal, "confirmed": ok,
+                                           "ts": time.time()}
+            results[p] = {"balance": bal, "confirmed": ok}
+            if ok:
+                self._emit_direct(gui_callback, f"💳 Start balance {p}: KES {bal:,.2f}")
+            else:
+                self._emit_direct(gui_callback,
+                                  f"ℹ️ Start balance {p}: unreadable — will recheck at bet time")
+        try:
             self._save_balance_cache()
-        finally:
-            if own_driver and sweep_driver is not None:
-                try:
-                    sweep_driver.quit()
-                except Exception:
-                    pass
+        except Exception:
+            pass
         self._emit_direct(gui_callback,
                           f"💳 Balance sweep done: {sum(1 for r in results.values() if r.get('confirmed'))}"
                           f"/{len(results)} accounts confirmed.")
@@ -14170,9 +17341,18 @@ return '';
             return []
 
     def _save_captured_route(self, action: str, route: dict):
-        """Persist a captured wallet route for future API-first replay."""
-        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "config", "discovered_sportsape_routes.json")
+        """Persist a captured wallet route for future API-first replay.
+
+        Uses writable_path() so a frozen build writes into the live workspace.
+        Anchoring this on __file__ put it in the _MEIPASS scratch folder, where
+        the write silently failed and every run had to re-capture from scratch.
+        """
+        try:
+            cfg_path = writable_path(os.path.join("config",
+                                                  "discovered_sportsape_routes.json"))
+        except Exception:
+            cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "config", "discovered_sportsape_routes.json")
         try:
             existing = {}
             if os.path.exists(cfg_path):
@@ -14664,13 +17844,204 @@ var app = document.querySelector('body');
 window.__spaPlace = window.__spaPlace || {state:'idle', detail:''};
 window.__spaPlace.state = 'pending';
 window.__spaPlace.detail = '';
+window.__spaNet = [];
 try {
+  var hook = function(){
+    var o = XMLHttpRequest.prototype.open, s = XMLHttpRequest.prototype.send;
+    var store = function(x, when){
+      try {
+        var entry = window.__spaNet[window.__spaNet.length-1];
+        if (entry) { entry[when + 'Status'] = x.status; entry[when + 'Url'] = (x.responseURL||x.url||'').slice(0,200);
+          var body = x.responseText || '';
+          entry[when + 'Body'] = String(body).slice(0,2000); }
+      } catch(e){}
+    };
+    // ── CAPTURE REQUEST HEADERS (2026-10-05) ───────────────────────────
+    // Diagnostic only - no behaviour is changed. The evidence so far says the
+    // session is ACCEPTED for reads (wallet/balance returns 200) in the very
+    // same round that /api/bets/place answers {"code":403,"message":"Forbidden"}.
+    // A dead or superseded token fails both, so this is a control on the bet
+    // write rather than on the login. The likeliest explanation is a header (or
+    // a cookie the header signs) that the SPA's own placeBet() attaches and our
+    // bare fetch() does not. Until we can see the headers, that is a guess - so
+    // record them.
+    var hdrDump = function(h){
+      try {
+        var out = {};
+        if (!h) return out;
+        if (typeof h.forEach === 'function' && typeof h.get === 'function') {
+          h.forEach(function(v, k){ out[k] = String(v).slice(0,120); });
+        } else {
+          for (var k in h) { if (Object.prototype.hasOwnProperty.call(h, k))
+            out[k] = String(h[k]).slice(0,120); }
+        }
+        return out;
+      } catch(e){ return {}; }
+    };
+    // BROAD match: the real endpoint was never confirmed as matching the old
+    // /placebet|place_bet|place-bet|betslip/ pattern, so silent misses looked
+    // like "no request was made". Capture anything that mutates a betslip OR
+    // any POST/PUT, and record non-matches too so we can see what was sent.
+    var interesting = function(m, u){
+      var mm = (m||'').toUpperCase();
+      if (mm === 'POST' || mm === 'PUT') return true;
+      return /place|bet|slip|order|ticket/i.test(u||'');
+    };
+    XMLHttpRequest.prototype.open = function(m, u){
+      this.__m = m; this.__u = (u||'').slice(0,250);
+      this.__hdrs = {};
+      if (interesting(m, this.__u)) {
+        window.__spaNet.push({method: this.__m, url: this.__u, reqStatus: null, reqBody: '', respStatus: null, respUrl: '', respBody: '', reqHeaders: {}, via: 'xhr'});
+        this.addEventListener('loadend', function(){ store(this, 'resp'); });
+      }
+      return o.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.setRequestHeader = function(k, v){
+      try { this.__hdrs = this.__hdrs || {}; this.__hdrs[String(k)] = String(v).slice(0,120); } catch(e){}
+      return this.__origSetHeader ? this.__origSetHeader.apply(this, arguments)
+                                  : XMLHttpRequest.prototype.setRequestHeader.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function(body){
+      var entry = window.__spaNet[window.__spaNet.length-1];
+      if (entry && !entry.reqSent) {
+        try { entry.reqBody = String(body).slice(0,2000); } catch(e){}
+        try { entry.reqHeaders = hdrDump(this.__hdrs); } catch(e){}
+        entry.reqStatus = this.status; entry.reqSent = true;
+      }
+      return s.apply(this, arguments);
+    };
+    // The SPA may use fetch() rather than XHR — hook it too so we never
+    // miss the request just because it took the other transport.
+    try {
+      var of = window.fetch;
+      window.fetch = function(input, init){
+        var url = (typeof input === 'string') ? input : (input && input.url) || '';
+        var m = (init && init.method) || (input && input.method) || 'GET';
+        var rec = null;
+        if (interesting(m, url)) {
+          // `via` separates the SPA's own request from the one our fallback
+          // issues. If the SPA's call succeeds and only ours 403s, the missing
+          // piece is whatever we do not send - now captured in reqHeaders.
+          rec = {method: m, url: String(url).slice(0,250), reqStatus: null,
+                 reqBody: init && init.body ? String(init.body).slice(0,2000) : '',
+                 respStatus: null, respUrl: '', respBody: '',
+                 reqHeaders: hdrDump(init && init.headers),
+                 credentials: (init && init.credentials) || 'omitted',
+                 via: window.__spaOwnFetch ? 'ours' : 'spa'};
+          window.__spaNet.push(rec);
+        }
+        return of.apply(this, arguments).then(function(resp){
+          if (rec) {
+            rec.respStatus = resp.status; rec.respUrl = String(resp.url||'').slice(0,200);
+            try { resp.clone().text().then(function(t){ rec.respBody = String(t).slice(0,2000); }); } catch(e){}
+          }
+          return resp;
+        });
+      };
+    } catch(e){}
+  };
+  try { hook(); } catch(e){}
   var svc = window.angular.element(app).injector().get('BetslipService');
+  // ── DEEP PROBE OF THE SLIP SERVICE (2026-10-05) ────────────────────────
+  // Diagnostic only - nothing here changes how we place.
+  //
+  // What we know: BetslipService.count() reports 2 live selections, but the
+  // object we have always read (`svc.betslip`) is NULL, and the site's own
+  // placeBet() then answers {"code":403,"message":"Forbidden"}. Reads of the
+  // wallet succeed in the same round, so the login is fine. A place request
+  // with no payload behind it would be refused exactly this way - so the
+  // likeliest explanation is that we are reading the count from one place and
+  // the actual bet from another that we have never found.
+  //
+  // Rather than guess the property name, enumerate everything the service
+  // exposes (own + prototype, skipping Angular internals) and report which
+  // property actually holds selections. That names the field to submit.
+  try {
+    var probe = {props: [], candidates: []};
+    var seen = {};
+    var push = function(name, val, depth){
+      if (seen[name] && depth === 0) return;
+      seen[name] = true;
+      var t = (val === null) ? 'null' : (Array.isArray(val) ? 'array['+val.length+']' : typeof val);
+      var prev = '';
+      try {
+        if (typeof val === 'string') prev = val.slice(0,60);
+        else if (Array.isArray(val)) prev = JSON.stringify(val.slice(0,2)).slice(0,220);
+        else if (val && typeof val === 'object') prev = JSON.stringify(val).slice(0,220);
+        else if (typeof val === 'function') prev = '(fn ' + (val.length) + ' args)';
+        else prev = String(val).slice(0,60);
+      } catch(e){ prev = '(unreadable)'; }
+      probe.props.push({n: name, t: t, v: prev});
+      // Anything that looks like a collection of bets/legs/selections.
+      if (/bet|slip|select|leg|choice|ticket|cart/i.test(name) && val &&
+          (Array.isArray(val) || typeof val === 'object')) {
+        probe.candidates.push({n: name, t: t, v: prev});
+      }
+    };
+    // Own properties.
+    for (var k in svc) {
+      if (!Object.prototype.hasOwnProperty.call(svc, k)) continue;
+      if (/^\$|^\$\$|^this$/.test(k)) continue;
+      try { push(k, svc[k], 0); } catch(e){}
+    }
+    // Prototype chain (the real API often lives there).
+    try {
+      var proto = Object.getPrototypeOf(svc), lvl = 0;
+      while (proto && lvl < 4) {
+        for (var k2 in proto) {
+          if (/^\$|^\$\$|^constructor$/.test(k2)) continue;
+          try {
+            var d = Object.getOwnPropertyDescriptor(proto, k2);
+            if (d && typeof d.value !== 'function') push(k2, d.value, lvl+1);
+            else if (d && !probe.props.some(function(x){return x.n === k2;}))
+              probe.props.push({n: k2, t: 'function', v: '(fn ' + (d.value ? d.value.length : '?') + ' args)'});
+          } catch(e){}
+        }
+        proto = Object.getPrototypeOf(proto); lvl++;
+      }
+    } catch(e){}
+    // One level INTO the top candidates, to see the row shape.
+    for (var ci = 0; ci < probe.candidates.length && ci < 4; ci++) {
+      try {
+        var c = svc[probe.candidates[ci].n];
+        if (c && typeof c === 'object' && !Array.isArray(c)) {
+          var inner = [];
+          for (var k3 in c) { try { inner.push(k3 + ':' + (Array.isArray(c[k3]) ? 'array['+c[k3].length+']' : typeof c[k3])); } catch(x){} }
+          probe.candidates[ci].inner = inner.slice(0, 14).join(', ');
+        }
+      } catch(e){}
+    }
+    window.__spaPlace.slipProbe = JSON.stringify(probe).slice(0, 4000);
+  } catch(e){ window.__spaPlace.slipProbe = 'probe-failed: ' + String(e).slice(0, 300); }
+  // Keep a snapshot for continuity, but read it the way the SITE reads it.
+  // `svc.betslip` / `svc.betSlip` / `svc.slip` do not exist on this service, so
+  // they have always evaluated to null and told us nothing - while count()
+  // correctly reported the selections. The real accessors are METHODS, and the
+  // dump above names them: getAllBetslips() and getBetslip(id). Calling those
+  // is the only way to see whether the service genuinely holds the slip that
+  // placeBet() is about to submit.
+  try {
+    var snap = null, how = '';
+    if (typeof svc.getAllBetslips === 'function') {
+      snap = svc.getAllBetslips(); how = 'getAllBetslips()';
+    } else if (typeof svc.getBetslip === 'function') {
+      snap = svc.getBetslip(0); how = 'getBetslip(0)';
+    }
+    var n = (snap && (snap.length !== undefined)) ? snap.length
+          : (snap ? 1 : 0);
+    window.__spaPlace.slipBefore = how + ' -> ' + n + ' item(s): '
+                                  + JSON.stringify(snap).slice(0, 1200);
+    window.__spaPlace.slipCount = n;
+  } catch(e){
+    window.__spaPlace.slipBefore = 'getAllBetslips threw: ' + String(e).slice(0,200);
+    window.__spaPlace.slipCount = -1;
+  }
   var p = svc.placeBet();
   if (p && p.then) {
     p.then(function(ok){
         window.__spaPlace.state = 'resolved';
-        window.__spaPlace.detail = JSON.stringify(ok).slice(0,500);
+        try { window.__spaPlace.detail = JSON.stringify(ok).slice(0,500) || String(ok); }
+        catch(e){ window.__spaPlace.detail = String(ok).slice(0,500); }
       }, function(err){
         var d = '';
         try { d = (err && err.data ? JSON.stringify(err.data) : '')
@@ -14709,14 +18080,130 @@ try {
                     pass
                 if count_now == 0 or state in ("resolved", "rejected", "threw", "sync"):
                     break
+            # The slip can empty BEFORE the XHR loadend handler has written the
+            # response body into __spaNet. Give the event loop a moment so the
+            # capture is not read as blank.
+            if count_now == 0:
+                for _ in range(3):
+                    time.sleep(1)
+                    try:
+                        if driver.execute_script(
+                                "var a = window.__spaNet || []; "
+                                "return a.length && a[a.length-1] && a[a.length-1].respBody;") :
+                            break
+                    except Exception:
+                        break
+            # WAIT FOR THE XHR TO ACTUALLY FINISH (2026-10-07).
+            # We read the capture 1-3s after the click, which is often BEFORE
+            # loadend fires - so respStatus stayed null and every place attempt
+            # logged "httpNone". That is why the real server verdict on
+            # /api/bets/place was never actually observed: we were inferring
+            # "403" from an earlier sighting rather than reading it. Wait until
+            # the request has a status, up to ~10s, so we finally see what the
+            # book says.
+            for _ in range(10):
+                try:
+                    _done = driver.execute_script(
+                        "var a = window.__spaNet || []; "
+                        "return !!(a.length && a[a.length-1] "
+                        "&& a[a.length-1].respStatus !== null "
+                        "&& a[a.length-1].respStatus !== undefined);")
+                except Exception:
+                    break
+                if _done:
+                    break
+                time.sleep(1)
+            # Read the captured XHR for BOTH outcomes. Previously this only ran
+            # on failure, so a SUCCESSFUL bet (slip emptied) returned early
+            # and never reported what the server actually said. That is why
+            # "Not valid" was never visible: the rejections that mattered all
+            # happened on the success-looking branch.
+            net_detail = ""
+            try:
+                n = driver.execute_script(
+                    "var a = window.__spaNet || []; return a.length ? a.length : 0;")
+                last = driver.execute_script(
+                    "var a = window.__spaNet || []; return a.length ? a[a.length-1] : null;")
+                if isinstance(last, dict):
+                    # 300 chars cut the payload off mid-bets array, hiding the
+                    # very fields the API rejects. A generic {"message":"Forbidden"}
+                    # is undiagnosable without the body the book was actually sent.
+                    resp = str(last.get("respBody") or "").replace("\n", " ")[:1200]
+                    req = str(last.get("reqBody") or "").replace("\n", " ")[:1200]
+                    net_detail = (f" | NET {last.get('method')} {last.get('url')} "
+                                  f"-> http{last.get('respStatus')} {resp}")
+                    if req:
+                        net_detail += f" | REQ {req}"
+                    # Several exchanges can fire around one PLACE. Dump every
+                    # captured request/response pair so a retry that failed
+                    # differently is still visible.
+                    try:
+                        allx = driver.execute_script(
+                            "var a = window.__spaNet || [];"
+                            "return a.map(function(r){ return (r.method||'') + ' ' + "
+                            "(r.url||'') + ' -> http' + (r.respStatus||'?') + ' ' + "
+                            "String(r.respBody||'').replace(/\\s+/g,' ').slice(0,300); });")
+                    except Exception:
+                        allx = None
+                    if isinstance(allx, list) and len(allx) > 1:
+                        net_detail += " | ALL-XHR: " + " || ".join(str(x)[:400] for x in allx[-6:])
+                    try:
+                        snapb = driver.execute_script(
+                            "return (window.__spaPlace && window.__spaPlace.slipBefore) || '';")
+                    except Exception:
+                        snapb = ""
+                    if snapb:
+                        net_detail += f" | SLIP-BEFORE: {str(snapb)[:800]}"
+            except Exception:
+                pass
+            # ── REPORT THE SLIP-SERVICE PROBE (2026-10-05) ────────────────
+            # Diagnostic only. We read the selection COUNT from one place and
+            # the actual bet payload has always been null, so we enumerate what
+            # the service really holds and name the field that carries the
+            # selections. Print it whenever the place did not succeed - that is
+            # exactly when we need to know.
+            if not result.get("placed"):
+                try:
+                    _pj = self._exec_script(
+                        driver,
+                        "return (window.__spaPlace && window.__spaPlace.slipProbe) || '';",
+                        default="", timeout=10.0, label="slip probe")
+                    if _pj:
+                        self._emit_direct(
+                            gui_callback,
+                            f"  \U0001f50e SLIP-SERVICE PROBE ({len(_pj)} chars): "
+                            f"{_pj[:900]}")
+                        try:
+                            _po = json.loads(_pj)
+                            _cands = _po.get("candidates") or []
+                            if _cands:
+                                self._emit_direct(
+                                    gui_callback,
+                                    f"  \U0001f3af CANDIDATE SLIP FIELDS: "
+                                    + " | ".join(
+                                        f"{c.get('n')}[{c.get('t')}]"
+                                        + (f"{{{c.get('inner')}}}" if c.get("inner") else "")
+                                        for c in _cands[:5]))
+                            else:
+                                self._emit_direct(
+                                    gui_callback,
+                                    "  \U0001f3af CANDIDATE SLIP FIELDS: none matched "
+                                    "(count() works but no bet/leg/selection object "
+                                    "is exposed on the service)")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             if count_now == 0:
                 result = {"placed": True,
-                          "detail": f"slip emptied (was {before}); spa={state}".
-                          replace("\n", " ")[:200]}
+                          "detail": f"slip emptied (was {before}); spa={state} "
+                                    f"captured={n}".
+                                    replace("\n", " ")[:200] + net_detail}
             else:
                 result = {"placed": False,
-                          "detail": f"count still {count_now}/{before}; spa={state} {detail}".
-                          replace("\n", " ")[:220]}
+                          "detail": f"count still {count_now}/{before}; spa={state} {detail} "
+                                    f"captured={n}".
+                                    replace("\n", " ")[:420] + net_detail}
         except Exception as exc:
             result = {"placed": False, "detail": f"place-via-spa error: {str(exc)[:140]}"}
         return result
@@ -14799,6 +18286,31 @@ return b.indexOf('bet successfully placed') >= 0 ||
                             pass
                 except Exception:
                     pass
+            # JS fallback (2026-09-30): the DOM remove buttons are frequently
+            # rendered OFF the live box (folded, renamed, or below the fold) so
+            # the XPath sweep above clears nothing while BetslipService —
+            # the SAME service _read_betslip_count uses — still holds every leg.
+            # Drive the service directly: call every plausible bulk-clear method
+            # it exposes (favourite/star/remove/clear/cancel/reset), then re-read
+            # the service count like _read_betslip_count does.
+            try:
+                driver.execute_script(r"""
+var app = document.querySelector('body');
+try {
+  var svc = window.angular.element(app).injector().get('BetslipService');
+  var tried = [];
+  var cands = ['removeAll','removeAllSelections','clearAll','clearAllSelections',
+               'clear','empty','cancelAll','reset','remove'];
+  for (var i=0; i<cands.length; i++){
+    if (typeof svc[cands[i]] === 'function') {
+      try { svc[cands[i]](); tried.push(cands[i]); } catch(e){ tried.push(cands[i]+':ERR'); }
+    }
+  }
+  window.__spaClear = tried;
+} catch(e){ window.__spaClear = ['no-svc']; }
+""")
+            except Exception:
+                pass
             deadline = time.time() + 8
             while time.time() < deadline:
                 if self._read_betslip_count(driver) == 0:
@@ -14866,8 +18378,38 @@ return p ? p.offsetHeight : 0;
                           f"  Total odds: {totals['odds']} | Possible win: KSH {totals['win']}")
         slip_count_at_open = self._read_betslip_count(driver)
 
+        # ── ODDS FLOOR (2026-10-05) ─────────────────────────────────────
+        # The site's periodic slip refresh silently strips selections whose
+        # odds it no longer holds. The re-click above tops the legs back up,
+        # but the SURVIVING odds can still be far below what we selected — a
+        # slip targeting x2.50 was observed going out at x1.29, i.e. we paid
+        # the accumulator margin for a fraction of the intended payout.
+        # Placing a degraded slip is worse than not betting: it converts a
+        # positive-EV ticket into a negative-EV one. So when the caller told us
+        # the floor it insists on, we refuse anything under it.
+        try:
+            _floor = float(getattr(self, "_active_odds_floor", 0.0) or 0.0)
+            _got = float(totals.get("odds") or 0.0)
+            if _floor > 0 and 0 < _got < _floor:
+                self._emit_direct(
+                    gui_callback,
+                    f"  ⛔ Slip odds {_got:.2f} are below the required floor x{_floor:.2f} "
+                    "(legs were stripped by the site refresh) — declining rather than "
+                    "placing a degraded accumulator.")
+                try:
+                    self._clear_betslip(driver, gui_callback=gui_callback)
+                except Exception:
+                    pass
+                return {"needs_legs": True, "count": 0}
+        except Exception:
+            pass
+
         consec_invalid = 0
         minted = False
+        # Bounds the "silent slip" recovery: without a cap the probe could
+        # re-trigger on every iteration and burn all attempts (see the
+        # _post_shell_recovers comment below).
+        self._post_shell_recovers = 0
         for attempt in range(1, max_attempts + 1):
             # If the SPA is on /login (token lapse is invisible to slip counting),
             # re-login produces an empty betslip — hand back so the caller rebuilds.
@@ -14901,28 +18443,59 @@ return c === 0 && bodyLen < 40000;
                 except Exception:
                     mint_now = False
                 if mint_now:
-                    self._emit_direct(gui_callback,
-                                      "  🔒 Session shell (empty slip on a bare page) — "
-                                      "forcing a fresh real-login POST before PLACE.")
-                    # The shell still renders logged=\"1\" (wallet API is live, the SPA
-                    # merely lost its hydrated slip after ~7min of idle). The account
-                    # session check below short-circuits on that stale attr, so we call
-                    # the REAL login submit directly with force=True — its own page-loads
-                    # re-render every future check as genuinely authenticated.
-                    if not self._hard_spa_login(driver, phone, password,
-                                                gui_callback=gui_callback, force=True):
-                        self._emit_direct(gui_callback,
-                                          "  🔒 Forced re-login did not confirm the session — aborting.")
-                        return False
-                    minted = True
-                    re_clicked = 0
-                    for odds, name, gid, market, prob in legs:
-                        if self._read_betslip_count(driver) >= len(legs):
-                            break
-                        home = name.split(" vs ")[0].strip() if " vs " in name else str(name).strip()
-                        if self._click_leg_on_listing_row(driver, home, gid, market):
-                            re_clicked += 1
-                            time.sleep(0.3)
+                    # DO NOT MINT BLINDLY (fix 2026-10-05). Minting means POSTing
+                    # credentials again, and that SUPERSEDES our own current
+                    # token. The old code minted whenever the SPA showed a bare
+                    # shell, even though its own comment admitted the wallet API
+                    # was still live and only the hydrated slip had been lost.
+                    # So a purely cosmetic SPA re-mount was answered by
+                    # re-authenticating, which is the single best way to make an
+                    # account collide with itself ('User logged from another
+                    # device'). Live run: 9 such rejections and 6 failed gates in
+                    # one hour, zero bets placed.
+                    #
+                    # We now ask the only question that matters - is the session
+                    # actually dead? - and act accordingly:
+                    #   session LIVE -> cheap navigation re-hydrates the SPA,
+                    #                   no new token, no collision risk
+                    #   session DEAD -> minting is the only way back, so do it
+                    live = False
+                    try:
+                        live = bool(self._session_is_live(driver, deep_check=True))
+                    except Exception:
+                        live = False
+                    if live:
+                        self._emit_direct(
+                            gui_callback,
+                            "  🔒 SPA lost its slip but the session is still LIVE — "
+                            "reloading the board instead of re-authenticating "
+                            "(minting here would supersede our own token).")
+                        try:
+                            self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                            time.sleep(1.2)
+                        except Exception:
+                            pass
+                    else:
+                        self._emit_direct(
+                            gui_callback,
+                            "  🔒 Session shell AND wallet API dead — "
+                            "forcing a fresh real-login POST before PLACE.")
+                        if not self._hard_spa_login(driver, phone, password,
+                                                    gui_callback=gui_callback, force=True):
+                            self._emit_direct(
+                                gui_callback,
+                                "  🔒 Forced re-login did not confirm the session — aborting.")
+                            return False
+                        minted = True
+                    # Same reasoning as the post-typing recovery: a
+                    # listing-only re-click finds nothing once the SPA has
+                    # re-mounted, so the slip stays empty and the round dies.
+                    # Delegate to the robust path (listing rows + market pages).
+                    try:
+                        re_clicked = int(self._click_selected_legs(
+                            driver, legs, gui_callback=gui_callback) or 0)
+                    except Exception:
+                        re_clicked = 0
                     time.sleep(0.8)
                     self._emit_direct(gui_callback,
                                       f"  🔒 Slip re-clicked {re_clicked} leg(s) on the fresh session")
@@ -14949,6 +18522,25 @@ return c === 0 && bodyLen < 40000;
                 if isinstance(slip_count, (int, float)) and slip_count >= 0:
                     self._emit_direct(gui_callback,
                                       f"   🧮 BetslipService re-verified: {slip_count} selection(s)")
+            # SLIP-STACKING GUARD (2026-09-30): a rebuild re-clicks its new legs
+            # on top of whatever the previous failed attempt left in the slip.
+            # _clear_betslip is best-effort and often returns False (legs below
+            # the fold / renamed buttons), so the slip compounds 3 → 6 → 8 and
+            # the extra selections are exactly what keeps the submit dead with
+            # "Not valid". If the live slip holds MORE legs than we requested,
+            # it is polluted: refuse to submit it, clear hard, and hand back so
+            # the caller rebuilds from a genuinely empty slip.
+            if legs and isinstance(slip_count, (int, float)) and slip_count > len(legs):
+                self._emit_direct(gui_callback,
+                                  f"   🧹 Slip has {slip_count} selections — {len(legs)} requested "
+                                  "(stale legs stacked from a previous attempt) — clearing "
+                                  "hard before the next rebuild.")
+                self._bench_slip_legs(legs)
+                try:
+                    self._clear_betslip(driver, gui_callback=gui_callback)
+                except Exception:
+                    pass
+                return {"needs_legs": True, "count": 0, "stacked": True}
             # The slip is empty or shrank below 2 selections. Empty means the
             # removal prompt stripped every selection without placing — rebuild.
             if slip_count == 0 or (slip_count > 0 and slip_count < 2):
@@ -14981,7 +18573,8 @@ return c === 0 && bodyLen < 40000;
             # fresh hydrated session, then restart this attempt (the fresh session's
             # page-load re-renders the whole shell away). Bounded: only one force
             # mint per attempt iteration via `minted`.
-            if phone and password and legs and not minted:
+            if (phone and password and legs and not minted
+                    and self._post_shell_recovers < 2):
                 try:
                     post_shell = bool(driver.execute_script(r"""
 var c = -1;
@@ -14993,24 +18586,84 @@ return c === 0 && bodyLen < 40000;
                 except Exception:
                     post_shell = False
                 if post_shell:
+                    # SECOND OPINION BEFORE DESTROYING A GOOD SLIP (2026-10-05).
+                    # The probe above reads the slip through one raw angular
+                    # injector call. If that path is mid-re-mount it can report
+                    # 0 while the slip is in fact intact - and we would then
+                    # reload the board and throw away a fully priced
+                    # accumulator. Cross-check with the robust reader and only
+                    # treat this as a dead shell when BOTH agree it is empty.
+                    try:
+                        _live = self._read_betslip_count(driver)
+                    except Exception:
+                        _live = None
+                    if isinstance(_live, (int, float)) and _live >= 1:
+                        post_shell = False
+                        self._emit_direct(
+                            gui_callback,
+                            f"  🔎 Slip probe reported empty but the betslip "
+                            f"actually holds {_live} selection(s) — keeping it "
+                            f"and NOT reloading the board.")
+                if post_shell:
+                    # CHEAP RECOVERY FIRST (2026-10-05). A "silent slip" is the
+                    # SPA re-mounting its shell — the fix is to reload the page,
+                    # NOT to mint a brand-new session. Forcing a login POST here
+                    # was actively harmful: it superseded our own token, and
+                    # the fresh session lost the slip, dropping it to 1 leg and
+                    # falling under the 2-leg minimum, so every round ended in
+                    # rebuild. Observed repeating every round with zero bets.
+                    # We now re-hydrate by navigation and re-click the legs, and
+                    # only escalate to a real login if the shell stays dead.
                     self._emit_direct(gui_callback,
                                       "  🔒 Slip went silent mid-typing (late SPA re-mount) — "
-                                      "forcing a fresh real-login POST.")
-                    if not self._hard_spa_login(driver, phone, password,
-                                                gui_callback=gui_callback, force=True):
-                        return False
-                    minted = True
+                                      "reloading the board and re-clicking the legs.")
+                    # COUNT THIS RECOVERY (2026-10-05). This block never set a
+                    # "recovered" flag, so on the very next loop iteration the
+                    # same probe could fire again and send us round the whole
+                    # reload-and-re-click cycle again - consuming every attempt
+                    # and ending the round with "Bet not placed". Observed on
+                    # essentially every round of a 4-hour run: the slip reached
+                    # 3 legs and x1.62 with the stake typed, then died here and
+                    # the account placed nothing for hours.
+                    self._post_shell_recovers = int(
+                        getattr(self, "_post_shell_recovers", 0) or 0) + 1
+                    _revived = False
+                    try:
+                        self._safe_get(driver, self.TODAY_GAMES_PAGE_URL)
+                        time.sleep(1.2)
+                        _revived = True
+                    except Exception:
+                        _revived = False
+                    if not _revived:
+                        # Navigation itself failed — only now is a real re-login
+                        # justified.
+                        if not self._hard_spa_login(driver, phone, password,
+                                                    gui_callback=gui_callback, force=True):
+                            return False
+                        minted = True
                     re_clicked = 0
-                    for odds2, name2, gid2, market2, prob2 in legs:
-                        if self._read_betslip_count(driver) >= len(legs):
-                            break
-                        home2 = name2.split(" vs ")[0].strip() if " vs " in name2 else str(name2).strip()
-                        if self._click_leg_on_listing_row(driver, home2, gid2, market2):
-                            re_clicked += 1
-                            time.sleep(0.3)
+                    # USE THE ROBUST SELECTION PATH, not a listing-only loop.
+                    # After a re-mount the SPA needs a hydration wait before rows
+                    # exist, and many legs simply are not on the board we land
+                    # on - the per-game market page is the reliable fallback.
+                    # The old listing-only loop re-clicked 0 legs every time
+                    # ("Slip re-clicked 0 leg(s)"), so the slip stayed empty and
+                    # the round placed nothing. _click_selected_legs does
+                    # listing rows first and falls back to market pages.
+                    try:
+                        re_clicked = int(self._click_selected_legs(
+                            driver, legs, gui_callback=gui_callback) or 0)
+                    except Exception:
+                        re_clicked = 0
                     time.sleep(0.8)
+                    _now = self._read_betslip_count(driver)
                     self._emit_direct(gui_callback,
-                                      f"  🔒 Re-clicked {re_clicked} leg(s) after the late re-mount")
+                                      f"  🔒 Re-clicked {re_clicked} leg(s) after the re-mount "
+                                      f"(slip now {_now} of {len(legs)})")
+                    if isinstance(_now, (int, float)) and _now >= 2:
+                        # Slip is whole again — re-apply the stake on the fresh
+                        # shell and carry on to PLACE instead of restarting.
+                        continue
                     continue
             # final re-check right before clicking PLACE. The React-bound amount field
             # (#amount-prematch) is the authoritative stake; the possible-win/odds ratio
@@ -15086,9 +18739,222 @@ if (slip) { slip.click(); }
                                       f"✅ Balance reduced: KES {before_balance:,.2f} → "
                                       f"KES {after:,.2f} — bet placed")
                 return True
+            _detail_l = str(spa_result.get("detail", "") or "").lower()
+            # "User logged from another device" is a SERVER-side session
+            # invalidation: the SPA still *looks* logged in (logged="1") but
+            # this browser's token has been superseded, so every submit is 403'd
+            # and every DOM PLACE click dies with it. Without this branch the
+            # account looped "Bet not placed" indefinitely — observed 95
+            # consecutive rejections on 0798810080 while the slip itself was
+            # built and verified fine ("BetslipService verified: 2 selection(s)").
+            # Retrying the DOM button on a dead token is guaranteed to fail, so
+            # re-login FIRST and keep the slip on the betslip for the retry.
+            _session_dead = ("logged from another device" in _detail_l
+                             or "invalid session" in _detail_l
+                             or "session expired" in _detail_l
+                             or ("http403" in _detail_l and "another device" in _detail_l))
+            if _session_dead:
+                self._emit_direct(gui_callback,
+                                  "  🔐 SERVER REJECTED: 'User logged from another device' — "
+                                  "clicking Okay and re-logging in before retrying the slip.")
+                # BACKOFF (2026-10-05): count consecutive rejections and STOP
+                # hammering. Every dismiss+re-login cycle mints a NEW token that
+                # supersedes the last, which is how one 30-minute window produced
+                # 33 failed logins, 34 dismissals, 31 gate failures and ZERO bets
+                # placed. The book throttles back-to-back logins, so the only way
+                # to actually recover is to leave the session alone. Cooldown
+                # grows 5 -> 10 -> 20 -> 40 min (capped at 40).
+                try:
+                    _bo = getattr(self, "_auth_backoff", None)
+                    if _bo is None:
+                        _bo = {}
+                        self._auth_backoff = _bo
+                    _k = str(phone or "")
+                    _n = int(_bo.get(_k + "_n") or 0) + 1
+                    _bo[_k + "_n"] = _n
+                    if _n >= 2:
+                        _delay = min(2400.0, 300.0 * (2 ** min(_n - 1, 3)))
+                        _bo[_k] = time.time() + _delay
+                        self._emit_direct(
+                            gui_callback,
+                            f"⏸️ {phone}: {_n} consecutive session rejections — pausing login "
+                            f"attempts for {_delay / 60:.0f} min so the session can settle. "
+                            "Retrying sooner just supersedes our own token again.")
+                        try:
+                            if self._clear_betslip(driver, gui_callback=gui_callback):
+                                return {"needs_legs": True, "count": 0}
+                        except Exception:
+                            pass
+                        return False
+                except Exception:
+                    pass
+                # Owner rule: dismiss the notice, then re-establish the session in
+                # a bounded loop and only give up once it has genuinely failed
+                # several times. Parking on the FIRST refusal just handed the
+                # account away while a single Okay+re-login would have recovered it.
+                _recovered = False
+                for _attempt in range(3):
+                    try:
+                        self._dismiss_foreign_session_prompt(driver)
+                    except Exception:
+                        pass
+                    try:
+                        self._logout_current_session(driver)
+                    except Exception:
+                        pass
+                    # INDUSTRIAL-GRADE FIX (2026-10-04): wait for the old session
+                    # to clear on the server before attempting a new login. The
+                    # server needs a moment to release the old token — without this
+                    # wait, the new login attempt races the old session and fails
+                    # with the same "another device" error.
+                    time.sleep(5)
+                    try:
+                        with self._login_lock:
+                            # force=True is ESSENTIAL. Without it _hard_spa_login
+                            # returns early the moment logged="1" is on screen, and
+                            # that attribute stays "1" after the server killed the
+                            # token — so no credentials get posted and the retry
+                            # submits on the token that was just rejected.
+                            login_ok = False
+                            try:
+                                if self._hard_spa_login(driver, phone, password,
+                                                         gui_callback=gui_callback,
+                                                         force=True):
+                                    login_ok = True
+                            except Exception:
+                                login_ok = False
+                            if not login_ok:
+                                try:
+                                    if self._session_is_live(driver, deep_check=True):
+                                        login_ok = True
+                                except Exception:
+                                    pass
+                            if login_ok:
+                                try:
+                                    _recovered = self._confirm_session_ready(
+                                        driver, phone, password, gui_callback=gui_callback)
+                                except Exception:
+                                    _recovered = False
+                                if not _recovered:
+                                    try:
+                                        if self._session_is_live(driver, deep_check=True):
+                                            _recovered = True
+                                    except Exception:
+                                        pass
+                                if _recovered:
+                                    break
+                    except Exception:
+                        pass
+                    self._emit_direct(gui_callback,
+                                      f"  🔁 re-login attempt {_attempt + 1}/3 did not "
+                                      f"confirm a live session — trying again.")
+                    time.sleep(3)
+                if _recovered:
+                    if self._clear_betslip(driver, gui_callback=gui_callback):
+                        return {"needs_legs": True, "count": 0}
+                    return False
+                self._emit_direct(gui_callback,
+                                  "  🅿️ PARKED: could not confirm a live session after "
+                                  "3 dismiss+re-login attempts. Stopping the retry loop "
+                                  "so we stop fighting the bookmaker; log this account "
+                                  "out everywhere else, then restart the engine.")
+                # Recovery failed above, so park rather than keep submitting on a
+                # dead token. Parking is what stops the endless 300s re-crawl loop.
+                try:
+                    self._parked_until[str(phone)] = time.time() + 1800.0
+                except Exception:
+                    pass
+                if self._agent_hub is not None:
+                    try:
+                        self._agent_hub.supervisor.beat_parked(phone)
+                    except Exception:
+                        pass
+                # Hand the slip back to the caller to replay the selection later,
+                # rather than clicking PLACE on a token the book already killed.
+                if self._clear_betslip(driver, gui_callback=gui_callback):
+                    return {"needs_legs": True, "count": 0}
+                return False
+
+            _spa_detail = str(spa_result.get("detail", "") or "")
+            # ── DUMP WHAT WAS ACTUALLY SENT (2026-10-05) ──────────────────
+            # Diagnostic only. Reads succeed (wallet 200) in the same round that
+            # the bet write is Forbidden, so the login is fine and something
+            # specific to the bet request is being refused. Print the captured
+            # method/url/headers for every intercepted request so the next round
+            # tells us what the SPA sends that our fallback does not.
+            try:
+                _net = self._exec_script(
+                    driver,
+                    "return JSON.stringify(window.__spaNet || []);",
+                    default="[]", timeout=10.0, label="spa net dump")
+                import json as _jn
+                _rows = _jn.loads(_net or "[]")
+            except Exception:
+                _rows = []
+            if isinstance(_rows, list) and _rows:
+                self._emit_direct(
+                    gui_callback,
+                    f"  \U0001f50d CAPTURED {len(_rows)} bet-related request(s):")
+                for _r in _rows[-4:]:
+                    if not isinstance(_r, dict):
+                        continue
+                    try:
+                        _h = _r.get("reqHeaders") or {}
+                        _hk = sorted(_h.keys())
+                        # Never print cookie values - only header NAMES.
+                        self._emit_direct(
+                            gui_callback,
+                            f"     [{_r.get('via','?')}] {_r.get('method','?')} "
+                            f"{str(_r.get('url',''))[:80]} -> resp "
+                            f"{_r.get('respStatus')} | cred="
+                            f"{_r.get('credentials','?')} | headers({len(_hk)}): "
+                            f"{', '.join(_hk[:10])}")
+                    except Exception:
+                        pass
+            # ── HTTP 403 ON /api/bets/place IS A SESSION REJECTION (2026-10-05)
+            # A 403 here is not a slip problem: the slip is built, priced and
+            # funded, and the book refuses the TOKEN at the place call. That is
+            # the same condition as "logged in from another device", so falling
+            # through to the DOM PLACE button and then "rebuilding from a fresh
+            # login" just re-mints a token the book will reject again.
+            #
+            # We park the account with a message that names the one cause the
+            # code cannot fix, instead of burning CPU on retries that are
+            # guaranteed to fail:
+            #   403 means another client holds the session for this account
+            #   (phone app / another browser / another machine).
+            if "403" in _spa_detail:
+                self._emit_direct(
+                    gui_callback,
+                    f"  \U0001f6ab PLACE REFUSED WITH HTTP 403 — the bookmaker "
+                    f"rejected our session token, not the slip. Detail: "
+                    f"{_spa_detail[:130]}")
+                self._emit_direct(
+                    gui_callback,
+                    "  ⚠️ 403 at PLACE means this account is signed in somewhere "
+                    "ELSE — the phone app, another browser, or another machine. "
+                    "SportPesa allows one active session, and the newest login "
+                    "wins. Sign the account out everywhere else and the next "
+                    "round will place normally.")
+                try:
+                    self._parked_until[str(phone)] = time.time() + 1800.0
+                except Exception:
+                    pass
+                if self._agent_hub is not None:
+                    try:
+                        self._agent_hub.supervisor.beat_parked(phone)
+                    except Exception:
+                        pass
+                try:
+                    if self._clear_betslip(driver, gui_callback=gui_callback):
+                        return {"needs_legs": True, "count": 0}
+                except Exception:
+                    pass
+                return False
+
             self._emit_direct(gui_callback,
                               f"  ↻ SPA service did not place "
-                              f"({spa_result.get('detail', '')[:160]}) — "
+                              f"({_spa_detail[:160]}) — "
                               "falling back to the DOM PLACE BET button")
             if not self._click_place_bet_button(driver):
                 self._emit_direct(gui_callback, "  ⚠️ PLACE BET button not found — retrying")
@@ -15141,6 +19007,10 @@ if (slip) { slip.click(); }
                     self._emit_direct(gui_callback,
                                       "  ↻ \"Not valid\" removed a leg — rebuilding slip "
                                       "from fresh games instead of placing the weakened one.")
+                    # Bench every leg currently on the slip — at least one of them
+                    # just died at PLACE, and the same composite gets rebuilt forever
+                    # otherwise (the observed LITHUANIA/ERITREA/MEXICO-USA loop).
+                    self._bench_slip_legs(legs)
                     if self._clear_betslip(driver, gui_callback=gui_callback):
                         return {"needs_legs": True, "count": now_count}
                     return False
@@ -15171,9 +19041,18 @@ if (slip) { slip.click(); }
                 self._emit_direct(gui_callback,
                                   "  ↻ Suspended selection keeps blocking submit — clearing slip, "
                                   "will rebuild from fresh games.")
-                if self._clear_betslip(driver, gui_callback=gui_callback):
-                    return {"needs_legs": True, "count": 0}
-                return False
+                self._bench_slip_legs(legs)
+                # Always signal a rebuild. The caller clears the persistent slip
+                # itself ("Cleared the persistent betslip before rebuild"), so a
+                # False from this local clear must NOT abort the rebuild path --
+                # that was the bug that turned this into a dead round for the
+                # account: "clearing slip" printed, then no "Rebuild #1" ever
+                # appeared, then "no bet this round (Bet not placed)".
+                try:
+                    self._clear_betslip(driver, gui_callback=gui_callback)
+                except Exception:
+                    pass
+                return {"needs_legs": True, "count": 0}
             self._emit_direct(gui_callback,
                               f"  Balance KES {after:,.2f} unchanged — will retry placement")
             time.sleep(1)

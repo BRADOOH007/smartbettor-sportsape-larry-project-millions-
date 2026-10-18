@@ -324,15 +324,24 @@ class SupabaseSync:
                 f"{self.url}/rest/v1/sportsape_stats?id=eq.{_stable_id('stats')}",
                 headers=self._headers, timeout=15)
             owner = None
+            # LATENT-BUG FIX (2026-10-05). The lease dict itself was never
+            # captured - only its `holder` - so the expiry check below read an
+            # unbound `owner_ts`, raised NameError, and the local `except`
+            # quietly turned `exp` into 0.0. `exp > now` was therefore always
+            # False and claim_lease NEVER returned False: the mutual-exclusion
+            # lease was decorative, and two live builds could both take the
+            # board. Capture the whole lease so the TTL is actually honoured.
+            owner_lease = None
             if resp.status_code == 200 and isinstance(resp.json(), list):
                 for row in resp.json():
                     p = json.loads(row.get("payload") or "{}")
                     if p.get("lease") and p["lease"].get("holder"):
                         owner = p["lease"]["holder"]
+                        owner_lease = p["lease"]
             now = time.time()
             if owner and owner != holder:
                 try:
-                    exp = float(owner_ts.get("expires") or 0)
+                    exp = float((owner_lease or {}).get("expires") or 0)
                 except Exception:
                     exp = 0.0
                 if exp > now:

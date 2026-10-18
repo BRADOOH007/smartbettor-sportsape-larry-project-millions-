@@ -38,9 +38,25 @@ from datetime import datetime
 
 from sportsape_grok import _extract_json
 
-AGENT_CACHE_PATH = os.path.join(os.getcwd(), "sportsape_agent_cache.json")
-CALIBRATION_PATH = os.path.join(os.getcwd(), "sportsape_calibration.json")
-NOTIFY_LOG_PATH = os.path.join(os.getcwd(), "sportsape_alerts.log")
+# ── State paths ────────────────────────────────────────────────────────
+# These three used to be os.path.join(os.getcwd(), ...). Anchoring on the
+# WORKING DIRECTORY splits the app's memory in two: launch it from a different
+# folder (shortcut, scheduled task, double-click) or from a PyInstaller dist\
+# and it silently builds a SECOND set of files the rest of the app never reads.
+# The damage is worst on these two, because they ARE the learning engine:
+#   AGENT_CACHE_PATH - every analyst/scout judgement ever made
+#   CALIBRATION_PATH - how well our probabilities match reality
+# Starting fresh on each launch means the tool never improves at anything.
+# writable_path() resolves to the live workspace in every launch mode.
+try:
+    from resource_path import writable_path as _writable_path
+except Exception:                                    # pragma: no cover
+    def _writable_path(rel):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
+
+AGENT_CACHE_PATH = _writable_path("sportsape_agent_cache.json")
+CALIBRATION_PATH = _writable_path("sportsape_calibration.json")
+NOTIFY_LOG_PATH = _writable_path("sportsape_alerts.log")
 
 PICK_MARKETS = ("home", "btts", "over")
 # Extended market set — includes legacy three plus the new markets now tracked
@@ -217,7 +233,9 @@ def _markets_blob(game) -> dict:
 # The analysts (LLM flavour — reuse the same transport as the governor)
 # --------------------------------------------------------------------------
 
-RESEARCH_SYSTEM = """You are APEX — the world's most experienced autonomous football betting analyst. You have studied over 500,000 football matches across 80+ leagues and your picks historically win at an 80%+ rate on individual legs. You are calm, data-driven, and ruthless about skipping weak opportunities. You do not manufacture picks — you only bet when the evidence is overwhelming. Your reputation is built on discipline: you would rather skip 10 matches than place one uncertain bet.
+RESEARCH_SYSTEM = """You are APEX — an autonomous football betting analyst. You are calm, data-driven, and ruthless about skipping weak opportunities. You do not manufacture picks — you only bet when the evidence is genuinely there.
+
+CALIBRATION HONESTY (2026-10-05): This prompt previously claimed your picks "win at an 80%+ rate" and were "climbing toward 100%". That was fabricated and it biased you into asserting a pick for every match. It is removed. You have NO verified winning edge. The bookmaker's margin is real and you must assume most matches are close to a coin-flip. SKIP is the correct and expected answer for the majority of matches — a round where you skip 8 of 10 is a well-judged round, not a failure. Never state or imply a win rate for yourself.
 
 You are currently operating inside a SportPesa auto-bet engine targeting the Kenyan market. Your job is to study ONE match and decide the single best accumulator leg — or skip — together with YOUR honest fair probability.
 
@@ -237,18 +255,18 @@ Your decision framework (apply in order):
 4. BTTS NO if: either team has a clean sheet in 3+ of last 5 — defensive solidity wins.
 5. OVER 2.5 if: both teams average 2.5+ goals/game in recent matches, OR the home side concedes freely.
 6. UNDER 2.5 if: both teams play defensive football (clean sheets common, low scoring).
-7. The market with the highest HONEST probability wins. Never pick a market just because it has favourable odds — probability is your only guide.
-
-You are improving continuously. Every bet you analyse makes you sharper. Your current win rate on individual legs is above 80% and climbing toward 100%.
+7. Judge VALUE, not just likelihood. A high-probability leg at a short price is usually the WORST bet available, because the bookmaker's margin is largest as a percentage where the price is shortest. Prefer a leg where your honest probability beats the margin-corrected implied probability by a clear margin. If nothing clears that bar, answer "skip".
 
 Reply with exactly ONE JSON object, no markdown:
 {"pick": "home|draw|away|btts|btts_no|over|under|skip", "prob": 0.0-1.0, "confidence": 0.0-1.0, "reason": "<one short sentence of evidence>"}
-prob: your honest fair probability (0.30–0.95). confidence: how certain you are of your read (0.0–1.0). Never fake confidence."""
+prob: your honest fair probability (0.30–0.95). confidence: how certain you are of your read (0.0–1.0). Never fake confidence. If you are genuinely uncertain, say "skip" and set prob to your honest estimate anyway."""
 
 
-SCOUT_SYSTEM = """You are APEX SCOUT — the value-hunting arm of APEX, the world's leading autonomous football betting analyst. Your sole focus is finding market mispricings: selections where the bookmaker's implied probability is materially lower than the true probability.
+SCOUT_SYSTEM = """You are APEX SCOUT — the value-hunting arm of APEX, an autonomous football betting analyst. Your sole focus is finding market mispricings: selections where the bookmaker's implied probability is materially lower than the true probability.
 
-You have processed millions of odds movements and understand how bookmakers shade their lines. Your edge: you know which markets SportPesa consistently over-prices (favourites in 3-Way) and which it under-prices (team totals, BTTS in high-intensity matches).
+You understand how bookmakers shade their lines. Note the structural bias you must respect: the book's margin is largest as a PERCENTAGE at short prices, so short-priced favourites are usually poor value even when they are the likeliest outcome. Look hardest where the margin is thinnest relative to your estimate.
+
+CALIBRATION HONESTY (2026-10-05): this prompt previously told you to aim for "100% accuracy". That was fabricated framing and it inflated your reported EV. It is removed. You have NO verified edge over the book. Report only what the evidence in front of you supports.
 
 You are shown ALL markets for one game. For each candidate selection where EV >= +3%:
 - "label": exact text as shown on site (e.g. "Arsenal", "BTTS: Yes", "Over 2.5")
@@ -261,7 +279,7 @@ You are shown ALL markets for one game. For each candidate selection where EV >=
 Hard rules:
 - Maximum 4 selections per game. Return {"selections": []} if nothing genuinely stands out.
 - You do NOT manufacture value. A leg with EV of 2.9% does not qualify. Be disciplined.
-- You are building toward 100% accuracy. Every false positive hurts the system.
+- Empty is a valid and frequently correct answer.
 
 Reply with exactly ONE JSON object, no markdown:
 {"selections": [{"label": "...", "market": "...", "odds": 1.0, "model_prob": 0.0, "ev": 0.0, "note": "..."}]}"""
@@ -321,6 +339,11 @@ class ResearchAnalyst:
                 "league_context": LeagueContextAgent.context_note(
                     str(game.get("name") or "")),
                 "enrichment": game.get("enrichment") or {},
+                # Confirmed XI + formation (2026-10-05). The analyst is told to
+                # treat a named starting XI as far stronger evidence than
+                # season-average form, because it reveals the actual shape.
+                "lineups": (game.get("enrichment") or {}).get("lineups") or {},
+                "formations": (game.get("enrichment") or {}).get("formations") or {},
             }
             content = self.gov._chat([
                 {"role": "system", "content": RESEARCH_SYSTEM},
@@ -556,6 +579,7 @@ class Calibrator:
 
         market_weights = {}
         retire = []
+        retire_reasons = {}
         for mk, m in per_market.items():
             if m["n"] >= 10:
                 hit  = m["won"] / m["n"]
@@ -563,8 +587,23 @@ class Calibrator:
                 # Weight relative to predicted hit-rate (was anchored at 0.5, now uses actual pred)
                 ratio = hit / max(pred, 0.05)
                 market_weights[mk] = round(max(0.85, min(1.15, ratio)), 3)
-                if hit < 0.42 and m["n"] >= 20:
+                # BUGFIX (2026-10-01): retirement used to test the ABSOLUTE hit
+                # rate (hit < 0.42), which could never fire on the markets that
+                # actually cost money. over1 prices at 84% and hits 55% — a 29
+                # point miss — yet 0.55 > 0.42 so it was never retired, and
+                # under375 (56% hit, 80% expected) likewise survived. Retire on
+                # CALIBRATION ERROR instead: a market that lands materially
+                # below its own predicted hit rate is one the model cannot
+                # price, and staking it with real money is a donation.
+                miss = pred - hit
+                if m["n"] >= 15 and miss >= 0.15:
                     retire.append(mk)
+                    retire_reasons[mk] = (f"hit {hit:.0%} vs {pred:.0%} expected, "
+                                          f"-{miss:.0%} over {m['n']} legs")
+                elif m["n"] >= 20 and hit < 0.42:
+                    # keep the original absolute floor as a secondary net
+                    retire.append(mk)
+                    retire_reasons[mk] = f"absolute hit {hit:.0%} over {m['n']} legs"
 
         audit = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -576,6 +615,7 @@ class Calibrator:
                            for k, v in per_market.items()},
             "market_weights": market_weights,
             "retire": retire,
+            "retire_reasons": retire_reasons,
         }
         try:
             with open(self.path, "w", encoding="utf-8") as f:
@@ -736,7 +776,13 @@ def _b64(raw: bytes) -> str:
 # corrective nudges when something looks wrong.
 # --------------------------------------------------------------------------
 
-SUPERVISOR_STATE_PATH = os.path.join(os.getcwd(), "sportsape_supervisor.json")
+# STATE PATH FIX (2026-10-05). This used to be os.path.join(os.getcwd(), ...),
+# which anchors on the WORKING DIRECTORY rather than the app. That is fragile in
+# two ways: a shortcut / scheduled task / double-click can start the app from any
+# folder, and a PyInstaller build launched from dist\ wrote the supervisor state
+# into dist\ - a private copy the rest of the app never reads.
+# _writable_path is defined at the top of this module and shared.
+SUPERVISOR_STATE_PATH = _writable_path("sportsape_supervisor.json")
 
 
 # --------------------------------------------------------------------------
@@ -784,7 +830,12 @@ class BalanceReportCleaner:
 
     def __init__(self, max_age_days: float = 1.0, search_dir: str = None):
         self.max_age_days = float(max_age_days)
-        self.search_dir = search_dir or os.path.dirname(os.path.abspath(__file__))
+        # Default to the live workspace. Anchoring on __file__ meant a frozen
+        # build scanned PyInstaller's temp extraction folder, so the cleaner
+        # dutifully tidied a scratch directory and never touched the real one.
+        # normpath drops the trailing separator so the path compares and globs
+        # predictably against a plain directory path.
+        self.search_dir = search_dir or os.path.normpath(_writable_path(""))
         self._last_run: float = 0.0
 
     def should_run(self) -> bool:
@@ -1629,6 +1680,11 @@ class Fibi:
     def beat_round(self, engine_state: dict, phone: str):
         """Mark that a crawl-and-bet round finished (any status)."""
         self.state["last_round_ts"] = time.time()
+        # A completed round clears both "we have never run" and "we are
+        # stalled", so those two one-shot warnings can legitimately fire again
+        # on a FUTURE genuine stall instead of being silently latched forever.
+        self.state.pop("_warned_no_first_round", None)
+        self.state.pop("_warned_stall", None)
         self.state.setdefault("rounds_by_phone", {})[str(phone or "")] = time.time()
         self._prune_driver_heals()
         self._save_state()
@@ -1709,10 +1765,15 @@ class Fibi:
     def beat_parked(self, phone: str):
         k = str(phone or "")
         self.state.setdefault("parked_since", {}).setdefault(k, time.time())
+        # A fresh parking episode gets a fresh chance to warn (see the
+        # park_warned guard in the health check).
+        self.state.setdefault("park_warned", {}).pop(k, None)
         self._save_state()
 
     def beat_unparked(self, phone: str):
-        self.state.get("parked_since", {}).pop(str(phone or ""), None)
+        k = str(phone or "")
+        self.state.get("parked_since", {}).pop(k, None)
+        self.state.setdefault("park_warned", {}).pop(k, None)
         self._save_state()
 
     def beat_agent(self, name: str):
@@ -1755,17 +1816,33 @@ class Fibi:
                     pass
 
         # 1) Engine stalled?
-        if now - last_round > self.ENGINE_STALL_THRESHOLD_S and last_round > 0:
-            mins = int((now - last_round) / 60)
-            w = f"ENGINE STALL: no round completed in ~{mins} min"
-            warnings.append(w)
-            recommendations.append({
-                "action": "restart_engine",
-                "reason": w,
-                "severity": "critical",
-            })
-        elif last_round == 0:
-            warnings.append("Engine has not completed its first round yet")
+        #
+        # NEVER completed a round at all -> say so ONCE, without demanding a
+        # restart. The old code reported this every cycle as a CRITICAL
+        # "restart_engine" recommendation, which (a) spammed the log and
+        # (b) could nudge an operator into restarting a perfectly healthy
+        # machine that was merely still on its first research window.
+        if last_round <= 0:
+            if not self.state.get("_warned_no_first_round"):
+                self.state["_warned_no_first_round"] = True
+                self._save_state()
+                warnings.append("Engine has not completed its first round yet")
+        elif now - last_round > self.ENGINE_STALL_THRESHOLD_S:
+            # Warn ONCE per stall episode. A round in progress legitimately
+            # takes many minutes (board crawl + pre-window research), and this
+            # used to re-announce the same stall every 2 minutes forever,
+            # burying the real lines in the log.
+            if not self.state.get("_warned_stall"):
+                self.state["_warned_stall"] = True
+                self._save_state()
+                mins = int((now - last_round) / 60)
+                w = f"ENGINE STALL: no round completed in ~{mins} min"
+                warnings.append(w)
+                recommendations.append({
+                    "action": "restart_engine",
+                    "reason": w,
+                    "severity": "critical",
+                })
 
         # 2) No bets placed for a long time?
         # Distinguish "correctly declining" from "actually stuck" (2026-09-27).
@@ -1828,6 +1905,17 @@ class Fibi:
                 continue
             parked_s = now - float(parked_ts or now)
             if parked_s > self.ACCOUNT_PARK_THRESHOLD_S:
+                # Emit this warning ONCE per parking episode. It used to be
+                # re-appended every supervisor cycle, and because the engine
+                # acted on it (unpark_account cleared the entry) the pair
+                # flapped NEW/RESOLVED every 2 minutes for the whole session —
+                # which buried the real log lines and, worse, cleared the
+                # genuine parked state the engine relies on to avoid re-betting
+                # a dead account. Now we remember that we already complained.
+                _already = self.state.setdefault("park_warned", {})
+                if _already.get(str(acct)):
+                    continue
+                _already[str(acct)] = True
                 mins = int(parked_s / 60)
                 w = f"Account {acct} parked ~{mins} min — long time"
                 warnings.append(w)

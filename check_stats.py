@@ -1,7 +1,16 @@
 import json, os, time
 from datetime import datetime
+from pathlib import Path
 
 base = os.path.dirname(os.path.abspath(__file__))
+
+# The shipped app writes its state to the Desktop (resource_path.app_base_dir:
+# a Desktop state set wins for every launch mode). Reading the source folder's
+# copy showed a stale, orphaned stats file - prefer the live one when present.
+_live = Path.home() / "Desktop"
+if (_live / "sportsape_stats.json").exists():
+    base = str(_live)
+LEDGER = os.path.join(base, "sportsape_ledger.json")
 
 def load(f):
     p = os.path.join(base, f)
@@ -108,6 +117,36 @@ fresh = [g for g in games.values() if isinstance(g, dict) and g.get('pick') and 
 print(f"  Fresh analyst picks in cache: {len(fresh)}")
 for g in fresh[:5]:
     print(f"    {g.get('name', '?')[:40]} -> {g.get('pick')} (prob {g.get('prob'):.0%} conf {g.get('confidence'):.0%})")
+
+print("\n" + "="*60)
+print("TEAMS (by market, real money)")
+print("="*60)
+_veto = {k: v for k, v in (st.get('recipes') or {}).items()
+         if int(v.get('trials', 0)) >= 15 and float(v.get('stake', 0)) > 0
+         and ((float(v.get('ret', 0)) - float(v.get('stake', 0)))
+              / float(v.get('stake', 0))) <= -0.20}
+if _veto:
+    for k, v in sorted(_veto.items()):
+        stk = float(v.get('stake', 0)); ret = float(v.get('ret', 0))
+        print(f"  VETOED recipe {k}: {v.get('trials', 0)} real bets, "
+              f"ROI {((ret - stk) / stk if stk else 0):+.0%} - the live engine refuses it")
+ts = st.get('team_stats') or {}
+trows = []
+for team, mk_map in ts.items():
+    for mk, e in mk_map.items():
+        n = int(e.get('trials') or 0)
+        if n < 2:
+            continue
+        stk = float(e.get('stake') or 0)
+        ret = float(e.get('ret') or 0)
+        roi = (ret - stk) / stk if stk else 0
+        trows.append((roi, n, team, mk, float(e.get('won') or 0) / n, stk, ret))
+trows.sort(key=lambda x: -x[0])
+for roi, n, team, mk, hit, stk, ret in trows[:12]:
+    print(f"  {str(team)[:26]:26} {mk:10} {n:3} bets  hit {hit:.0%}  "
+          f"ROI {roi:+.0%}  KES {stk:.0f}->{ret:.0f}")
+if not trows:
+    print("  No team data yet (needs settled bets carrying the game names).")
 
 print("\n" + "="*60)
 print("SUPERVISOR / FIBI")

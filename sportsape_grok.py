@@ -25,7 +25,16 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL_XAI    = "grok-3"
 DEFAULT_MODEL_GROQ   = "openai/gpt-oss-120b"
-DEFAULT_MODEL_GEMINI = "gemini-2.0-flash"
+# gemini-2.0-flash was retired by Google (404 "no longer available").
+# Verified 2026-10-11 against a live key: gemini-3.8-flash answers; the
+# Gemini edge also 503s under load, so the client retries it.
+# The analyst's default model. MEASURED 2026-10-15: gemini-3.8-flash
+# answered 503 "experiencing high demand" on every attempt (the free edge
+# is saturated), so ai_verdicts silently returned {} for its whole life and
+# the AI gate never blocked a leg. gemini-flash-lite-latest answers 200 and
+# is the same analyst at QA speed; the heavier model is not worth a 100%
+# failure rate on a 12-second per-round budget.
+DEFAULT_MODEL_GEMINI = "gemini-flash-lite-latest"
 DEFAULT_MODEL_OPENAI = "gpt-4o-mini"
 # Akamai on Groq/xAI edges blocks the default Python-urllib signature — send a
 # real Chrome UA + accept headers exactly like the tool's stealth layer does.
@@ -351,6 +360,12 @@ class GrokGovernor:
             if exc.code == 429 and _retry < 3:
                 wait = [15, 45, 90][_retry]
                 time.sleep(wait)
+                return self._chat(messages, temperature=temperature, _retry=_retry + 1)
+            # The Gemini edge answers 503 "high demand" for a model that exists
+            # (measured 2026-10-11 with a valid key). That is transient, not a
+            # rejection - short backoff, two retries, then propagate.
+            if exc.code == 503 and _retry < 2:
+                time.sleep([2, 5][_retry])
                 return self._chat(messages, temperature=temperature, _retry=_retry + 1)
             raise
 
