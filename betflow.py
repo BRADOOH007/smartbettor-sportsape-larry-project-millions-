@@ -2935,6 +2935,14 @@ def do_round(driver, phone: str, password: str, stake: float,
     # without odds - fall back to the DOM board instead of standing down. The
     # DOM path is slower but proven; it must stay the floor of this engine.
     legs = api_pick_legs(games, exclude=used_today, rotation=rotation) if api_mode else []
+    # SHARE THE SPOILS: if this account's rotation produced no slip, try the
+    # other rotations before standing down - every phone should bet each round.
+    if not legs and api_mode:
+        for alt_rot in range(1, 6):
+            legs = api_pick_legs(games, exclude=used_today, rotation=alt_rot)
+            if legs:
+                log(f"  rotation {rotation} found no slip - rotation {alt_rot} did")
+                break
     if not legs and api_mode:
         log("  API pick found no playable combination - falling back to the DOM board")
         goto(driver, TODAY_URL)
