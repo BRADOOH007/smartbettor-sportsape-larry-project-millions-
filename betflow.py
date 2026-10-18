@@ -492,6 +492,22 @@ def idle_research() -> dict:
         out["flashscore"] = len(games)
     except Exception as exc:
         out["flashscore_error"] = str(exc)[:80]
+    # ── FotMob news (injuries/rest/rotation) - RSS, cheap, no browser ─────
+    try:
+        import fotmob_news
+        wanted_fm = None
+        try:
+            board_file = LIVE / "last_board.json"
+            if board_file.exists():
+                board = json.loads(board_file.read_text(encoding="utf-8"))
+                wanted_fm = [(g.get("home"), g.get("away"))
+                             for g in board if g.get("home") and g.get("away")]
+        except Exception:
+            wanted_fm = None
+        fm = fotmob_news.refresh(wanted_fm)
+        out["fotmob"] = len(fm) if isinstance(fm, dict) else 0
+    except Exception as exc:
+        out["fotmob_error"] = str(exc)[:80]
     # ── API-Football: today's not-started fixtures (one call, cached 6h) ──
     try:
         import model_data

@@ -397,6 +397,16 @@ def apply_gates(cands: list, log=print, ai: bool = True) -> tuple:
         if news_blocked(sig):
             news_blocked_n += 1
             continue
+        # FotMob RSS news (injuries/rest/rotation) - a second, independent
+        # news source. Conservative: only blocks when a flag keyword is present
+        # AND the team name is unambiguously matched in a preview.
+        try:
+            import fotmob_news as _fm
+            if _fm.team_has_bad_news(c.get("home")) or _fm.team_has_bad_news(c.get("away")):
+                news_blocked_n += 1
+                continue
+        except Exception:
+            pass
         if odds_underpaid(sig, c.get("market"), c.get("odds")):
             odds_blocked_n += 1
             continue
