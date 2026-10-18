@@ -508,6 +508,31 @@ def idle_research() -> dict:
         out["fotmob"] = len(fm) if isinstance(fm, dict) else 0
     except Exception as exc:
         out["fotmob_error"] = str(exc)[:80]
+    # ── ESPN standings (free, no quota): pre-warm for the board's leagues ──
+    # Standings don't change in 30 min, so fetching them during the pacing
+    # gap means the deep check + standing_ok gate are instant at round time.
+    try:
+        import model_data
+        board_file = LIVE / "last_board.json"
+        if board_file.exists():
+            board = json.loads(board_file.read_text(encoding="utf-8"))
+            seen = set()
+            for g in board:
+                if g.get("sport", "Football") != "Football":
+                    continue
+                country = g.get("country") or ""
+                league = g.get("league") or ""
+                key = (country, league)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    model_data.fetch_standings(country, league)
+                except Exception:
+                    pass
+            out["standings"] = len(seen)
+    except Exception as exc:
+        out["standings_error"] = str(exc)[:80]
     # ── API-Football: today's not-started fixtures (one call, cached 6h) ──
     try:
         import model_data
@@ -1700,15 +1725,25 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
         if _ok:
             try:
                 import model_data as _md
-                ok, reason = _md.deep_check(legs[0])
-                if not ok:
+                # Deep check ALL legs (not just the anchor). Cached data
+                # (standings 12h, form 24h) makes this fast; quota is only
+                # spent on the first uncached leg.
+                all_ok = True
+                fail_reason = "ok"
+                for leg in legs:
+                    ok, reason = _md.deep_check(leg)
+                    if not ok:
+                        all_ok = False
+                        fail_reason = reason
+                        break
+                if not all_ok:
                     try:
-                        log(f"  DEEP CHECK failed: {reason} - slip dropped")
+                        log(f"  DEEP CHECK failed: {fail_reason} - slip dropped")
                     except Exception:
                         pass
                     return []
                 try:
-                    log(f"  DEEP CHECK ok: {reason}")
+                    log(f"  DEEP CHECK ok: all {len(legs)} legs passed")
                 except Exception:
                     pass
             except Exception:
