@@ -1599,7 +1599,8 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
                           # learning table is keyed by, so the draft can steer
                           # toward leagues whose markets beat their price.
                           "league": f"{g.get('sport') or 'Football'}: "
-                                    f"{g.get('league') or ''}"})
+                                    f"{g.get('league') or ''}",
+                           "country": g.get("country") or ""})
     if not cands:
         return []
 

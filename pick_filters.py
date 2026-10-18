@@ -444,6 +444,21 @@ def apply_gates(cands: list, log=print, ai: bool = True) -> tuple:
         if odds_drifted(sig, c.get("market")):
             odds_blocked_n += 1
             continue
+        # Standing/position gate (ESPN, free, no quota): block extreme
+        # mismatches - e.g. betting away win when home is 8+ places higher
+        # with significantly better PPG. None data = no opinion (pass).
+        try:
+            import model_data as _md
+            country = c.get("country") or ""
+            league = c.get("league") or ""
+            if league.startswith("Football: "):
+                league = league[len("Football: "):].strip()
+            if country and league and not _md.standing_ok(
+                    c.get("home"), c.get("away"), country, league):
+                odds_blocked_n += 1
+                continue
+        except Exception:
+            pass
         if p is None:
             gated.append(c)
             continue

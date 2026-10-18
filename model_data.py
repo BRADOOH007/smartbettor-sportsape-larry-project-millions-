@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 model_data.py - API-Football model layer for BetFlow.
@@ -721,3 +721,174 @@ def deep_check(cand: dict) -> tuple:
     except Exception as e:
         return True, "deep_check error: " + str(e)[:60]
 
+
+
+
+
+# -- ESPN standings helpers (free, no quota) -------------------------------
+
+
+_ESPN_STANDINGS_TTL = 12.0 * 3600.0
+
+_LEAGUE_SLUG_MAP = {
+    ("england", "premier league"): "eng.1",
+    ("england", "championship"): "eng.2",
+    ("spain", "la liga"): "esp.1",
+    ("italy", "serie a"): "ita.1",
+    ("germany", "bundesliga"): "ger.1",
+    ("france", "ligue 1"): "fra.1",
+    ("netherlands", "eredivisie"): "ned.1",
+    ("portugal", "primeira liga"): "por.1",
+    ("scotland", "premiership"): "sco.1",
+    ("turkey", "super lig"): "tur.1",
+    ("belgium", "pro league"): "bel.1",
+    ("austria", "bundesliga"): "aut.1",
+    ("switzerland", "super league"): "sui.1",
+    ("greece", "super league"): "gre.1",
+    ("denmark", "superliga"): "den.1",
+    ("sweden", "allsvenskan"): "swe.1",
+    ("norway", "eliteserien"): "nor.1",
+    ("poland", "ekstraklasa"): "pol.1",
+    ("russia", "premier league"): "rus.1",
+    ("usa", "mls"): "usa.1",
+    ("usa", "major league soccer"): "usa.1",
+    ("mexico", "liga mx"): "mex.1",
+    ("brazil", "serie a"): "bra.1",
+    ("argentina", "liga profesional"): "arg.1",
+    ("argentina", "primera division"): "arg.1",
+    ("japan", "j1 league"): "jpn.1",
+    ("australia", "a-league"): "aus.1",
+    ("australia", "a league"): "aus.1",
+    ("china", "super league"): "chn.1",
+    ("uefa", "champions league"): "uefa.champions",
+    ("uefa", "europa league"): "uefa.europa",
+}
+
+
+def _espn_slug(country, league):
+    if not country or not league:
+        return None
+    c = str(country).strip().lower()
+    l = str(league).strip().lower()
+    if l.startswith("football: "):
+        l = l[len("football: "):].strip()
+    key = (c, l)
+    if key in _LEAGUE_SLUG_MAP:
+        return _LEAGUE_SLUG_MAP[key]
+    for (cc, ll), slug in _LEAGUE_SLUG_MAP.items():
+        if cc == c and (ll in l or l in ll):
+            return slug
+    for (cc, ll), slug in _LEAGUE_SLUG_MAP.items():
+        if cc in c or c in cc:
+            if ll in l or l in ll:
+                return slug
+    return None
+
+
+def fetch_standings(country, league):
+    slug = _espn_slug(country, league)
+    if not slug:
+        return None
+    cache = _load_cache()
+    st = cache.setdefault("espn_standings", {})
+    ent = st.get(slug)
+    if ent and time.time() - ent.get("at", 0) < _ESPN_STANDINGS_TTL:
+        return ent.get("data")
+    url = "https://site.api.espn.com/apis/v2/sports/soccer/{}/standings".format(slug)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        st[slug] = {"at": time.time(), "data": None}
+        cache["espn_standings"] = st
+        _save_cache(cache)
+        return None
+    entries = None
+    try:
+        children = body.get("children", [])
+        if children:
+            standings = children[0].get("standings", {}).get("entries", [])
+        else:
+            standings = body.get("standings", {}).get("entries", [])
+        entries = []
+        for e in standings:
+            team = (e.get("team") or {}).get("displayName", "")
+            stats = {s.get("name"): s.get("value") for s in (e.get("stats") or [])}
+            entries.append({
+                "team": team,
+                "rank": int(stats.get("rank") or 0),
+                "points": int(stats.get("points") or 0),
+                "played": int(stats.get("gamesPlayed") or 0),
+                "won": int(stats.get("wins") or 0),
+                "drawn": int(stats.get("ties") or 0),
+                "lost": int(stats.get("losses") or 0),
+                "gf": int(stats.get("pointsFor") or 0),
+                "ga": int(stats.get("pointsAgainst") or 0),
+                "form": stats.get("overall"),
+            })
+    except Exception:
+        entries = None
+    st[slug] = {"at": time.time(), "data": entries}
+    cache["espn_standings"] = st
+    _save_cache(cache)
+    return entries
+
+
+def _find_team_standing(team, standings):
+    if not standings or not team:
+        return None
+    n = norm(team)
+    for s in standings:
+        if norm(s.get("team", "")) == n:
+            return s
+    toks = n.split()
+    last = toks[-1] if toks else ""
+    if len(last) >= 4:
+        cands = [s for s in standings
+                 if last in norm(s.get("team", "")).split()]
+        if len(cands) == 1:
+            return cands[0]
+    return None
+
+
+def standing_signal(home, away, country, league):
+    standings = fetch_standings(country, league)
+    if not standings:
+        return None
+    hs = _find_team_standing(home, standings)
+    aw = _find_team_standing(away, standings)
+    if not hs or not aw:
+        return None
+    n = len(standings)
+    hr, ar = hs["rank"], aw["rank"]
+    hppg = (hs["points"] / hs["played"]) if hs["played"] else 0.0
+    appg = (aw["points"] / aw["played"]) if aw["played"] else 0.0
+    gap = ar - hr
+    mot = None
+    if hr <= 3 and ar > n // 2:
+        mot = "home title contender vs mid-table away"
+    elif ar <= 3 and hr > n // 2:
+        mot = "away title contender vs mid-table home"
+    elif hr >= n - 2:
+        mot = "home in relegation zone"
+    elif ar >= n - 2:
+        mot = "away in relegation zone"
+    return {
+        "home_rank": hr, "away_rank": ar, "rank_gap": gap,
+        "home_ppg": round(hppg, 2), "away_ppg": round(appg, 2),
+        "home_form": hs.get("form"), "away_form": aw.get("form"),
+        "n_teams": n, "motivation": mot,
+    }
+
+
+def standing_ok(home, away, country, league):
+    sig = standing_signal(home, away, country, league)
+    if not sig:
+        return True
+    gap = sig["rank_gap"]
+    if gap >= 8 and sig["home_ppg"] > sig["away_ppg"] + 0.5:
+        return False
+    if gap <= -8 and sig["away_ppg"] > sig["home_ppg"] + 0.5:
+        return False
+    return True
