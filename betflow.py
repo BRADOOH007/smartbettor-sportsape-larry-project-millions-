@@ -555,7 +555,10 @@ def idle_research() -> dict:
 SHADOW_MARKETS = {"home", "away", "draw", "btts", "btts_no",
                   "over15", "over25", "under", "under25",
                   "dnb_home", "dnb_away",
-                  "ht_home", "ht_draw", "ht_away", "hfbtts", "hfbtts_no"}
+                  "dc_1x", "dc_x2", "dc_12",
+                  "ht_home", "ht_draw", "ht_away",
+                  "htft_hh", "htft_xx", "htft_aa",
+                  "hfbtts", "hfbtts_no"}
 
 
 def make_shadow_slips(games: list, real_legs: list, rotation: int,
@@ -568,23 +571,24 @@ def make_shadow_slips(games: list, real_legs: list, rotation: int,
     simulated. Returns [] when nothing distinct is available.
     """
     shadows = []
-    for shift in (2, 4):
-        try:
-            legs = api_pick_legs(games, rotation=rotation + shift, want=want)
-        except Exception:
-            continue
-        if not legs:
-            continue
-        if len(legs) == len(real_legs) and all(
-                any(l["gid"] == r["gid"] and l["market"] == r["market"]
-                    for r in real_legs) for l in legs):
-            continue                       # identical shape - nothing to learn
-        if any(l["market"] not in SHADOW_MARKETS for l in legs):
-            continue
-        product = 1.0
-        for l in legs:
-            product *= l["odds"]
-        shadows.append({
+    for shift in (1, 2, 3, 4):
+        for want in (2, 3):
+            try:
+                legs = api_pick_legs(games, rotation=rotation + shift, want=want)
+            except Exception:
+                continue
+            if not legs:
+                continue
+            if len(legs) == len(real_legs) and all(
+                    any(l["gid"] == r["gid"] and l["market"] == r["market"]
+                        for r in real_legs) for l in legs):
+                continue                       # identical shape - nothing to learn
+            if any(l["market"] not in SHADOW_MARKETS for l in legs):
+                continue
+            product = 1.0
+            for l in legs:
+                product *= l["odds"]
+            shadows.append({
             "placed_at": datetime.now().isoformat(timespec="seconds"),
             "phone": "shadow",
             "stake": 0.0,
@@ -603,7 +607,7 @@ def make_shadow_slips(games: list, real_legs: list, rotation: int,
             "status": "shadow",
             "shadow_of_rotation": rotation + shift,
         })
-        if len(shadows) >= 2:
+        if len(shadows) >= 6:
             break
     return shadows
 
