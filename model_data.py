@@ -717,6 +717,9 @@ def deep_check(cand: dict) -> tuple:
             return False, "bad form: " + str(away)
         if fid and has_key_injury(fid):
             return False, "key injury on fixture " + str(fid)
+        # lineup check: if released, must be complete (11 starters each)
+        if fid and not lineup_ok(fid):
+            return False, "incomplete lineup on fixture " + str(fid)
         return True, "ok"
     except Exception as e:
         return True, "deep_check error: " + str(e)[:60]
@@ -891,4 +894,91 @@ def standing_ok(home, away, country, league):
         return False
     if gap <= -8 and sig["away_ppg"] > sig["home_ppg"] + 0.5:
         return False
+    return True
+
+# -- Lineup helpers (API-Football, quota-aware) ---------------------------
+_LINEUP_TTL = 1.0 * 3600.0
+
+
+def fetch_lineups(fixture_id: int):
+    if not fixture_id:
+        return None
+    cache = _load_cache()
+    lus = cache.setdefault("fixture_lineups", {})
+    key = str(fixture_id)
+    ent = lus.get(key)
+    if ent and time.time() - ent.get("at", 0) < _LINEUP_TTL:
+        return ent.get("data")
+    if 0 <= _quota_left() < 2:
+        return None
+    try:
+        body = _get(f"{API_HOST}/fixtures/lineups?fixture={fixture_id}")
+    except Exception:
+        body = None
+    if not body or not body.get("response"):
+        lus[key] = {"at": time.time(), "data": None}
+        cache["fixture_lineups"] = lus
+        _save_cache(cache)
+        return None
+    out = []
+    for item in body["response"]:
+        try:
+            team = (item.get("team") or {}).get("name", "")
+            formation = item.get("formation", "")
+            startXI = []
+            for p in (item.get("startXI") or []):
+                pl = (p.get("player") or {})
+                startXI.append(pl.get("name") or pl.get("number"))
+            subs = []
+            for p in (item.get("substitutes") or []):
+                pl = (p.get("player") or {})
+                subs.append(pl.get("name") or pl.get("number"))
+            out.append({
+                "team": team,
+                "formation": formation,
+                "startXI": startXI,
+                "subs": subs,
+            })
+        except Exception:
+            continue
+    lus[key] = {"at": time.time(), "data": out}
+    cache["fixture_lineups"] = lus
+    _save_cache(cache)
+    return out
+
+
+def lineup_summary(fixture_id: int) -> str | None:
+    """Human-readable lineup summary, or None if not released yet."""
+    lineups = fetch_lineups(fixture_id)
+    if not lineups:
+        return None
+    parts = []
+    for lu in lineups:
+        xi = ", ".join(str(x) for x in (lu.get("startXI") or [])[:11])
+        parts.append("{} ({}): {}".format(lu.get("team", "?"),
+                                          lu.get("formation", "?"), xi))
+    return " | ".join(parts)
+
+
+def lineup_released(fixture_id: int) -> bool:
+    lineups = fetch_lineups(fixture_id)
+    if not lineups:
+        return False
+    for lu in lineups:
+        if len(lu.get("startXI") or []) < 10:
+            return False
+    return True
+
+
+def lineup_ok(fixture_id: int) -> bool:
+    """True if lineups are released and look complete (11 starters each).
+
+    Returns True when lineups aren't released yet (no opinion - too early).
+    """
+    lineups = fetch_lineups(fixture_id)
+    if not lineups:
+        return True  # not released yet = no opinion
+    for lu in lineups:
+        if len(lu.get("startXI") or []) < 10:
+            return False  # incomplete = something wrong
     return True
