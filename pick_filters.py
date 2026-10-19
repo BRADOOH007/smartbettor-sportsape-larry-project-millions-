@@ -487,24 +487,23 @@ def apply_gates(cands: list, log=print, ai: bool = True) -> tuple:
         except Exception:
             pass
 
-    # ── AI analyst red flags (batched, one call) ────────────────────────
+    # ── AI analyst (ADVISORY ONLY - no BS, but does NOT block) ──────────
+    # The AI was blocking 20-25 legs/round but the survivors still lost, so
+    # blocking was not improving outcomes - it was just shrinking the pool and
+    # forcing worse substitutes. The AI now reports its opinion (logged) but
+    # never drops a leg. The mechanical gates (retired, veto, odds, flashscore,
+    # standing, movement) remain the real filters.
     if AI_ENABLED and ai and kept:
         try:
             verdicts = ai_verdicts(kept)
         except Exception:
             verdicts = {}
         if verdicts:
-            gated = []
-            for c in kept:
-                if verdicts.get(f"{c.get('gid')}|{c.get('market')}"):
-                    ai_blocked += 1
-                    continue
-                gated.append(c)
-            kept = gated
-            if ai_blocked:
+            flagged = sum(1 for c in kept
+                          if verdicts.get(f"{c.get('gid')}|{c.get('market')}"))
+            if flagged:
                 try:
-                    log(f"  AI analyst: {ai_blocked} leg(s) red-flagged "
-                        f"(no BS) and dropped")
+                    log(f"  AI analyst: {flagged} leg(s) flagged (advisory, not dropped)")
                 except Exception:
                     pass
 

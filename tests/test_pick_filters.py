@@ -130,13 +130,16 @@ class TestSteerGates(unittest.TestCase):
         self.assertEqual(counts["ai_blocked"], 0)
 
     def test_ai_flags_are_honoured_when_present(self):
+        # AI is now ADVISORY ONLY: it flags risky legs but never drops them.
+        # The mechanical gates (retired, veto, odds, flashscore, standing,
+        # movement) are the real filters; the AI just reports its opinion.
         verdicts = {"1|over25": True, "2|btts": False}
         with mock.patch.object(pick_filters, "STATS", Path("/nope/missing.json")), \
              mock.patch.object(pick_filters, "_flash_table", return_value={}), \
              mock.patch.object(pick_filters, "ai_verdicts", return_value=verdicts):
             kept, counts = pick_filters.apply_gates(list(CANDS), log=lambda m: None)
-        self.assertEqual([c["market"] for c in kept], ["btts"])
-        self.assertEqual(counts["ai_blocked"], 1)
+        self.assertEqual([c["market"] for c in kept], ["over25", "btts"])
+        self.assertEqual(counts["ai_blocked"], 0)
 
     def test_rotation_orders_by_learned_weight(self):
         markets = ["dnb_away", "under", "btts"]
