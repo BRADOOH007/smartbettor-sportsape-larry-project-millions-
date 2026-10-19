@@ -11282,7 +11282,64 @@ return 'noicon';
                 "teams_best": teams[:3], "teams_worst": teams[-3:],
                 "vetoed_recipes": vetoes,
             }
+            # ── AI post-mortem: honest analysis of the day's results ────────
+            # The AI's new role (it no longer blocks games): analyze settled
+            # results and tell us what worked, what failed, and why - no
+            # sugarcoating. Advisory only.
+            ai_insights = ""
             try:
+                import json as _j, urllib.request as _ur
+                from sportsape_grok import _detect_provider
+                _key = ""
+                try:
+                    _cfg = _j.loads(
+                        Path(writable_path("sportsape_settings.json")).read_text(encoding="utf-8"))
+                    _key = str(_cfg.get("grok_api_key") or "").strip()
+                except Exception:
+                    _key = ""
+                if _key:
+                    _base, _model = _detect_provider(_key, None)
+                    _prompt = (
+                        "You are a brutally honest betting analyst. Below is today's "
+                        "settled bet record. Analyze it with NO sugarcoating - tell "
+                        "us what actually worked, what failed, and why. Identify "
+                        "patterns in the losses (markets, leagues, odds bands, slip "
+                        "size). Give 3 concrete, actionable recommendations. "
+                        "Be specific, cite numbers. No fluff.\n\n"
+                        "Day: %s\n"
+                        "Bets: %d  Won: %d  Lost: %d  Staked: %.2f  Returned: %.2f  Net: %.2f\n"
+                        "Markets (trials/hit/priced): %s\n"
+                        "Vetoed recipes: %s\n"
+                        "Retired markets: %s\n"
+                        % (day, len(todays), len(won), len(lost), staked, returned,
+                           returned - staked,
+                           ", ".join("%s %d/%d (priced %.0f%%)" % (m["market"], int(m["hit"] * m["trials"]), m["trials"], m["priced"] * 100) for m in mkt[:8]),
+                           ", ".join(v["recipe"] for v in vetoes),
+                           ", ".join(retired) if retired else "none"))
+                    _body = _j.dumps({"model": _model, "temperature": 0.3,
+                                     "messages": [{"role": "user", "content": _prompt}]}).encode()
+                    _req = _ur.Request(
+                        _base + "/chat/completions", data=_body,
+                        headers={"Content-Type": "application/json",
+                                 "Authorization": "Bearer " + _key,
+                                 "User-Agent": "BetFlow/1.0",
+                                 "Accept": "application/json"})
+                    with _ur.urlopen(_req, timeout=30) as _resp:
+                        _data = _j.loads(_resp.read().decode("utf-8", "replace"))
+                    ai_insights = str(((_data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+                    if ai_insights:
+                        self._emit_direct(gui_callback,
+                            "AI POST-MORTEM: " + ai_insights[:400])
+            except Exception as _e:
+                try:
+                    self._emit_direct(gui_callback,
+                        "AI post-mortem skipped: " + str(_e)[:60])
+                except Exception:
+                    pass
+            try:
+                entry["ai_insights"] = ai_insights
+            except Exception:
+                pass
                 jpath = Path(writable_path("sportsape_learning_journal.json"))
                 hist = []
                 if jpath.exists():
