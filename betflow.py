@@ -115,7 +115,7 @@ TODAY_URL = "https://www.ke.sportpesa.com/en/sports-betting/football-1/today-gam
 LOGIN_URL = "https://www.ke.sportpesa.com/en/sports-betting/football-1/"
 
 # Owner rule: never take odds in the 1.00-1.09 band.
-MIN_LEG_ODDS = 1.09
+MIN_LEG_ODDS = 1.25            # was 1.09; raised to 1.25 to avoid MTS-rejected short legs
 # Slip we aim for. Small and quick beats clever and slow.
 TARGET_LEGS = 2
 MIN_LEGS = 2
@@ -2158,7 +2158,7 @@ def pick_legs(games: list, want: int = TARGET_LEGS,
     Preference order: markets that are less popular and therefore mispriced more
     often - DNB away, under 2.5, BTTS no - before the 3-way crowd.
     """
-    MAX_LEGS = 4
+    MAX_LEGS = 3
 
     # Flatten (game, market, odds) with the floor applied.
     #
@@ -2928,8 +2928,87 @@ def do_round(driver, phone: str, password: str, stake: float,
     except Exception:
         pass
 
-    # Never re-bet a fixture already used today. This is what stops the engine
-    # from placing the same accumulator all day.
+    # ── SKIP OBSCURE LEAGUES: only bet on games the model can price ─────
+    # The model (API-Football) only covers leagues it knows about. Games from
+    # obscure leagues (Israeli Liga Alef, Bahrain 2nd Division, etc.) get no
+    # fixture match, no EV score, and no learning signal. Skip them rather than
+    # guessing. When the quota is exhausted (fixtures_today returns []), we
+    # keep everything (can't tell what's obscure without the fixture list).
+    try:
+        import model_data as _md
+        fixtures = _md.fetch_fixtures_today()
+        if fixtures:
+            fx_keys = set()
+            for fx in fixtures:
+                fx_keys.add((norm(fx.get("hn", "")), norm(fx.get("an", ""))))
+            # also build a fuzzy set: last token of each team
+            def _in_fixtures(home, away):
+                h, a = norm(home), norm(away)
+                if (h, a) in fx_keys or (a, h) in fx_keys:
+                    return True
+                # fuzzy: check if any fixture has both teams matching by prefix
+                for fh, fa in fx_keys:
+                    if (fh.startswith(h[:5]) or h.startswith(fh[:5])) and \
+                        (fa.startswith(a[:5]) or a.startswith(fa[:5])):
+                        return True
+                return False
+            before = len(games)
+            games = [g for g in games
+                     if _in_fixtures(g.get("home", ""), g.get("away", ""))]
+            if len(games) < before:
+                try:
+                    log(f"  obscure leagues: skipped {before - len(games)} game(s) "
+                        f"not in API-Football fixtures")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # ── SKIP UNCOVERED SPORTS/LEAGUES (no model + no grading source) ──
+    # Basketball is gradeable only via ESPN (NBA, NBL, WNBA, EuroLeague, FIBA,
+    # ACB). Tennis only via ESPN (ATP, WTA). Table tennis has no source.
+    # Skip the rest so we don't bet on ungradeable legs.
+    try:
+        _COVERED_BB = {"NBA", "NBL", "WNBA", "EuroLeague", "FIBA", "ACB"}
+        _COVERED_TENNIS = {"ATP", "WTA"}
+        before = len(games)
+        filtered = []
+        for g in games:
+            sport = g.get("sport")
+            # Test fixtures (no sport field) bypass the filter
+            if sport is None:
+                filtered.append(g)
+                continue
+            league = str(g.get("league") or "")
+            country = str(g.get("country") or "")
+            if "Basketball" in str(sport):
+                if any(c in league for c in _COVERED_BB):
+                    filtered.append(g)
+            elif "Tennis" in str(sport):
+                if any(c in league for c in _COVERED_TENNIS):
+                    filtered.append(g)
+            elif "Table Tennis" in str(sport):
+                continue
+            else:
+                # Football: check API-Football fixtures
+                try:
+                    if fixtures:
+                        h = norm(g.get("home",""))
+                        a = norm(g.get("away",""))
+                        if _in_fixtures(h, a):
+                            filtered.append(g)
+                    else:
+                        filtered.append(g)  # no fixture data, keep all
+                except NameError:
+                    filtered.append(g)  # fixtures not defined, keep all
+        if len(filtered) < before:
+            try:
+                log(f"  obscure leagues: skipped {before - len(filtered)} game(s) "
+                    f"(ungradeable/unmatched)")
+            except Exception:
+                pass
+        games = filtered
+    except Exception:
+        pass
     used_today = games_bet_today(load_ledger())
     if used_today:
         log(f"  {len(used_today)} fixture(s) already bet today - excluded")

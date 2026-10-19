@@ -50,7 +50,7 @@ SECOND = game_like({
 
 THIRD = game_like({
     "1X2#0": (1.02, 30001), "1X2#1": (12.0, 30002), "1X2#2": (29.0, 30003),  # floor test: 1.02 rejected
-    "BTTS#1": (1.70, 30004), "DNB#1": (3.90, 30005),
+    "BTTS#0": (1.70, 30004), "DNB#1": (3.90, 30005),
 }, home="Depressed FC", away="Favored United", gid="3000", br=0, ko=0)
 
 
