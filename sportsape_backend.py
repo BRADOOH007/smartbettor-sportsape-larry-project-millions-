@@ -1223,13 +1223,25 @@ function click(el) {
   return false;
 }
 const nodes = Array.from(document.querySelectorAll('button,[role="button"],a,div,span'));
+// Collect all matching nodes, then pick the best: exact text match first,
+// then the rightmost (highest x) so the "Agree"/"Accept" button on the RIGHT
+// of a two-button modal is chosen over a "Disagree"/"Decline" on the left.
+const matches = [];
 for (const node of nodes) {
   if (!visible(node)) continue;
   const text = (node.innerText || node.textContent || '').trim().toLowerCase().replace(/\\s+/g, ' ');
   if (!text) continue;
-  if (labels.some(label => text === label || text.includes(label))) {
-    if (click(node)) return true;
+  const exact = labels.some(label => text === label);
+  const sub = !exact && labels.some(label => text.includes(label));
+  if (exact || sub) {
+    const r = node.getBoundingClientRect();
+    matches.push({ node, exact, x: r.left + r.width / 2, text });
   }
+}
+// exact matches first, then rightmost
+matches.sort((a, b) => (b.exact - a.exact) || (b.x - a.x));
+for (const m of matches) {
+  if (click(m.node)) return true;
 }
 return false;
 """
@@ -1294,6 +1306,10 @@ return false;
                     "accept",
                     "accept all",
                     "agree",
+                    "i agree",
+                    "i accept",
+                    "confirm",
+                    "ok",
                     "got it",
                 ],
             )
