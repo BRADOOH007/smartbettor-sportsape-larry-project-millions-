@@ -2952,12 +2952,12 @@ def do_round(driver, phone: str, password: str, stake: float,
                         (fa.startswith(a[:5]) or a.startswith(fa[:5])):
                         return True
                 return False
-            before = len(games)
+            _board_count = len(games)
             games = [g for g in games
                      if _in_fixtures(g.get("home", ""), g.get("away", ""))]
-            if len(games) < before:
+            if len(games) < _board_count:
                 try:
-                    log(f"  obscure leagues: skipped {before - len(games)} game(s) "
+                    log(f"  obscure leagues: skipped {_board_count - len(games)} game(s) "
                         f"not in API-Football fixtures")
                 except Exception:
                     pass
@@ -2970,7 +2970,7 @@ def do_round(driver, phone: str, password: str, stake: float,
     try:
         _COVERED_BB = {"NBA", "NBL", "WNBA", "EuroLeague", "FIBA", "ACB"}
         _COVERED_TENNIS = {"ATP", "WTA"}
-        before = len(games)
+        _board_count = len(games)
         filtered = []
         for g in games:
             sport = g.get("sport")
@@ -3000,9 +3000,9 @@ def do_round(driver, phone: str, password: str, stake: float,
                         filtered.append(g)  # no fixture data, keep all
                 except NameError:
                     filtered.append(g)  # fixtures not defined, keep all
-        if len(filtered) < before:
+        if len(filtered) < _board_count:
             try:
-                log(f"  obscure leagues: skipped {before - len(filtered)} game(s) "
+                log(f"  obscure leagues: skipped {_board_count - len(filtered)} game(s) "
                     f"(ungradeable/unmatched)")
             except Exception:
                 pass

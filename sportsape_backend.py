@@ -11356,6 +11356,7 @@ return 'noicon';
                 entry["ai_insights"] = ai_insights
             except Exception:
                 pass
+            try:
                 jpath = Path(writable_path("sportsape_learning_journal.json"))
                 hist = []
                 if jpath.exists():
