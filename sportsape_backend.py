@@ -11609,6 +11609,14 @@ return 'noicon';
                 "band": self._band_of(b.get("odds")),
                 "lead": b.get("lead_bucket") or "-",
                 "mix": "-".join(sorted(set(markets))) or "-"})
+        # SIGNATURE FIX: a packaged recipe with mix "-" must not erase the real
+        # market mix the row carries. Every settled row used to file as
+        # "3L@5-6/-/[-]", so the engine could never learn WHICH market
+        # combination pays (its only profitable signature - btts+away+draw -
+        # sat hidden inside the same bucket as the -90% dnb/ml stacks).
+        if str(key.get("mix") or "-") in ("", "-") and markets:
+            key = dict(key)
+            key["mix"] = "-".join(sorted(set(str(m) for m in markets)))
         key_s = f"{key.get('legs')}L@{key.get('band')}/{key.get('lead')}/[{key.get('mix')}]"
         _stake_this = float(b.get("stake") or 0.0)
         _is_real = _stake_this > 0.0
@@ -13932,14 +13940,25 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
                         "stake": stake,
                         "odds": round(win / stake, 2) if stake > 0 and win > 0 else 0.0,
                         "possible_win": win,
+                    }
+                    # The real market mix must ride in the recipe key: with the
+                    # hard-coded "-" the recorder could never tell WHICH market
+                    # combination won or drained the account (measured: every
+                    # real recipe filed as mix "-", signature learning was
+                    # blind because the site rows WERE enriched above).
+                    _ww_mix = "-".join(sorted(set(
+                        _enr.get("markets") or []))) or "-"
+                    entry["recipe"] = {
+                        "legs": legs, "band": self._band_of(win / stake if stake > 0 and win > 0 else 0),
+                        "lead": "-", "mix": _ww_mix}
+                    entry.update({
                         "markets": _enr.get("markets") or [],
                         "probs": _enr.get("probs") or [],
                         "status": st,
                         "settled_at": placed_at if st in ("won", "lost", "void") else None,
                         "won_amount": win if st == "won" else None,
                         "imported": True,
-                        "recipe": {"legs": legs, "band": self._band_of(win / stake if stake > 0 and win > 0 else 0), "lead": "-", "mix": "-"},
-                    }
+                    })
                     if _enr.get("games"):
                         entry["games"] = _enr["games"]
                     if _enr.get("leg_names"):

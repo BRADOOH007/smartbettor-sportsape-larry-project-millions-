@@ -119,6 +119,10 @@ MIN_LEG_ODDS = 1.25            # was 1.09; raised to 1.25 to avoid MTS-rejected 
 # Slip we aim for. Small and quick beats clever and slow.
 TARGET_LEGS = 2
 MIN_LEGS = 2
+# Owner-approved slip-length cap (2026-10-24): 4-leg slips run 0W/7L at these
+# odds/leagues (4L@4-5 is -94% over 28 settled bets). Module-level so BOTH
+# pick paths (api_pick_legs and pick_legs) share the same ceiling.
+MAX_LEGS = 3
 MIN_SLIP_ODDS = 1.60
 MAX_SLIP_ODDS = 6.00
 
@@ -333,6 +337,15 @@ VETO_EXEMPTIONS = {"3L@5-6", "4L@4-5"}
 # Add 0-win rule: a recipe with >= 5 trials and 0 wins is vetoed regardless of ROI
 # (catches 4L@lt3: 7 trials, 0 wins, -100%).
 VETO_ROI = -0.20            # ... and the same "clearly losing" ROI
+# SIGNATURE vetoes (market combinations, e.g. btts+away+draw vs dnb+ml stacks)
+# need a smaller sample than band vetoes: 8 real bets at -20% is already a
+# coherent verdict about WHICH markets belong together in a slip, while an
+# odds-band verdict needs 15+ to rule out band noise. MEASURED 2026-10-25:
+# the dnb/ml signatures ran 1W/7L since the regime change while the only
+# profitable signature (btts+away+draw) sat hidden - because every row had
+# been recorded with mix "-" (fixed in _record_settled_stats).
+SIG_VETO_MIN_TRIALS = 8
+SIG_VETO_ROI = -0.20
 # Research-only (shadow) evidence needs a much bigger sample and a much worse
 # record before it may refuse a band - real money stays the honest signal.
 SHADOW_VETO_MIN_TRIALS = 25
@@ -420,6 +433,28 @@ def load_vetoed_recipes() -> dict:
             roi = ((ret - stake) / stake) if stake > 0 else -1.0
             if stake <= 0 or roi <= SHADOW_VETO_ROI:
                 veto[short] = {"trials": trials, "roi": roi, "kind": "shadow"}
+        # ── SIGNATURE vetoes: aggregate real-money trials by the market MIX ──
+        # The odds band and the market combination are independent verdicts:
+        # btts+away+draw and dnb_home+ml_away+ml_home can sit in the SAME band
+        # with opposite records. Keys look like "3L@5-6/-/[away-btts-draw]";
+        # rows recorded before the mix fix carry "-" and are skipped until
+        # fresh evidence accrues.
+        sig_agg: dict = {}
+        for key, r in (st.get("recipes") or {}).items():
+            mix = str(key).rsplit("/[", 1)[-1].strip("[]")
+            if not mix or mix == "-":
+                continue
+            agg = sig_agg.setdefault(mix, {"trials": 0, "stake": 0.0, "ret": 0.0})
+            agg["trials"] += int(r.get("trials") or 0)
+            agg["stake"] += float(r.get("stake") or 0.0)
+            agg["ret"] += float(r.get("ret") or 0.0)
+        for mix, agg in sig_agg.items():
+            if agg["stake"] <= 0 or agg["trials"] < SIG_VETO_MIN_TRIALS:
+                continue
+            roi = (agg["ret"] - agg["stake"]) / agg["stake"]
+            if roi <= SIG_VETO_ROI:
+                veto["SIG:" + mix] = {"trials": agg["trials"], "roi": roi,
+                                      "kind": "signature"}
         return veto
     except Exception:
         return {}
@@ -1713,7 +1748,7 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
         lw = pick_filters.league_weights()
     except Exception:
         lw = {}
-    legs = _draft_legs(cands, order, want, league_w=lw)
+    legs = _draft_legs(cands, order, want, league_w=lw, max_legs=MAX_LEGS)
 
     # ── DEEP CHECK (form + injuries) on the anchor leg ────────────────
     # Only the top leg is checked (quota: ~5 req per leg). Cached 24h so
@@ -3061,6 +3096,15 @@ def do_round(driver, phone: str, password: str, stake: float,
             log(f"  OMITTED: recipe {rkey} is a proven loser "
                 f"({ev['trials']} real bets, ROI {ev['roi']:+.0%}) - "
                 f"that odds band is not bet again")
+            logout(driver)
+            return None
+        skey = "SIG:" + "-".join(sorted(set(str(l["market"]) for l in legs)))
+        sv = vetoed.get(skey)
+        if sv:
+            log(f"  OMITTED: signature {'+'.join(sorted(set(str(l['market']) for l in legs)))} "
+                f"is a proven loser ({sv['trials']} real bets, "
+                f"ROI {sv['roi']:+.0%}) - that market combination "
+                f"is not bet again")
             logout(driver)
             return None
 
