@@ -351,6 +351,21 @@ SIG_VETO_ROI = -0.20
 SHADOW_VETO_MIN_TRIALS = 25
 SHADOW_VETO_ROI = -0.35
 
+# VALUE SINGLES (owner rule 2026-10-25): do not fear big odds. When the model
+# actually prices a big-odds selection and it clears the EV bar, stake it ALONE
+# instead of burying it as the killing leg of a multi. Bars are strict because
+# singles learn slowly and the machine only truly prices a few games per day:
+#   * the leg must carry a MODEL probability (no model = no data = no single);
+#   * EV >= +15% (EV per unit staked) - the multi draft's -10% floor is for
+#     1.25-1.5 legs whose misses are cheap; a 3.5-odds miss is not.
+#   * odds between 2.50 and 8.00 - small odds are the multi draft's job;
+#     this path exists precisely for the prices the draft refuses.
+SINGLE_MIN_ODDS = 2.50
+SINGLE_MAX_ODDS = 8.00          # singles are not multis: one big price the
+                                # model actually likes is cleaner math than
+                                # three near-coin-flips crossing x6
+VALUE_SINGLE_MIN_EV = 0.15
+
 
 def _band_of(odds: float) -> str:
     """Combined-odds band bins. IDENTICAL to the legacy recorder's
@@ -1748,7 +1763,32 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
         lw = pick_filters.league_weights()
     except Exception:
         lw = {}
-    legs = _draft_legs(cands, order, want, league_w=lw, max_legs=MAX_LEGS)
+    # ── VALUE SINGLE: the data-backed big-odds exit ───────────────────────
+    # Owner rule 2026-10-25: do not fear big odds. A selection the model
+    # prices with real positive EV at 2.50+ is staked ALONE rather than
+    # padded into an acca where it is the leg most likely to break the
+    # ticket. The preference is decided early but placed through the SAME
+    # deep-check and deliberation path as every other slip - no bypass.
+    sing_pref = None
+    try:
+        singles = [c for c in cands
+                   if c.get("ev") is not None
+                   and c["ev"] >= VALUE_SINGLE_MIN_EV
+                   and SINGLE_MIN_ODDS <= c["odds"] <= SINGLE_MAX_ODDS
+                   and c.get("sel_id")]
+        if singles:
+            sing_pref = dict(max(singles, key=lambda c: (c["ev"], c["odds"])))
+            sing_pref["value_single"] = True
+    except Exception as _vse:
+        log(f"  value single scan skipped: {str(_vse)[:60]}")
+
+    if sing_pref:
+        legs = [sing_pref]
+        log(f"  value single: {sing_pref['home']} vs {sing_pref['away']} "
+            f"[{sing_pref['market']}] @ {sing_pref['odds']:.2f} "
+            f"(model EV {sing_pref['ev']:+.0%}) - staked alone, not in a multi")
+    else:
+        legs = _draft_legs(cands, order, want, league_w=lw, max_legs=MAX_LEGS)
 
     # ── DEEP CHECK (form + injuries) on the anchor leg ────────────────
     # Only the top leg is checked (quota: ~5 req per leg). Cached 24h so
@@ -1795,9 +1835,10 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
     # "no BS" filter; this is the "think" step that makes sure the slip is a
     # real, mixed, considered bet rather than a reflex.
     if legs:
+        _is_value_single = any(l.get("value_single") for l in legs)
         distinct = {l.get("market") for l in legs}
         available = {c.get("market") for c in cands} if 'cands' in dir() else distinct
-        if len(distinct) < 2 and len(available) >= 2:
+        if len(distinct) < 2 and len(available) >= 2 and not _is_value_single:
             try:
                 log(f"  THINKING: slip rejected - only one market class "
                     f"({sorted(distinct)}) - not a considered bet")
@@ -1807,7 +1848,9 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
         try:
             mkts = ", ".join(sorted(distinct))
             odds = " x ".join(str(l.get("odds")) for l in legs)
-            log(f"  THINKING: {len(legs)}-leg slip OK - markets=[{mkts}], "
+            tag = "value single" if _is_value_single else (
+                f"{len(legs)}-leg slip OK")
+            log(f"  THINKING: {tag} - markets=[{mkts}], "
                 f"odds=[{odds}], AI cleared, recipe not vetoed")
         except Exception:
             pass
