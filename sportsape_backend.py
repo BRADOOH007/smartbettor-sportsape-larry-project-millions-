@@ -14009,6 +14009,7 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
                     # it (a genuinely manual bet from the phone app).
                     _enr = self._new_engine_enrich(row_id)
                     # Reconstruct a minimal ledger entry
+                    import json as _js
                     entry = {
                         "id": row_id,
                         "phone": phone,
@@ -14018,6 +14019,14 @@ return (c.querySelector('[data-qa="cashout-confirm"], [data-qa="cashout-amount"]
                         "odds": round(win / stake, 2) if stake > 0 and win > 0 else 0.0,
                         "possible_win": win,
                     }
+                    # Legs fallback: the site history sometimes ships legs=0
+                    # (measured 2026-10-26 on the singles) - the engine's own
+                    # enrichment knows better, so the recipe key and every
+                    # legs-counted table don't file a fake "0L" recipe.
+                    if legs <= 0:
+                        legs = int(len(_enr.get("leg_odds") or []) or
+                                   len(_enr.get("markets") or []) or 0)
+                        entry["legs"] = legs
                     # The real market mix must ride in the recipe key: with the
                     # hard-coded "-" the recorder could never tell WHICH market
                     # combination won or drained the account (measured: every

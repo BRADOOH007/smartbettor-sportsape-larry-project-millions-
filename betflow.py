@@ -393,6 +393,8 @@ def _hour_bucket(ko) -> str:
 
     The patterning tables slice by kick-off hour so local rhythms (evening
     European cards, overnight Asian slates) can emerge from our own money.
+    MEASURED 2026-10-26: the board's dateTimestamp arrives in MILLISECONDS
+    (ko=1.793e12), so seconds-epoch must be normalised before fromtimestamp.
     """
     try:
         ko = float(ko)
@@ -400,10 +402,28 @@ def _hour_bucket(ko) -> str:
         return ""
     if ko <= 0:
         return ""
+    if ko > 1e12:                     # milliseconds epoch from the board feeds
+        ko /= 1000.0
     try:
         return f"{datetime.fromtimestamp(ko).hour:d}"
     except Exception:
         return ""
+
+
+def _ko_seconds(ko) -> float | None:
+    """Kick-off in seconds since epoch, or None when unknown/invalid."""
+    try:
+        ko = float(ko)
+    except (TypeError, ValueError):
+        return None
+    if ko <= 0:
+        return None
+    if ko > 1e12:
+        ko /= 1000.0
+    try:
+        return ko
+    except Exception:
+        return None
 
 
 def hot_flags_for(legs: list) -> tuple[bool, bool]:
@@ -1399,10 +1419,11 @@ def api_other_sports(driver, max_games: int = 10) -> list:
              and g.get("odds")]
     if not games:
         return []
-    # Kick-off guard, same as the football board.
+    # Kick-off guard, same as the football board - milliseconds normalised
+    # (raw ko/soon comparison silently disabled this guard, measured 2026-10-26).
     soon = time.time() + MIN_LEAD_MINUTES * 60
     games = [g for g in games
-             if not (g.get("ko") and g["ko"] <= soon)]
+             if not (lambda k: k is not None and k <= soon)(_ko_seconds(g.get("ko")))]
     by_sport = {}
     for g in games:
         by_sport[g.get("sport", "?")] = by_sport.get(g.get("sport", "?"), 0) + 1
@@ -1465,11 +1486,16 @@ def api_board(driver) -> list:
 
     # Kick-off guard: never pick a game already inside MIN_LEAD_MINUTES of
     # kick-off - the book suspends legs while the slip is being filled.
+    # MEASURED 2026-10-26: ko arrives in milliseconds, so the raw seconds
+    # comparison silently disabled this guard (ko=1.79e12 can never be
+    # <= soon=1.79e9). Normalise before comparing - as a side effect the
+    # guard actually guards now, a small behaviour change with the RIGHT
+    # sign (fewer suspended-slip placements).
     soon = time.time() + MIN_LEAD_MINUTES * 60
     kept = []
     for g in games:
-        ko = g.get("ko") or 0
-        if ko > 0 and ko <= soon:
+        ko = _ko_seconds(g.get("ko"))
+        if ko is not None and ko <= soon:
             continue
         kept.append(g)
     games = kept
@@ -3290,8 +3316,30 @@ def do_round(driver, phone: str, password: str, stake: float,
                 f"({', '.join(_wh) or 'matched'})")
         except Exception:
             pass
-    stake = _effective_stake(before, base_stake, legs,
-                             sig_hot=_sig_hot, domain_hot=_dom_hot)
+    _sized = _effective_stake(before, base_stake, legs,
+                              sig_hot=_sig_hot, domain_hot=_dom_hot)
+    # VALUE-SINGLE stake discipline (measured 2026-10-26): the confidence
+    # sizing doubled the stake on 1-leg tickets; five 25-stake singles went
+    # 0W/4L for -75 before their recipe had a single settled trial playing
+    # for it. Until the 1L band has 10+ real settles behind it, a value
+    # single stakes the BASE - the odds are allowed to be big, the money
+    # waits for its own recipe's proof, then the caps open up like every
+    # other pattern's do.
+    try:
+        if len(legs) == 1 and legs[0].get("value_single") and _sized is not None:
+            import pick_filters as _pf
+            _st = json.loads(_pf.STATS.read_text(encoding="utf-8"))
+            _n_1l = sum(int((r or {}).get("trials") or 0)
+                        for k, r in (_st.get("recipes") or {}).items()
+                        if str(k).startswith("1L@"))
+            if _n_1l < _pf.HOT_MIN_TRIALS:
+                _sized = min(_sized, base_stake)
+                log(f"  value single stakes the base (1L recipe needs "
+                    f"{_pf.HOT_MIN_TRIALS - _n_1l} more settle(s) before "
+                    f"confidence sizing unlocks)")
+    except Exception:
+        pass
+    stake = _sized
     if stake is None:
         log("  effective stake below the book's practical minimum - standing down")
         logout(driver)
