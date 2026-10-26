@@ -151,17 +151,43 @@ class TestWiring(unittest.TestCase):
             self.assertTrue(any("re-testing the accounts" in n for n in notes))
         mock.patch.stopall()
 
-    def test_unreadable_balance_aborts_after_three(self):
+    def test_unreadable_balance_cools_down_instead_of_stopping(self):
+        # OWNER RULE 2026-10-26 - "do not prevent betting". Three consecutive
+        # unreadable rounds used to STOP the machine until a human came back,
+        # dead for hours through a stuck challenge (measured 2026-10-24). Now
+        # it cools down, keeps cycling, and re-reads the balance every round;
+        # with the cooldown zeroed, later rounds still run after the 3
+        # strikes, and the stop event (not a hard-stop reason) ends the run.
+        # No read, no bet, ever - the floor itself is untouched.
         calls = []
+        notes = []
         b, _r = make_backend(calls, self.LEGACY_ROWS)
-        with mock.patch.object(
-                new_engine, "do_round",
-                mock.MagicMock(return_value={"unreadable": True})):
+        b._legacy = None                    # no live sync from the ticker
+        round_calls = []
+
+        def unreadable_then_stop(*a, **kw):
+            round_calls.append(1)
+            if len(round_calls) >= 5:       # two cooldown cycles later
+                b.stop_bet_machine()
+            return {"unreadable": True}
+
+        with mock.patch.object(new_engine, "do_round",
+                               mock.MagicMock(side_effect=unreadable_then_stop)), \
+             mock.patch.object(betflow_adapter, "UNREADABLE_COOLDOWN", 0):
             res = b.run_football_bet_schedule(
                 "0798810080", "pw", phones=["0798810080"], stake=10.0,
-                cadence_seconds=0.5, max_bets=0, daily_bets=20)
-            self.assertEqual(res["reason"], "balance_unreadable")
+                cadence_seconds=0.5, max_bets=0, daily_bets=20,
+                gui_callback=notes.append)
             self.assertEqual(res["placed"], 0)
+            self.assertNotIn("reason", res,
+                             "an unreadable balance must never hard-stop "
+                             "the machine anymore")
+            self.assertGreaterEqual(len(round_calls), 5,
+                                    "the engine must keep re-testing after "
+                                    "the 3 strikes, not stop")
+            self.assertTrue(
+                any("cooling down" in n for n in notes),
+                "the cooldown must be announced; got: " + " | ".join(notes))
         mock.patch.stopall()
 
     def test_deposit_in_progress_skips_account_but_bets_others(self):

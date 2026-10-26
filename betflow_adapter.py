@@ -36,6 +36,13 @@ import betflow as new_engine
 BALANCE_RECHECK_MIN_S = 8 * 60
 BALANCE_RECHECK_MAX_S = 16 * 60
 
+# How long the machine backs off after three consecutive unreadable-balance
+# rounds before re-testing the accounts. A cooldown, not a stop: a stuck
+# challenge (Akamai) used to dead-end the whole worker until a human came
+# back. Owner rule 2026-10-26 - never prevent betting; the floor itself is
+# untouched (no read, no bet, ever).
+UNREADABLE_COOLDOWN = 15 * 60
+
 # The original backend, if it can be imported. Optional on purpose: if it is
 # broken we still want the GUI to launch and bet.
 try:
@@ -271,15 +278,33 @@ class Backend:
                     if isinstance(row, dict) and row.get("unreadable"):
                         # Without a balance we cannot honour the floor, and
                         # betting blind is how a cap gets blown. Fail the round
-                        # loudly instead - and give up after a few tries rather
-                        # than looping silently forever.
+                        # loudly instead of placing. OWNER RULE 2026-10-26 -
+                        # "do not prevent betting": three unreadable rounds used
+                        # to STOP the machine until a human came back, dead for
+                        # hours (measured through the 2026-10-24 Akamai day).
+                        # Now: cooldown instead of stop. The engine keeps
+                        # cycling, re-reads every round, skips any account
+                        # whose balance stays unreadable, and betting resumes
+                        # automatically the moment the challenge clears. The
+                        # floor itself is untouched - no read, no bet, ever.
                         unreadable += 1
                         say(f"could not read the balance on {acct} "
                             f"({unreadable}/3) - skipping this round.")
                         if unreadable >= 3:
+                            _cool = UNREADABLE_COOLDOWN
                             say("balance unreadable three times in a row - "
-                                "stopping rather than betting without a floor.")
-                            return {"placed": placed_total, "reason": "balance_unreadable"}
+                                "cooling down 15 min and retrying instead of "
+                                "stopping (resumes betting as soon as the "
+                                "challenge clears).")
+                            unreadable = 0
+                            self._set_cap_hold(True)   # no browser open; lets
+                                                       # idle settlement run
+                            try:
+                                _deadline2 = time.time() + _cool
+                                while time.time() < _deadline2 and self.running and not stopping():
+                                    time.sleep(5.0)
+                            finally:
+                                self._set_cap_hold(False)
                         continue
                     unreadable = 0
                     if isinstance(row, dict) and row.get("balance_floor"):

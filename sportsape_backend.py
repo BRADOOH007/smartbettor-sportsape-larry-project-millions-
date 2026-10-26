@@ -5314,7 +5314,17 @@ return { real: real, h: h };
                 # crawl upcoming fixtures, run the analyst on top candidates,
                 # and cache picks so the bet machine fires instantly when the
                 # betting window opens.
-                if (now - last_idle_sync) >= idle_sync_interval:
+                # Wider gap when nothing needs settling: the 5-min cadence
+                # was burning two full logins per cycle 24/7 against Akamai
+                # for nothing (measured 2026-10-26 - the storm ran while the
+                # daily cap hold parked the machine). Active bets keep the
+                # 5-min rhythm; otherwise settle research runs every 15.
+                _quick_active = sum(
+                    1 for b in (getattr(self, "_bets", None) or [])
+                    if (b.get("status") or "") in ("active", "unconfirmed")
+                    and not str(b.get("status", "")).startswith("shadow"))
+                _idle_gap = idle_sync_interval if _quick_active else 900.0
+                if (now - last_idle_sync) >= _idle_gap:
                     try:
                         _workers_running = any(
                             t.is_alive() for t in (getattr(self, "_worker_threads", []) or []))
