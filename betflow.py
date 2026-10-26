@@ -624,7 +624,8 @@ def make_shadow_slips(games: list, real_legs: list, rotation: int,
     for shift in (1, 2, 3, 4):
         for want in (2, 3):
             try:
-                legs = api_pick_legs(games, rotation=rotation + shift, want=want)
+                legs = api_pick_legs(games, rotation=rotation + shift, want=want,
+                                     value_singles=False)
             except Exception:
                 continue
             if not legs:
@@ -1641,7 +1642,7 @@ def _forebet_prob(market: str, fb: dict) -> float | None:
 
 def api_pick_legs(games: list, want: int = TARGET_LEGS,
                   exclude: set | None = None, rotation: int = 0,
-                  ai: bool = True) -> list:
+                  ai: bool = True, value_singles: bool = True) -> list:
     """Choose legs from API rows. Mirrors pick_legs()'s rules and band but over
     the FULL market surface (Draw No Bet, 1X2 first half, First Team To Score,
     odd/even, ...), not just the four markets the DOM listing shows.
@@ -1653,6 +1654,11 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
       * a Forebet disagreement gate - drop a leg the independent model rates
         far below what the price implies (neutral when no cache exists);
       * a market-mixed draft instead of the all-Draw-No-Bet greedy.
+
+    value_singles=False (shadow research) skips the data-backed big-odds
+    single so alternate shapes stay genuine rotation-driven multis - otherwise
+    every shadow collapsest into the same 1-leg single and the research
+    answers nothing.
     """
     cands = []
     for g in games:
@@ -1770,17 +1776,18 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
     # ticket. The preference is decided early but placed through the SAME
     # deep-check and deliberation path as every other slip - no bypass.
     sing_pref = None
-    try:
-        singles = [c for c in cands
-                   if c.get("ev") is not None
-                   and c["ev"] >= VALUE_SINGLE_MIN_EV
-                   and SINGLE_MIN_ODDS <= c["odds"] <= SINGLE_MAX_ODDS
-                   and c.get("sel_id")]
-        if singles:
-            sing_pref = dict(max(singles, key=lambda c: (c["ev"], c["odds"])))
-            sing_pref["value_single"] = True
-    except Exception as _vse:
-        log(f"  value single scan skipped: {str(_vse)[:60]}")
+    if value_singles:
+        try:
+            singles = [c for c in cands
+                       if c.get("ev") is not None
+                       and c["ev"] >= VALUE_SINGLE_MIN_EV
+                       and SINGLE_MIN_ODDS <= c["odds"] <= SINGLE_MAX_ODDS
+                       and c.get("sel_id")]
+            if singles:
+                sing_pref = dict(max(singles, key=lambda c: (c["ev"], c["odds"])))
+                sing_pref["value_single"] = True
+        except Exception as _vse:
+            log(f"  value single scan skipped: {str(_vse)[:60]}")
 
     if sing_pref:
         legs = [sing_pref]
