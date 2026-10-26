@@ -11287,6 +11287,18 @@ return 'noicon';
                     vetoes.append({"recipe": key, "trials": n,
                                    "roi": round(roi, 3)})
 
+            # Hot patterns: what the recency-weighted reader says is working.
+            # Advisory narration - the mechanical steering reads the same
+            # tables live; this just names them in the journal.
+            hot_rows = []
+            try:
+                import pick_filters as _pfh
+                hot_rows = sorted(
+                    (_pfh.load_hot_patterns() or {}).items(),
+                    key=lambda kv: -float(kv[1].get("rec_roi") or 0.0))[:3]
+            except Exception:
+                hot_rows = []
+
             entry = {
                 "day": day,
                 "written_at": datetime.now().isoformat(timespec="seconds"),
@@ -11294,6 +11306,7 @@ return 'noicon';
                 "staked": round(staked, 2), "returned": round(returned, 2),
                 "net": round(returned - staked, 2),
                 "retired_markets": retired,
+                "patterns_hot": [{"pattern": k, **v} for k, v in hot_rows],
                 "markets_best": mkt[:3], "markets_worst": mkt[-3:],
                 "teams_best": teams[:3], "teams_worst": teams[-3:],
                 "vetoed_recipes": vetoes,
@@ -11630,6 +11643,70 @@ return 'noicon';
         # Keep the legacy combined counter for backwards compatibility, but the
         # bandit and every ROI read now use "recipes" (real only) — see
         # _recipe_roi_tables().
+
+        # ── Pattern-slicing tables + recency ring (owner 2026-10-26) ────────
+        # "Discover what works and stick with it" needs the data sliced by
+        # everything we already know about a slip: its market SIGNATURE
+        # (learned here per league too), the sport, the country and the
+        # kick-off hour. Real money only - shadows never touch these tables.
+        # bets_ring is the recency dataset: the last 90 real settles with
+        # their descriptors, from which load_hot_patterns() reads the last
+        # 30 for RECENT confirmation (patterns go stale; the ring knows).
+        if _is_real:
+            _metas = [m for m in (b.get("legs_meta") or []) if isinstance(m, dict)]
+            _sig = "-".join(sorted(set(str(m) for m in markets))) or "-"
+            _leagues = sorted({str(m.get("league") or "-") for m in _metas})
+            _sports = sorted({str(m.get("sport") or "") for m in _metas} - {""})
+            _countries = sorted({str(m.get("country") or "") for m in _metas} - {""})
+            _hours = sorted({str(m.get("ko_hour") or "") for m in _metas} - {""})
+            _won_amount = float(b.get("won_amount") or 0.0)
+            try:
+                _pat = self._stats.setdefault("bets_ring", [])
+                _pat.append({
+                    "day": str(b.get("placed_at") or "")[:10],
+                    "legs": int(b.get("legs") or len(markets) or 0),
+                    "band": self._band_of(b.get("odds")),
+                    "sig": _sig,
+                    "leagues": _leagues,
+                    "sports": _sports,
+                    "countries": _countries,
+                    "hours": _hours,
+                    "stake": _stake_this,
+                    "ret": _won_amount,
+                    "won": 1 if won else 0,
+                })
+                if len(_pat) > 90:
+                    del _pat[:-90]
+                # signature × league table: the AND of the two strongest
+                # dimensions - a mix can be hot in one league, cold in another.
+                # Multi-valued dimensions split the stake evenly (a 3-league
+                # slip files 1/3 stake to each), matching the team table.
+                for _lg in _leagues:
+                    _share_s = _stake_this / max(1, len(_leagues))
+                    _share_r = _won_amount / max(1, len(_leagues))
+                    _e = (self._stats.setdefault("sig_league", {})
+                          .setdefault(_sig, {})
+                          .setdefault(_lg, {"trials": 0, "won": 0,
+                                            "stake": 0.0, "ret": 0.0}))
+                    _e["trials"] = int(_e.get("trials") or 0) + 1
+                    _e["won"] = int(_e.get("won") or 0) + (1 if won else 0)
+                    _e["stake"] = float(_e.get("stake") or 0.0) + _share_s
+                    _e["ret"] = float(_e.get("ret") or 0.0) + _share_r
+                for _table, _vals in (
+                        ("sport_stats", _sports),
+                        ("country_stats", _countries),
+                        ("hour_stats", _hours)):
+                    _share_s = _stake_this / max(1, len(_vals))
+                    _share_r = _won_amount / max(1, len(_vals))
+                    for _v in _vals:
+                        _e = (self._stats.setdefault(_table, {}).setdefault(
+                            _v, {"trials": 0, "won": 0, "stake": 0.0, "ret": 0.0}))
+                        _e["trials"] = int(_e.get("trials") or 0) + 1
+                        _e["won"] = int(_e.get("won") or 0) + (1 if won else 0)
+                        _e["stake"] = float(_e.get("stake") or 0.0) + _share_s
+                        _e["ret"] = float(_e.get("ret") or 0.0) + _share_r
+            except Exception:
+                pass
 
         # ── Per-team × market P&L ledger ("teams that always win") ─────────
         # The owner's ask. Every settled slip files the REAL per-leg outcome

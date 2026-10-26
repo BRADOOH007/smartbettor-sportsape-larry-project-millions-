@@ -132,6 +132,11 @@ MAX_SLIP_ODDS = 6.00
 # staked ABOVE the base, never above MAX_MODEL_STAKE.
 MIN_FULL_BALANCE_STAKE = 1.0
 MAX_MODEL_STAKE = 25.0
+# A pattern the machine has PROVEN hot (10+ real bets AND recent-30 ROI
+# >= +20%) earns a higher stake ceiling - following winners is the whole
+# point of the learning loop. Still bounded: an account never risks 40 on
+# a hot pattern until its own balance and the win-rate tables say so.
+HOT_STAKE_CAP = 40.0
 # Kick-off must be at least this far away so the book does not suspend the leg
 # while we are filling the slip.
 MIN_LEAD_MINUTES = 10.0
@@ -381,6 +386,60 @@ def _band_of(odds: float) -> str:
     if o <= 6.0:
         return "5-6"
     return "gt6"
+
+
+def _hour_bucket(ko) -> str:
+    """Kick-off hour bucket ("14" .. "23") in LOCAL machine time, "" unknown.
+
+    The patterning tables slice by kick-off hour so local rhythms (evening
+    European cards, overnight Asian slates) can emerge from our own money.
+    """
+    try:
+        ko = float(ko)
+    except (TypeError, ValueError):
+        return ""
+    if ko <= 0:
+        return ""
+    try:
+        return f"{datetime.fromtimestamp(ko).hour:d}"
+    except Exception:
+        return ""
+
+
+def hot_flags_for(legs: list) -> tuple[bool, bool]:
+    """(signature_hot, domain_hot) for this slip per load_hot_patterns().
+
+    signature_hot: the slip's market mix has 10+ real bets AND recent-30 ROI
+    >= +20%. domain_hot: every leg shares a kick-off hour / country / league
+    that is hot the same way. Either unlocks the raised stake cap (40 vs 25).
+    Fail-safe: any error = (False, False) = the normal cap.
+    """
+    if not legs:
+        return (False, False)
+    try:
+        import pick_filters
+        hot = pick_filters.load_hot_patterns()
+    except Exception:
+        return (False, False)
+    if not hot:
+        return (False, False)
+    sig = "-".join(sorted(set(str(l.get("market") or "") for l in legs)))
+    sig_hot = ("sig:" + sig) in hot if sig else False
+    domain_hot = False
+    leagues = [str(l.get("league") or "") for l in legs]
+    countries = {str(l.get("country") or "") for l in legs}
+    hours = {_hour_bucket(l.get("ko")) for l in legs}
+    hours.discard("")
+    if countries and len(countries) == 1:
+        domain_hot = domain_hot or any(
+            k == f"country:{next(iter(countries))}" for k in hot)
+    if len(hours) == 1:
+        domain_hot = domain_hot or any(
+            k == f"hour:{next(iter(hours))}" for k in hot)
+    if leagues and len(set(leagues)) == 1:
+        domain_hot = domain_hot or any(
+            k == f"league:{leagues[0]}" for k in hot)
+    return (sig_hot, domain_hot)
 
 
 def load_vetoed_recipes() -> dict:
@@ -648,11 +707,12 @@ def make_shadow_slips(games: list, real_legs: list, rotation: int,
             "games": [f"{l['home']} vs {l['away']} [{l['market']}]" for l in legs],
             "leg_odds": [l["odds"] for l in legs],
             "legs_meta": [{"sport": l.get("sport") or "Football",
-                           "league": l.get("league") or "-",
-                           "country": l.get("country") or "",
-                           "market": l["market"],
-                           "home": l["home"], "away": l["away"]}
-                          for l in legs],
+                            "league": l.get("league") or "-",
+                            "country": l.get("country") or "",
+                            "ko_hour": _hour_bucket(l.get("ko")),
+                            "market": l["market"],
+                            "home": l["home"], "away": l["away"]}
+            for l in legs],
             "markets": [l["market"] for l in legs],
             "leg_names": [f"{l['home']} vs {l['away']}" for l in legs],
             "status": "shadow",
@@ -1500,17 +1560,22 @@ def _confidence_stake(base: float, legs: list, cap: float = MAX_MODEL_STAKE) -> 
     return min(cap, base * 2.5)
 
 
-def _effective_stake(balance: float, base: float, legs: list) -> float | None:
+def _effective_stake(balance: float, base: float, legs: list,
+                     sig_hot: bool = False, domain_hot: bool = False) -> float | None:
     """Actual stake for this round. None => refuse to bet (below the floor).
 
     - balance below the base but at/above the floor -> BET THE FULL BALANCE
       (the "low balance bets full margin" rule, not sitting idle);
     - balance above the base -> confidence-sized stake, never above the cap;
-    - balance below MIN_FULL_BALANCE_STAKE -> None (hard floor).
+    - balance below MIN_FULL_BALANCE_STAKE -> None (hard floor);
+    - a HOT pattern (10+ real bets, recent-30 ROI >= +20% - see
+      hot_flags_for) lifts the cap to HOT_STAKE_CAP: winners get followed
+      with money, not just with ordering.
     """
     if balance < MIN_FULL_BALANCE_STAKE:
         return None
-    planned = _confidence_stake(base, legs)
+    cap = HOT_STAKE_CAP if (sig_hot or domain_hot) else MAX_MODEL_STAKE
+    planned = _confidence_stake(base, legs, cap=cap)
     return min(planned, balance)
 
 
@@ -1758,6 +1823,23 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
         weights = (pick_filters.load_learning() or {}).get("weights") or {}
     except Exception:
         weights = {}
+    # Hot-pattern steering (prize the winners): proven-hot market mixes and
+    # hot sports get a 1.5x ordering weight so the draft LEADS with them.
+    # Only ordering - floors, vetoes and band caps still decide.
+    try:
+        import pick_filters
+        _hot = pick_filters.load_hot_patterns() or {}
+        for _k in _hot:
+            if _k.startswith("sig:"):
+                for _m in _k[4:].split("-"):
+                    if _m:
+                        weights[_m] = float(weights.get(_m, 1.0)) * 1.5
+            elif _k.startswith("sport:"):
+                _sp = _k[6:]
+                for _m in API_PREF:
+                    weights[_m] = float(weights.get(_m, 1.0)) * 1.5
+    except Exception:
+        pass
     order = _rotate_markets(
         pick_filters.rotation_with_weights(API_PREF, weights), rotation)
 
@@ -1769,6 +1851,19 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
         lw = pick_filters.league_weights()
     except Exception:
         lw = {}
+    # Proven-hot LEAGUES: bump every market weight of that league to 1.5 in
+    # the draft, so hot competitions win ties against neutral ones.
+    try:
+        import pick_filters
+        _hot = pick_filters.load_hot_patterns() or {}
+        for _k in _hot:
+            if _k.startswith("league:"):
+                _lg = _k[7:]
+                _e = lw.setdefault(_lg, {})
+                for _m in API_PREF:
+                    _e[_m] = max(float(_e.get(_m) or 0.0), 1.5)
+    except Exception:
+        pass
     # ── VALUE SINGLE: the data-backed big-odds exit ───────────────────────
     # Owner rule 2026-10-25: do not fear big odds. A selection the model
     # prices with real positive EV at 2.50+ is staked ALONE rather than
@@ -3177,9 +3272,26 @@ def do_round(driver, phone: str, password: str, stake: float,
 
     # Stake sizing AFTER the legs are known (confidence needs the model EVs):
     # an under-funded account bets the FULL balance; a well-modelled slip is
-    # staked above the base, capped at MAX_MODEL_STAKE. The hard floor already
-    # returned above, so this is only the sizing itself.
-    stake = _effective_stake(before, base_stake, legs)
+    # staked above the base, capped at MAX_MODEL_STAKE - or HOT_STAKE_CAP when
+    # the slip rides a pattern the machine has proven hot. The hard floor
+    # already returned above, so this is only the sizing itself.
+    _sig_hot, _dom_hot = hot_flags_for(legs)
+    if _sig_hot or _dom_hot:
+        try:
+            import pick_filters as _pf
+            _wh = []
+            for _k, _v in (_pf.load_hot_patterns() or {}).items():
+                if (_k.startswith("sig:")
+                        and _k[4:] == "-".join(sorted(set(str(l.get("market") or "") for l in legs)))):
+                    _wh.append(_k[4:])
+                elif _k.startswith("country:") or _k.startswith("hour:") or _k.startswith("league:"):
+                    _wh.append(_k.split(":", 1)[0] + ":" + _k.split(":", 1)[1])
+            log(f"  hot pattern steering: cap lifted to KES {HOT_STAKE_CAP:,.0f} "
+                f"({', '.join(_wh) or 'matched'})")
+        except Exception:
+            pass
+    stake = _effective_stake(before, base_stake, legs,
+                             sig_hot=_sig_hot, domain_hot=_dom_hot)
     if stake is None:
         log("  effective stake below the book's practical minimum - standing down")
         logout(driver)
@@ -3292,9 +3404,10 @@ def do_round(driver, phone: str, password: str, stake: float,
                "legs_meta": [{"sport": l.get("sport") or "Football",
                               "league": l.get("league") or "-",
                               "country": l.get("country") or "",
+                              "ko_hour": _hour_bucket(l.get("ko")),
                               "market": l["market"],
                               "home": l["home"], "away": l["away"]}
-                             for l in legs],
+                for l in legs],
                # markets/probs/leg_names are the calibration feed: the legacy
                # recorder (_record_settled_stats) files per-market, per-league
                # and per-team statistics from these. An empty "markets" list is

@@ -77,6 +77,114 @@ def load_learning() -> dict:
     return {"retired": retired, "weights": weights}
 
 
+# ── HOT PATTERNS (prize the winners, not just punish the losers) ────────────
+# A pattern is "hot" only when BOTH hold:
+#   1. FULL-history evidence floor:  >= HOT_MIN_TRIALS real settled bets in its
+#      own stats table (10 - a 3-bet fluke must never steer the machine);
+#   2. RECENT money confirmation: over the last HOT_RING_N settled real bets
+#      (30), the pattern's ROI >= HOT_MIN_ROI (+20%).
+# Recency matters because books adjust and seasons turn: the full table proves
+# the pattern is real, the ring proves it is STILL real. Missing stats = no
+# opinion = the draft runs unchanged (same fail-safe as every other gate).
+HOT_MIN_TRIALS = 10
+HOT_MIN_ROI = 0.20
+HOT_RING_N = 30
+
+
+def load_hot_patterns() -> dict:
+    """Patterns worth following right now.
+
+    Returns a flat dict: {"sig:away-btts-draw": {...}, "league:Football: KPL":
+    {...}, "country:Kenya": ..., "sport:Basketball": ..., "hour:14": ...}.
+    Empty dict = nothing qualifies = no steering.
+    """
+    try:
+        st = json.loads(STATS.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    ring = [r for r in (st.get("bets_ring") or []) if isinstance(r, dict)][-HOT_RING_N:]
+
+    def _roll(sel):
+        agg = {}
+        for r in ring:
+            keys = sel(r)
+            if not keys:
+                continue
+            for k in (keys if isinstance(keys, list) else [keys]):
+                e = agg.setdefault(k, {"stake": 0.0, "ret": 0.0, "n": 0})
+                e["stake"] += float(r.get("stake") or 0.0)
+                e["ret"] += float(r.get("ret") or 0.0)
+                e["n"] += 1
+        return agg
+
+    def _rec_roi(e):
+        if not e or e["stake"] <= 0:
+            return None
+        return (e["ret"] - e["stake"]) / e["stake"]
+
+    sig_ring = _roll(lambda r: [r.get("sig")] if r.get("sig") else [])
+    lg_ring = _roll(lambda r: r.get("leagues") or [])
+    ct_ring = _roll(lambda r: r.get("countries") or [])
+    sp_ring = _roll(lambda r: r.get("sports") or [])
+    hr_ring = _roll(lambda r: r.get("hours") or [])
+
+    hot: dict = {}
+
+    # Signatures: full floor from the recipes table (mix part of the key).
+    sig_full: dict = {}
+    for key, r in (st.get("recipes") or {}).items():
+        mix = str(key).rsplit("/[", 1)[-1].strip("[]")
+        if not mix or mix == "-":
+            continue
+        e = sig_full.setdefault(mix, {"trials": 0, "stake": 0.0, "ret": 0.0})
+        e["trials"] += int(r.get("trials") or 0)
+        e["stake"] += float(r.get("stake") or 0.0)
+        e["ret"] += float(r.get("ret") or 0.0)
+    for mix, e in sig_full.items():
+        if int(e["trials"]) < HOT_MIN_TRIALS:
+            continue
+        r = sig_ring.get(mix)
+        rr = _rec_roi(r)
+        if rr is None or rr < HOT_MIN_ROI:
+            continue
+        hot["sig:" + mix] = {"trials": int(e["trials"]), "rec_roi": round(rr, 3),
+                             "rec_n": int(r["n"])}
+
+    # Leagues: full floor from sig_league[(mix, league)] money rollup.
+    lg_full: dict = {}
+    for lgs in (st.get("sig_league") or {}).values():
+        for lg, e in lgs.items():
+            a = lg_full.setdefault(lg, {"trials": 0, "stake": 0.0, "ret": 0.0})
+            a["trials"] += int(e.get("trials") or 0)
+            a["stake"] += float(e.get("stake") or 0.0)
+            a["ret"] += float(e.get("ret") or 0.0)
+    for lg, e in lg_full.items():
+        if int(e["trials"]) < HOT_MIN_TRIALS:
+            continue
+        r = lg_ring.get(lg)
+        rr = _rec_roi(r)
+        if rr is None or rr < HOT_MIN_ROI:
+            continue
+        hot["league:" + lg] = {"trials": int(e["trials"]), "rec_roi": round(rr, 3),
+                               "rec_n": int(r["n"])}
+
+    # Sport / country / hour slices from their own tables.
+    _ring_by = {"sport": sp_ring, "country": ct_ring, "hour": hr_ring}
+    for table, tag in (("sport_stats", "sport"),
+                       ("country_stats", "country"),
+                       ("hour_stats", "hour")):
+        for kk, e in (st.get(table) or {}).items():
+            if int(e.get("trials") or 0) < HOT_MIN_TRIALS:
+                continue
+            r = _ring_by[tag].get(kk)
+            rr = _rec_roi(r)
+            if rr is None or rr < HOT_MIN_ROI:
+                continue
+            hot[f"{tag}:{kk}"] = {"trials": int(e.get("trials") or 0),
+                                  "rec_roi": round(rr, 3), "rec_n": int(r["n"])}
+    return hot
+
+
 def team_vetoes() -> dict:
     """Pairings the money says no to: {(team, market): {'trials', 'roi'}}.
 
