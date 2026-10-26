@@ -1239,26 +1239,44 @@ LEG_KEY = {
 # market fetch can see (Draw No Bet is real here; the DOM listing never had it).
 # The rotation deals one leg per market class per pass, so a slip mixes
 # markets - and now sports: the two-way moneyline sits early so a basketball
-# or tennis leg can open a slip next to football legs, and the first-half
-# markets sit where the draft actually reaches them (a 3-4 leg slip never got
-# as far as the last entries).
-# The order below is load-bearing for WHICH markets land on a slip: a 2-4 leg
-# slip only reaches the first ~6 classes, so a market that never gets drafted
-# never gets learned either. The HTFT combos (44) therefore sit right after
-# the O/U cluster, BEFORE the plain first-half markets - measured 2026-10-13:
-# with them at slots 12-14, 39 real slips drafted zero HTFT legs; the double
-# draw (X/X ~5-10) and the favourite/away combos are exactly the less-crowded
-# prices the picker exists to reach.
-# DOUBLE CHANCE rides early too: the owner asked for it (2026-10-15), and it
-# is the two-outcome home market - 1X at 1.25-1.40 is the same job as
-# dnb_home but WITHOUT the draw push, so a 1X leg keeps a slip alive.
-API_PREF = ["ml_home", "ml_away", "dc_1x", "dc_x2", "dc_12", "dnb_away",
-            "dnb_home", "under", "under25",
-            "btts_no", "over15", "over25",
+# or tennis leg can open a slip next to football legs.
+#
+# REORDERED 2026-10-26 on measured money (settled real bets since 2026-10-20,
+# 73 tickets, backend-verified): the btts/away/draw family is the only family
+# that beats its price (bets CONTAINING btts +36.7% ROI n=26, away +31.7% n=27,
+# draw +35.9% n=14; the money-maker signature away-btts-draw +171.8% n=10),
+# while the dnb/home family bleeds (dnb_home -68.3% n=12,
+#   home -40.2% n=14, ml_home lead -15.9% n=23). The winner family occupies
+#   the front of the list (account 1 leads btts/away/draw) and the O/U slice
+#   opens the second rotation half (account 2 leads under/over/btts_no - the
+#   exact profile that measured +22.9% on that account). Damped losers sit
+#   where the draft reaches them last; the HTFT/DC/HFBTTS cluster is ALL
+#   retired as proven unpriceable - its buckets just skip, and shadow
+#   rotations with bigger shifts still reach it for research.
+# NOTE: MARKET_DAMP moves home/ml_home/dnb_home to the TAIL of the
+# weight-sorted order regardless of their slot here, so their final position
+# is the bottom, preserved in this relative order.
+API_PREF = ["btts", "away", "draw", "ml_away", "dnb_away",
+            "dc_1x", "dc_x2", "dc_12",
             "htft_xx", "htft_hh", "htft_aa",
-            "ht_draw", "ht_home", "ht_away",
-            "hfbtts", "btts", "away", "draw", "home",
-            "first_away", "hfbtts_no"]
+            "ht_draw", "ht_home", "ht_away", "hfbtts",
+            "under", "under25", "over15", "over25", "btts_no",
+            "first_away", "hfbtts_no",
+            "ml_home", "home", "dnb_home"]
+
+# MEASURED damping 2026-10-26 (same sample): markets where our settles ran
+# far below break-even are damped at draft-order time - ordering only; floors,
+# band vetoes and the deep check are untouched, so a hot pattern can still
+# steer toward them once ITS OWN evidence says so. The chart:
+#   dnb_home -68.3% (n=12)   home -40.2% (n=14)   ml_home -2.6% contain /
+#   -15.9% as lead (n=23)    dnb_home+ml pairs 0W streaks.
+# dnb_away is NOT damped: it rides inside the one winning dnb stack
+# (dnb_away-ml_away-ml_home +15.8% n=13).
+MARKET_DAMP = {
+    "dnb_home": 0.4,
+    "home": 0.6,
+    "ml_home": 0.75,
+}
 
 _MKT_PARAM_CACHE: dict = {"at": 0.0, "param": None}
 _MKT_PARAM_TTL = 1800.0
@@ -1849,6 +1867,15 @@ def api_pick_legs(games: list, want: int = TARGET_LEGS,
         weights = (pick_filters.load_learning() or {}).get("weights") or {}
     except Exception:
         weights = {}
+    # Measured damping on top: today's losing markets are drafted late until
+    # their own evidence turns (MARKET_DAMP above). A market the learning
+    # table already weights gets damped multiplicatively, so learning and
+    # measurement compose instead of fighting.
+    try:
+        for _m, _f in MARKET_DAMP.items():
+            weights[_m] = float(weights.get(_m, 1.0)) * _f
+    except Exception:
+        pass
     # Hot-pattern steering (prize the winners): proven-hot market mixes and
     # hot sports get a 1.5x ordering weight so the draft LEADS with them.
     # Only ordering - floors, vetoes and band caps still decide.

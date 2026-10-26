@@ -271,8 +271,11 @@ class Backend:
                     # on a fresh about:blank driver, always failed, and stopped
                     # the machine before a single bet (measured 2026-10-09).
                     # Each account drafts from a DIFFERENT market rotation
-                    # (account 0 leads DNB, account 1 leads O/U...), so two
-                    # accounts never share the same bet profile.
+                    # (account 0 opens at btts/away/draw, account 1 lands on
+                    # the second stretch and wraps into the same family), so
+                    # two accounts never share the same bet profile - while
+                    # BOTH lead the measured winning family, not the dnb-led
+                    # split the old order gave them.
                     row = new_engine.do_round(driver, acct, password, float(stake),
                                               rotation=idx * (len(new_engine.API_PREF) // 2))
                     if isinstance(row, dict) and row.get("unreadable"):

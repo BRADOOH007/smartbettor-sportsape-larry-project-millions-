@@ -128,12 +128,27 @@ class HtftDraftTests(unittest.TestCase):
         self.assertGreaterEqual(product, betflow.MIN_SLIP_ODDS)
         self.assertLessEqual(product, betflow.MAX_SLIP_ODDS)
 
-    def test_account_two_rotation_leads_with_htft(self):
-        # rotation = idx * (len(API_PREF)//2) is what the adapter gives phone #2
+    def test_account_rotations_stay_distinct_but_lead_winner_family(self):
+        # rotation = idx * (len(API_PREF)//2) is what the adapter gives phone #2.
+        # MEASURED 2026-10-26: the winning family (btts/away/draw) owns the
+        # front of API_PREF and the second rotation half, so phone #2 starts
+        # on the retired DC/HTFT cluster, those buckets stay empty, and the
+        # draft WRAPS into the same winner family as phone #1 - both lead
+        # btts now, while remaining different bet profiles (bucket order
+        # after the lead differs).
+        retired = ("dc_", "htft_", "ht_", "hfbtts")
         rot = 1 * (len(betflow.API_PREF) // 2)
-        order = betflow._rotate_markets(betflow.API_PREF, rot)
-        self.assertTrue(order[0].startswith("htft_"),
-                        f"rotation {rot} leads {order[:4]}")
+        order0 = betflow._rotate_markets(betflow.API_PREF, 0)
+        order_half = betflow._rotate_markets(betflow.API_PREF, rot)
+        self.assertNotEqual(order0, order_half,
+                            "the two account rotations must not be identical")
+        first_live_0 = next(m for m in order0 if not m.startswith(retired))
+        first_live_1 = next(m for m in order_half if not m.startswith(retired))
+        # Account 1 leads the winner family directly; account 2 lands on the
+        # under/over/btts_no slice - its measured winning identity - after
+        # stepping past the retired DC/HTFT cluster.
+        self.assertEqual(first_live_0, "btts")
+        self.assertEqual(first_live_1, "under")
 
     def test_htft_labels_resolve_on_the_board(self):
         # Every htft_ label the picker can ask for exists on the board's odds.
@@ -223,7 +238,10 @@ class ApiPickTests(unittest.TestCase):
                                         return_value={}):
             legs = betflow.api_pick_legs([BVB_EVERYTHING, SECOND], ai=False)
         self.assertTrue(legs)
-        self.assertIn("ml_home", [l["market"] for l in legs],
+        # The un-gated default draft opens on the measured winner family
+        # (reordered 2026-10-26: btts/away/draw lead API_PREF).
+        self.assertIn([l["market"] for l in legs][0],
+                      ("btts", "away", "draw"),
                       "with no model the gate must not block anything")
 
     def test_model_drops_negative_ev_leg(self):
@@ -255,23 +273,38 @@ class ApiPickTests(unittest.TestCase):
     def test_model_neutral_without_data(self):
         legs = betflow.api_pick_legs([BVB_EVERYTHING, SECOND], ai=False)
         self.assertTrue(legs)
-        self.assertIn("ml_home", [l["market"] for l in legs],
+        # Un-gated default draft = the measured picker order
+        # (btts/away/draw leads, reordered 2026-10-26).
+        self.assertIn([l["market"] for l in legs][0],
+                      ("btts", "away", "draw"),
                       "with no model data the draft must be unchanged")
         for leg in legs:
             self.assertIsNone(leg.get("ev"))
 
     def test_rotation_shifts_market_lead(self):
         # The rotation deals one leg per market class in API_PREF order, so a
-        # different account rotation must lead with a DIFFERENT market - that
-        # is what keeps two accounts off the same bet profile.
-        rot0 = betflow.api_pick_legs([BVB_EVERYTHING, SECOND], rotation=0, ai=False)
-        rot_half = betflow.api_pick_legs([BVB_EVERYTHING, SECOND],
-                                         rotation=len(betflow.API_PREF) // 2,
-                                         ai=False)
-        self.assertTrue(rot0 and rot_half)
-        self.assertNotEqual(rot0[0]["market"], rot_half[0]["market"],
-                            "a different account rotation must not lead with "
-                            "the same market")
+        # different account rotation must NOT produce the same bet profile.
+        # MEASURED 2026-10-26: account 1 leads the btts/away/draw family,
+        # account 2 opens on the under/over/btts_no slice (its measured
+        # winning profile) after the retired cluster wraps - distinct shapes.
+        # The board carries an O/U game so the half rotation has real
+        # partners to pair inside the slip band.
+        ou_game = game_like({
+            "OU1.5#1": (1.55, 30011), "OU2.5#0": (2.10, 30012),
+            "1X2#2": (3.10, 30013), "BTTS#0": (1.75, 30014),
+        }, home="Lechia", away="Pogon", gid="3001", br=0, ko=0)
+        board = [BVB_EVERYTHING, SECOND, ou_game]
+        legs0 = betflow.api_pick_legs(board, rotation=0, ai=False)
+        legs_half = betflow.api_pick_legs(board,
+                                          rotation=len(betflow.API_PREF) // 2,
+                                          ai=False)
+        self.assertTrue(legs0 and legs_half,
+                        f"empty: rot0={legs0[0:1]} rot_half={legs_half[0:1]}")
+        shapes = [tuple(sorted(l["market"] for l in legs0)),
+                  tuple(sorted(l["market"] for l in legs_half))]
+        self.assertNotEqual(shapes[0], shapes[1],
+                            "the two rotations should draw different slip "
+                            f"shapes, got {shapes}")
 
     def test_stake_full_balance_when_below_base(self):
         self.assertEqual(betflow._effective_stake(3.58, 10.0, []), 3.58)
@@ -332,7 +365,9 @@ class TestOtherSportsAndWeights(unittest.TestCase):
         legs = betflow.api_pick_legs(board, want=2, rotation=0, ai=False)
         self.assertTrue(legs, "basketball rows must be draftable")
         for l in legs:
-            self.assertIn(l["market"], ("ml_home", "ml_away"))
+            # A basketball moneyline is drafted under whichever 1X2 label the
+            # rotation opens at (ml_* or plain away/home) - same cell, '1X2#'.
+            self.assertIn(l["market"], ("ml_home", "ml_away", "away", "home"))
             self.assertTrue(l.get("sel_id"))
 
     def test_weights_reorder_the_rotation(self):
